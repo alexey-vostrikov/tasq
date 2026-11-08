@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Всё собирается в том же образе, что и локальная сборка (make),
+# поэтому гейты на хосте и в GitHub Actions не расходятся.
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: rust:1.99.1-bookworm
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add rustfmt and clippy
+        run: rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Smoke test (init + doctor outside the repo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$GITHUB_WORKSPACE/target/release/tasq"
+          work="$(mktemp -d)"
+          cd "$work"
+          "$bin" --version
+          "$bin" init --key TASQ --name "smoke"
+          "$bin" doctor --check
+          "$bin" doctor --json | tee doctor.json
+          grep -q '"ok": true' doctor.json
