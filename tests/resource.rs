@@ -580,3 +580,26 @@ fn gc_releases_reservations_of_expired_attempts() {
         .expect("count");
     assert_eq!(live, 0, "после уборки живых резервов нет");
 }
+
+/// Префикс `./` снимается до проверки на пустоту: иначе шаблон `./` сохранялся бы пустым
+/// и не проходил повторную нормализацию (найдено property-тестом идемпотентности).
+#[test]
+fn glob_prefix_is_stripped_before_the_emptiness_check() {
+    let raw = Resource {
+        kind: resource::Kind::Glob,
+        value: "./".to_string(),
+        mode: resource::Mode::Exclusive,
+    };
+    let error = resource::normalize(&raw).expect_err("./ не шаблон");
+    assert_eq!(error.code(), "INVALID_VALUE");
+
+    let ok = Resource {
+        kind: resource::Kind::Glob,
+        value: "./src/*.rs".to_string(),
+        mode: resource::Mode::Exclusive,
+    };
+    let normalized = resource::normalize(&ok).expect("normalize");
+    assert_eq!(normalized.value, "src/*.rs");
+    let twice = resource::normalize(&normalized).expect("повторная нормализация");
+    assert_eq!(twice, normalized);
+}

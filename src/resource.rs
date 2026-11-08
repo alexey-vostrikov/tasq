@@ -243,7 +243,16 @@ pub fn normalize(resource: &Resource) -> Result<Resource> {
             if trimmed.split('/').any(|segment| segment == "..") {
                 return Err(Error::PathOutsideProject(trimmed.to_string()));
             }
-            trimmed.trim_start_matches("./").to_string()
+            // Префикс `./` снимается до проверки на пустоту: иначе `./` превращался
+            // бы в пустой шаблон, который уже не проходит повторную нормализацию.
+            let without_prefix = trimmed.trim_start_matches("./");
+            if without_prefix.is_empty() {
+                return Err(Error::InvalidValue {
+                    field: "glob".to_string(),
+                    value: "empty".to_string(),
+                });
+            }
+            without_prefix.to_string()
         }
         Kind::Logical => {
             let trimmed = resource.value.trim();

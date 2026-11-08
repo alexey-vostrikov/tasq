@@ -20,5 +20,11 @@ getrandom = "0.4"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
+[dev-dependencies]
+# Property-тесты вместо cargo-fuzz: fuzz-раннер требует nightly и ASAN, а гейт должен
+# идти в том же стабильном образе, что и остальная сборка. Генераторы при этом дают
+# тот же класс входа — мусор, обрезанные строки, юникод, вложенные скобки.
+proptest = "1.12"
+
 [lints.rust]
 unsafe_code = "forbid"
