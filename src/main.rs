@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 
+use tasq::connect;
 use tasq::edge;
 use tasq::error::{Error, Result};
 use tasq::lease;
@@ -379,6 +380,26 @@ enum Command {
         #[arg(long)]
         per_tool: bool,
     },
+    /// Register the MCP server in a client's config
+    Connect {
+        /// Client id; without it the command only lists candidates
+        client: Option<String>,
+        /// Where to write: user | project
+        #[arg(long)]
+        scope: Option<String>,
+        /// HTTP endpoint instead of stdio (loopback only)
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Only show what would change
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove the entry instead of adding it
+        #[arg(long)]
+        remove: bool,
+        /// Check the recorded config and exit 1 if it is wrong
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -585,6 +606,149 @@ fn collect_resources(
     items
 }
 
+/// `tasq connect` — прописка сервера в конфиг клиента.
+#[allow(clippy::too_many_arguments)]
+fn run_connect(
+    cli: &Cli,
+    client: Option<&str>,
+    scope: Option<&str>,
+    url: Option<&str>,
+    dry_run: bool,
+    remove: bool,
+    check: bool,
+) -> Result<ExitCode> {
+    let cwd = std::env::current_dir()?;
+
+    // Без идентификатора клиента команда ничего не пишет: сначала показываем,
+    // у кого вообще есть конфиг, иначе `connect` норовил бы создать файлы всем подряд.
+    let Some(client_id) = client else {
+        let states = connect::states(&cwd);
+        if cli.json {
+            print_json(&states);
+        } else {
+            println!(
+                "{:<16} {:<8} {:<5} {:<5} path",
+                "client", "scope", "file", "tasq"
+            );
+            for state in &states {
+                println!(
+                    "{:<16} {:<8} {:<5} {:<5} {}",
+                    state.client,
+                    state.scope,
+                    if state.file_exists { "yes" } else { "no" },
+                    if state.configured { "yes" } else { "no" },
+                    state.path
+                );
+            }
+            println!();
+            println!("ничего не записано: укажите клиента, например `tasq connect claude-code`");
+        }
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let client = connect::client(client_id).ok_or_else(|| Error::InvalidValue {
+        field: "client".to_string(),
+        value: format!(
+            "{client_id} (known: {})",
+            connect::CLIENTS
+                .iter()
+                .map(|client| client.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })?;
+
+    let scope = match scope {
+        Some(value) => connect::Scope::parse(value).ok_or_else(|| Error::InvalidValue {
+            field: "scope".to_string(),
+            value: format!("{value} (allowed: user, project)"),
+        })?,
+        None => client.default_scope,
+    };
+
+    if check {
+        let ok = connect::verify(client, scope, &cwd)?;
+        let path = connect::path_for(client, scope, &cwd)?;
+        if cli.json {
+            print_json(&serde_json::json!({
+                "client": client.id,
+                "path": path.display().to_string(),
+                "configured": ok,
+            }));
+        } else if ok {
+            println!("{}: tasq is configured in {}", client.id, path.display());
+        } else {
+            println!("{}: tasq is missing from {}", client.id, path.display());
+        }
+        return Ok(if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        });
+    }
+
+    let transport = match url {
+        Some(url) => {
+            // HTTP-транспорт разрешён только на петле: наружу MCP-сервер не отдаётся молча.
+            let loopback = url.starts_with("http://127.0.0.1")
+                || url.starts_with("http://localhost")
+                || url.starts_with("http://[::1]")
+                || url.starts_with("https://127.0.0.1");
+            if !loopback {
+                return Err(Error::InvalidValue {
+                    field: "url".to_string(),
+                    value: format!("{url} (loopback address required)"),
+                });
+            }
+            connect::Transport::Http {
+                url: url.to_string(),
+            }
+        }
+        None => connect::Transport::Stdio {
+            command: std::env::current_exe()?.display().to_string(),
+            args: vec!["mcp".to_string()],
+        },
+    };
+
+    // Удаление и правка требуют существующего файла: создавать его ради удаления бессмысленно.
+    let path = connect::path_for(client, scope, &cwd)?;
+    if (remove || !dry_run) && !path.is_file() && client.created_by_client {
+        return Err(connect::missing_file(client, &path));
+    }
+
+    let outcome = connect::apply(client, scope, &cwd, &transport, dry_run, remove)?;
+
+    let code = match outcome.action.as_str() {
+        "manual" | "unparsable" => ExitCode::from(3),
+        _ => ExitCode::SUCCESS,
+    };
+
+    if cli.json {
+        print_json(&outcome);
+        return Ok(code);
+    }
+
+    match outcome.action.as_str() {
+        "written" => println!("{}: written to {}", outcome.client, outcome.path),
+        "removed" => println!("{}: removed from {}", outcome.client, outcome.path),
+        "would-write" => println!("{}: would write to {}", outcome.client, outcome.path),
+        "would-remove" => println!("{}: would remove from {}", outcome.client, outcome.path),
+        "unchanged" => println!("{}: already configured in {}", outcome.client, outcome.path),
+        "manual" | "unparsable" => {
+            println!("{}: {} not touched", outcome.client, outcome.path);
+            println!("причина: формат не позволяет безопасную правку");
+            if let Some(snippet) = &outcome.snippet {
+                println!("{snippet}");
+            }
+        }
+        other => println!("{}: {other} ({})", outcome.client, outcome.path),
+    }
+    if let Some(backup) = &outcome.backup {
+        println!("backup: {backup}");
+    }
+    Ok(code)
+}
+
 fn print_json<T: serde::Serialize>(value: &T) {
     println!(
         "{}",
@@ -619,6 +783,28 @@ fn line(node: &Node, indent: usize) -> String {
 }
 
 fn run(cli: &Cli) -> Result<ExitCode> {
+    // `connect` работает с конфигами клиентов и не требует базы: его можно запускать
+    // в проекте, где `tasq init` ещё не делали.
+    if let Command::Connect {
+        client,
+        scope,
+        url,
+        dry_run,
+        remove,
+        check,
+    } = &cli.command
+    {
+        return run_connect(
+            cli,
+            client.as_deref(),
+            scope.as_deref(),
+            url.as_deref(),
+            *dry_run,
+            *remove,
+            *check,
+        );
+    }
+
     match &cli.command {
         Command::Init { key, name } => {
             let cwd = std::env::current_dir()?;
@@ -1869,6 +2055,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+
+        Command::Connect { .. } => unreachable!("обработан до открытия базы"),
 
         Command::Mcp { profile } => {
             let profile =

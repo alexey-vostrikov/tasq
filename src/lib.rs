@@ -9,6 +9,7 @@ pub mod activity;
 pub mod budget;
 pub mod burnup;
 pub mod comment;
+pub mod connect;
 pub mod db;
 pub mod edge;
 pub mod error;
