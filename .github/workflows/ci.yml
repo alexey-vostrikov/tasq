@@ -15,7 +15,7 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Add rustfmt and clippy
         run: rustup component add rustfmt clippy
