@@ -16,7 +16,7 @@ DOCKER_FILE  = --rm -v $(CURDIR):/src -v $(CACHE)/cargo:/cache/cargo \
                -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target -e HOME=/cache/home
 RUN          = docker run $(DOCKER_FILE) $(IMAGE)
 
-.PHONY: all image cache-init fmt clippy deny test build install smoke act clean tokens
+.PHONY: all image cache-init fmt clippy deny test cov build install smoke act clean tokens
 
 all: fmt clippy deny test tokens
 
@@ -36,6 +36,13 @@ clippy: cache-init
 # Политика зависимостей: уязвимости, лицензии, источники, дубли, запрещённые крейты.
 deny: cache-init
 	$(RUN) cargo deny check
+
+# Покрытие. Порог — пол, ниже которого сборка не выпускается, а не цель: он не должен
+# мешать добавлять код, но обязан ловить «написали и не проверили».
+# Отдельная цель, потому что инструментированная сборка пересобирает всё дерево.
+COVERAGE_MIN ?= 70
+cov: cache-init
+	$(RUN) cargo llvm-cov --all-targets --summary-only --fail-under-lines $(COVERAGE_MIN)
 
 test: cache-init
 	$(RUN) cargo test --all-targets
