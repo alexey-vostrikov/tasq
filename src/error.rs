@@ -108,6 +108,28 @@ pub enum Error {
     #[error("path {0} is outside the project root")]
     PathOutsideProject(String),
 
+    /// Ребро зависимости соединяет узел сам с собой.
+    #[error("cannot link {dot_id} to itself")]
+    SelfEdge { dot_id: String },
+
+    /// Ребро между узлами разных проектов.
+    #[error("{from} and {to} belong to different projects")]
+    CrossProjectEdge { from: String, to: String },
+
+    /// Блокировка предка потомком (или наоборот) — тупик по построению.
+    #[error(
+        "cannot link {dot_id} -> {other}: they are in the same branch (ancestor or descendant)"
+    )]
+    AncestorBlockEdge { dot_id: String, other: String },
+
+    /// Ребро создало бы цикл в графе блокировок.
+    #[error("linking {from} -> {to} would create a cycle: {path}")]
+    CycleDetected {
+        from: String,
+        to: String,
+        path: String,
+    },
+
     /// Действие допустимо только для `todo`.
     #[error("node {dot_id} is {status}: only todo nodes can be removed")]
     NotRemovable { dot_id: String, status: String },
@@ -159,6 +181,10 @@ impl Error {
             Error::ResourceReservationConflict { .. } => "RESOURCE_RESERVATION_CONFLICT",
             Error::TooManyReservations { .. } => "TOO_MANY_RESERVATIONS",
             Error::PathOutsideProject(_) => "PATH_OUTSIDE_PROJECT",
+            Error::SelfEdge { .. } => "SELF_EDGE",
+            Error::CrossProjectEdge { .. } => "CROSS_PROJECT_EDGE",
+            Error::AncestorBlockEdge { .. } => "ANCESTOR_BLOCK_EDGE",
+            Error::CycleDetected { .. } => "CYCLE_DETECTED",
             Error::NotRemovable { .. } => "NOT_REMOVABLE",
             Error::AlreadyInState { .. } => "ALREADY_IN_STATE",
             Error::DepthLimit => "DEPTH_LIMIT",
@@ -203,6 +229,12 @@ impl Error {
             }
             Error::TooManyReservations { .. } => "reserve a directory instead of its files",
             Error::PathOutsideProject(_) => "reservations are relative to the project root",
+            Error::SelfEdge { .. } => "a node cannot depend on itself",
+            Error::CrossProjectEdge { .. } => "links only work inside one project",
+            Error::AncestorBlockEdge { .. } => {
+                "link a sibling branch instead; a parent cannot wait for its own child"
+            }
+            Error::CycleDetected { .. } => "remove the opposite edge first, or pick another target",
             Error::NotRemovable { .. } => {
                 "closed work keeps its history; cancel or archive it instead"
             }

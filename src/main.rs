@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 
+use tasq::edge;
 use tasq::error::{Error, Result};
 use tasq::lease;
 use tasq::node::{self, Filter, NewNode, Node, Patch};
@@ -263,6 +264,54 @@ enum Command {
     },
     /// Live leases: who holds what and until when
     Holders,
+    /// Dependencies between nodes: add, remove, list, graph
+    Dep {
+        #[command(subcommand)]
+        command: DepCommand,
+    },
+    /// What to work on next, with the reason for the choice
+    Next {
+        /// How many candidates to show
+        #[arg(long, default_value_t = 3)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum DepCommand {
+    /// Add a link: `tasq dep add A B` means A waits for B
+    Add {
+        /// The node that waits
+        from: String,
+        /// The node it waits for (or the target of the relation)
+        to: String,
+        /// Relation kind: blocks | related | duplicates | discovered_from | split_from
+        #[arg(long, default_value = "blocks")]
+        kind: String,
+    },
+    /// Remove a link
+    Rm {
+        from: String,
+        to: String,
+        #[arg(long, default_value = "blocks")]
+        kind: String,
+    },
+    /// List links of the project
+    Ls {
+        /// Only this kind
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Neighbourhood of a node: what it waits for, what it unblocks, Mermaid
+    Graph {
+        reference: String,
+        /// How deep to walk the blockers chain
+        #[arg(long, default_value_t = 3)]
+        depth: i64,
+        /// Print a Mermaid diagram instead of a table
+        #[arg(long)]
+        mermaid: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -414,10 +463,17 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 let mut conn = db::open_checked(&path)?;
                 let project = project::default_project(&conn)?;
                 let closed = lease::gc(&mut conn, &project)?;
+                let unblocked = edge::clear_stale_blocked(&mut conn, &project)?;
                 if cli.json {
-                    print_json(&serde_json::json!({ "expired_attempts_closed": closed }));
+                    print_json(&serde_json::json!({
+                        "expired_attempts_closed": closed,
+                        "stale_blocked_cleared": unblocked,
+                    }));
                 } else {
                     println!("closed {closed} expired attempt(s)");
+                    if unblocked > 0 {
+                        println!("returned {unblocked} node(s) from blocked to todo");
+                    }
                 }
             }
             Ok(if report.ok {
@@ -862,7 +918,146 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+
+        Command::Dep { command } => match command {
+            DepCommand::Add { from, to, kind } => {
+                let kind = parse_edge_kind(kind)?;
+                let (mut conn, project) = open(cli.db.as_deref())?;
+                let edge = edge::link(&mut conn, &project, from, to, kind, "-")?;
+                if cli.json {
+                    print_json(&edge);
+                } else {
+                    println!("{} {} {}", edge.from, edge.kind, edge.to);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            DepCommand::Rm { from, to, kind } => {
+                let kind = parse_edge_kind(kind)?;
+                let (mut conn, project) = open(cli.db.as_deref())?;
+                let removed = edge::unlink(&mut conn, &project, from, to, kind, "-")?;
+                if !cli.json {
+                    if removed {
+                        println!("removed {} {} {}", from, kind.as_str(), to);
+                    } else {
+                        println!("no such link: {} {} {}", from, kind.as_str(), to);
+                    }
+                }
+                Ok(if removed {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                })
+            }
+            DepCommand::Ls { kind } => {
+                let kind = match kind {
+                    Some(value) => Some(parse_edge_kind(value)?),
+                    None => None,
+                };
+                let (conn, project) = open(cli.db.as_deref())?;
+                let links = edge::list(&conn, &project, kind)?;
+                if cli.json {
+                    print_json(&links);
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if links.is_empty() {
+                    println!("no links; add one with `tasq dep add A B`");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                for link in &links {
+                    println!("{:<16} {} -> {}", link.kind, link.from, link.to);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            DepCommand::Graph {
+                reference,
+                depth,
+                mermaid,
+            } => {
+                let (conn, project) = open(cli.db.as_deref())?;
+                let graph = edge::graph(&conn, &project, reference, *depth)?;
+                if cli.json {
+                    print_json(&graph);
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if *mermaid {
+                    println!("{}", graph.to_mermaid());
+                    return Ok(ExitCode::SUCCESS);
+                }
+                println!("{}", graph.node);
+                if graph.blocked_by.is_empty() {
+                    println!("waits for   nothing");
+                }
+                for neighbour in &graph.blocked_by {
+                    println!(
+                        "waits for   {} ({}) {}",
+                        neighbour.dot_id, neighbour.status, neighbour.title
+                    );
+                }
+                if graph.blocks.is_empty() {
+                    println!("unblocks    nothing");
+                }
+                for neighbour in &graph.blocks {
+                    println!(
+                        "unblocks    {} ({}) {}",
+                        neighbour.dot_id, neighbour.status, neighbour.title
+                    );
+                }
+                if graph.unblocks_total > 0 {
+                    println!("transitively unblocks {} node(s)", graph.unblocks_total);
+                }
+                if graph.critical_chain.len() > 1 {
+                    println!("chain       {}", graph.critical_chain.join(" -> "));
+                }
+                if let Some(blocker) = graph
+                    .transitive_blockers
+                    .iter()
+                    .find(|neighbour| !neighbour.terminal)
+                {
+                    println!(
+                        "next blocker {} ({} away) {}",
+                        blocker.dot_id, blocker.distance, blocker.title
+                    );
+                }
+                for link in &graph.related {
+                    println!("{:<16} {} -> {}", link.kind, link.from, link.to);
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+
+        Command::Next { limit } => {
+            let (conn, project) = open(cli.db.as_deref())?;
+            let candidates = edge::next_candidates(&conn, &project, *limit)?;
+            if cli.json {
+                print_json(&candidates);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if candidates.is_empty() {
+                println!("nothing to pick up: every open node is blocked or leased");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for (index, candidate) in candidates.iter().enumerate() {
+                println!(
+                    "{}. {:<18} {:<8} {}",
+                    index + 1,
+                    candidate.dot_id,
+                    candidate.priority,
+                    candidate.title
+                );
+                println!("   because {}", candidate.reason);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
+}
+
+fn parse_edge_kind(value: &str) -> Result<edge::Kind> {
+    edge::Kind::parse(value).ok_or_else(|| Error::InvalidValue {
+        field: "kind".to_string(),
+        value: format!(
+            "{value} (allowed: blocks, related, duplicates, discovered_from, split_from)"
+        ),
+    })
 }
 
 fn report_error(err: &Error, json: bool) {

@@ -22,6 +22,7 @@ pub struct Node {
     pub id: i64,
     pub dot_id: String,
     pub path: String,
+    pub project_id: i64,
     pub depth: i64,
     pub seq: i64,
     pub kind: String,
@@ -109,6 +110,7 @@ fn map_node(row: &Row<'_>, project: &Project) -> rusqlite::Result<Node> {
     Ok(Node {
         id: row.get("id")?,
         dot_id: project.dot_id(&path),
+        project_id: row.get("project_id")?,
         path,
         depth: row.get("depth")?,
         seq: row.get("seq")?,

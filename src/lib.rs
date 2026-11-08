@@ -7,6 +7,7 @@
 
 pub mod activity;
 pub mod db;
+pub mod edge;
 pub mod error;
 pub mod lease;
 pub mod node;
