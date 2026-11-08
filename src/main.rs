@@ -39,6 +39,16 @@ struct Cli {
     #[arg(long, global = true, value_name = "KEY", env = "TASQ_PROJECT")]
     project: Option<String>,
 
+    /// Max seconds data may stay unwritten on the mcp server (0 disables the flush)
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECS",
+        env = "TASQ_FLUSH_SECONDS",
+        default_value_t = 3
+    )]
+    flush: u64,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -2340,7 +2350,18 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     value: format!("{profile} (allowed: full, agent, read-only, migration)"),
                 })?;
             let cwd = std::env::current_dir()?;
-            mcp::serve(&cwd, cli.db.as_deref(), profile, cli.project.as_deref())?;
+            let flush = if cli.flush == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(cli.flush))
+            };
+            mcp::serve(
+                &cwd,
+                cli.db.as_deref(),
+                profile,
+                cli.project.as_deref(),
+                flush,
+            )?;
             Ok(ExitCode::SUCCESS)
         }
 

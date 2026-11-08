@@ -81,10 +81,49 @@ pub fn open(path: &Path) -> Result<Connection> {
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;",
+         PRAGMA busy_timeout = 5000;
+         -- Потолок размера журнала: после checkpoint WAL не остаётся на максимуме.
+         PRAGMA journal_size_limit = 8388608;",
     )?;
     register_unicode(&conn)?;
     Ok(conn)
+}
+
+/// Число несохранённых кадров журнала: 0 — всё уже в базе.
+pub fn pending_frames(conn: &Connection) -> Result<i64> {
+    let (busy, log, checkpointed): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    let _ = busy;
+    Ok(log - checkpointed)
+}
+
+/// Сбрасывает журнал на диск и усекает его.
+///
+/// Зачем это нужно при `synchronous = NORMAL`: в WAL-режиме коммит не делает fsync, а лишь
+/// дописывает кадры в журнал. Пока не случится checkpoint, данные живут в кэше страниц и
+/// пропадут при отключении питания — сколько бы времени ни прошло. Checkpoint копирует кадры
+/// в основной файл, делает fsync и (в режиме TRUNCATE) обнуляет журнал: окно потерь
+/// ограничивается интервалом между вызовами этой функции, то есть временем, а не объёмом
+/// записи.
+///
+/// README §17: допустимая потеря — несколько секунд работы.
+pub fn checkpoint(conn: &Connection) -> Result<i64> {
+    // TRUNCATE усечёт журнал, только когда нет активных читателей; иначе остаётся
+    // PASSIVE — он тоже копирует кадры и делает fsync, но журнал не обнуляет.
+    let (busy, log, checkpointed): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 {
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            let _: (i64, i64, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            Ok(())
+        })?;
+    }
+    let _ = log;
+    Ok(checkpointed)
 }
 
 /// Регистрирует Unicode-осведомлённые `uni_lower` и `UNICODE_NOCASE`.
@@ -299,4 +338,56 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
             && schema_version <= SUPPORTED_SCHEMA_VERSION,
     };
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Пока не сделан checkpoint, кадры лежат в журнале; после — журнал пуст,
+    /// и данные уже в основном файле. Это и есть окно потерь при отключении питания.
+    #[test]
+    fn checkpoint_moves_frames_into_the_database() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-checkpoint-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let outcome = init(&dir, "CHECK", "checkpoint").expect("init");
+        let db_path = std::path::PathBuf::from(&outcome.db_path);
+
+        let conn = open(&db_path).expect("open");
+        // Пишем так же, как это делает любая команда: одной транзакцией.
+        let mut writer = open(&db_path).expect("writer");
+        let tx = write_tx(&mut writer).expect("tx");
+        tx.execute(
+            "INSERT INTO activity_log (project_id, entity_type, entity_id, action, created_at)
+             VALUES (1, 'probe', 1, 'test', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .expect("insert");
+        tx.commit().expect("commit");
+
+        let wal = |path: &std::path::Path| {
+            std::fs::metadata(path.with_extension("db-wal"))
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        assert!(wal(&db_path) > 0, "после коммита кадры в журнале");
+
+        checkpoint(&conn).expect("checkpoint");
+        assert_eq!(wal(&db_path), 0, "после checkpoint журнал усечён");
+
+        // Данные читаются из основного файла новым соединением.
+        let fresh = open(&db_path).expect("open fresh");
+        let count: i64 = fresh
+            .query_row(
+                "SELECT COUNT(*) FROM activity_log WHERE action = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+    }
 }

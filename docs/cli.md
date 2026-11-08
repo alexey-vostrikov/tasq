@@ -14,6 +14,7 @@ Local-first task tracker for AI agents
 | `--db` | `PATH` | — | Path to the database; overrides the upward search for .tasq/tasq.db |
 | `--json` | — | — | Machine-readable output |
 | `--project` | `KEY` | — | Project key to work in (default: the first project by creation order) |
+| `--flush` | `SECS` | `3` | Max seconds data may stay unwritten on the mcp server (0 disables the flush) |
 
 
 ## Команды

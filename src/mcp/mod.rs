@@ -8,6 +8,9 @@ pub mod rpc;
 pub mod tools;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -15,6 +18,63 @@ use crate::error::{Error, Result};
 use crate::project;
 
 use profile::Profile;
+
+/// Периодический сброс журнала на диск в отдельном потоке.
+///
+/// `synchronous = NORMAL` в WAL-режиме означает: коммит не делает fsync, и до checkpoint
+/// данные лежат в кэше страниц. Пока не сбросить их, они пропадут при отключении питания —
+/// независимо от того, сколько времени прошло. Поток закрывает это окно интервалом.
+///
+/// Своё соединение к тому же файлу, а не общий `Connection`: rusqlite не `Sync`, и делить
+/// его между потоками пришлось бы под мьютексом, который блокировал бы обработку вызовов.
+struct Flusher {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Flusher {
+    /// `interval` — максимум, сколько данные могут пролежать незаписанными.
+    fn start(db_path: PathBuf, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("tasq-flush".to_string())
+            .spawn(move || {
+                let conn = match crate::db::open(&db_path) {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        eprintln!("tasq mcp: flusher disabled ({err})");
+                        return;
+                    }
+                };
+                // Спим короткими кусками, чтобы остановка не ждала целый интервал.
+                let slice = Duration::from_millis(200);
+                let mut waited = Duration::ZERO;
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(slice);
+                    waited += slice;
+                    if waited < interval {
+                        continue;
+                    }
+                    waited = Duration::ZERO;
+                    if let Err(err) = crate::db::checkpoint(&conn) {
+                        eprintln!("tasq mcp: checkpoint failed: {err}");
+                    }
+                }
+            })
+            .ok();
+        Flusher { stop, handle }
+    }
+}
+
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 /// Сервер с выбранным профилем.
 ///
@@ -230,8 +290,19 @@ pub fn serve(
     db: Option<&std::path::Path>,
     profile: Profile,
     project_key: Option<&str>,
+    flush: Option<Duration>,
 ) -> Result<usize> {
     let mut server = Server::open(cwd, db, profile, project_key)?;
+
+    // Сброс журнала по времени: пока сервер жив, данные не должны висеть в кэше
+    // страниц дольше интервала, иначе отключение питания съест не «последнюю секунду»,
+    // а всю сессию.
+    let _flusher = match (flush, server.context.as_ref()) {
+        (Some(interval), Some(context)) if !interval.is_zero() => {
+            Some(Flusher::start(context.db_path.clone(), interval))
+        }
+        _ => None,
+    };
     if let Some(key) = server.project_key() {
         eprintln!("tasq mcp: project {key}");
     }

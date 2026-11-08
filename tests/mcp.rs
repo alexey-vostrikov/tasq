@@ -524,3 +524,100 @@ fn tasq_db_environment_variable_selects_the_database() {
         serde_json::from_str(stdout.lines().nth(1).expect("call response")).expect("json");
     assert_eq!(response["result"]["isError"], json!(false), "{response}");
 }
+
+/// Сколько незаписанных данных держит сервер. `synchronous = NORMAL` в WAL-режиме не делает
+/// fsync на коммите: без периодического checkpoint данные живут в кэше страниц, и отключение
+/// питания съедает всю сессию, а не последнюю секунду. Проверяем именно это: журнал после
+/// записи непустой, а через интервал `--flush` — пустой.
+fn wal_size(dir: &std::path::Path) -> u64 {
+    let path = dir.join(".tasq/tasq.db-wal");
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+fn spawn_server(dir: &std::path::Path, extra: &[&str]) -> std::process::Child {
+    Command::new(bin())
+        .current_dir(dir)
+        .args(["mcp"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp")
+}
+
+fn write_one(child: &mut std::process::Child, title: &str) -> Value {
+    use std::io::{BufRead, BufReader};
+    let stdin = child.stdin.as_mut().expect("stdin");
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    )
+    .expect("init");
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "node_create", "arguments": {"title": title}}})
+    )
+    .expect("call");
+    stdin.flush().expect("flush");
+
+    let stdout = child.stdout.as_mut().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("initialize response");
+    line.clear();
+    reader.read_line(&mut line).expect("call response");
+    serde_json::from_str(&line).expect("json")
+}
+
+#[test]
+fn unwritten_data_does_not_outlive_the_flush_interval() {
+    let dir = temp_dir("flush-on");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+
+    let mut child = spawn_server(&dir, &["--flush", "1"]);
+    let response = write_one(&mut child, "Узел под сброс");
+    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+
+    let after_write = wal_size(&dir);
+    assert!(after_write > 0, "сразу после записи журнал не пуст");
+
+    // Интервал 1 с: ждём с запасом, журнал обязан обнулиться.
+    let mut flushed = 0;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        flushed = wal_size(&dir);
+        if flushed == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        flushed, 0,
+        "через интервал сброса журнал должен быть усечён (было {after_write} байт)"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn the_flush_can_be_disabled() {
+    let dir = temp_dir("flush-off");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+
+    let mut child = spawn_server(&dir, &["--flush", "0"]);
+    let response = write_one(&mut child, "Узел без сброса");
+    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        wal_size(&dir) > 0,
+        "с --flush 0 журнал остаётся непустым: сброса нет"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
