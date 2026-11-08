@@ -57,6 +57,7 @@ impl Profile {
                 "tasq_init",
                 "project_list",
                 "project_update",
+                "project_select",
                 "node_create",
                 "node_get",
                 "node_update",
@@ -125,6 +126,7 @@ pub const ALL_TOOLS: &[&str] = &[
     "project_create",
     "project_list",
     "project_update",
+    "project_select",
     // Узлы (9)
     "node_create",
     "node_get",
@@ -183,13 +185,13 @@ mod tests {
 
     #[test]
     fn full_profile_has_exactly_the_declared_catalogue() {
-        // 42 из ТЗ плюс tasq_risk, добавленный в M6: 4+9+2+3+2+3+3+4+4+3+4+2 = 43.
-        assert_eq!(ALL_TOOLS.len(), 43, "каталог v1 — 43 инструмента");
+        // 42 из ТЗ плюс tasq_risk (M6) и project_select (проекты): 44.
+        assert_eq!(ALL_TOOLS.len(), 44, "каталог v1 — 44 инструмента");
         let mut unique: Vec<&str> = ALL_TOOLS.to_vec();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), ALL_TOOLS.len(), "имена не повторяются");
-        assert_eq!(Profile::Full.tools().len(), 43);
+        assert_eq!(Profile::Full.tools().len(), 44);
     }
 
     #[test]

@@ -69,6 +69,8 @@ fn generated_reference_covers_every_command_and_tool() {
         "import",
         "tokens",
         "connect",
+        "create",
+        "list",
         "mcp",
         "docs",
     ] {
@@ -80,7 +82,7 @@ fn generated_reference_covers_every_command_and_tool() {
     assert!(cli.contains("--json"), "глобальные флаги описаны");
 
     let tools = fs::read_to_string(dir.join("mcp-tools.md")).expect("mcp-tools.md");
-    assert!(tools.contains("Всего инструментов: 43"), "{tools}");
+    assert!(tools.contains("Всего инструментов: 44"), "{tools}");
     for name in [
         "tasq_claim",
         "node_create",

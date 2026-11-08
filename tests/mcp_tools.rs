@@ -1,4 +1,4 @@
-//! Каталог MCP целиком: каждый из 43 инструментов вызывается через настоящий сервер.
+//! Каталог MCP целиком: каждый из 44 инструментов вызывается через настоящий сервер.
 //!
 //! Смысл не в проверке форм ответов (это делают тесты ядра), а в том, что **каждый
 //! инструмент каталога действительно подключён к обработчику**: забыть одну ветку `match`
@@ -134,7 +134,12 @@ fn project_and_init_tools() {
 
     // Создание второго проекта контекст сеанса не переключает: все инструменты работают
     // с проектом сеанса, иначе `node_create` после `project_create` уходил бы в чужой проект.
-    assert_eq!(out[2]["key"], json!("OTHER"));
+    assert_eq!(out[2]["project"]["key"], json!("OTHER"));
+    assert_eq!(
+        out[2]["active_project"],
+        json!("TASQ"),
+        "сеанс остался в своём проекте"
+    );
     assert_eq!(out[3]["key"], json!("TASQ"), "правка ушла в проект сеанса");
     assert_eq!(
         out[3]["updated"],
@@ -560,7 +565,7 @@ fn every_catalogue_entry_has_a_handler() {
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
             .collect()
     };
-    assert_eq!(names.len(), 43, "каталог на 43 инструмента");
+    assert_eq!(names.len(), 44, "каталог на 44 инструмента");
 
     for name in &names {
         let out = Command::new(bin())
@@ -604,4 +609,167 @@ fn every_catalogue_entry_has_a_handler() {
             "ответ {name} не является результатом вызова: {result}"
         );
     }
+}
+
+/// Проекты в MCP: создание не меняет контекст молча, `project_select` меняет явно,
+/// и после него работа идёт в выбранном проекте — в том же сеансе.
+#[test]
+fn projects_are_created_and_selected_explicitly() {
+    let dir = temp_dir("projects");
+    cli(&dir, &["init", "--key", "ALPHA", "--name", "Первый"]);
+
+    let out = session(
+        &dir,
+        &[
+            ("project_create", json!({"key": "prj", "name": "Новый"})),
+            // До выбора узлы идут в проект по умолчанию: это видно в ответе, а не угадывается.
+            ("node_create", json!({"title": "До выбора", "kind": "epic"})),
+            ("project_select", json!({"key": "PRJ"})),
+            (
+                "node_create",
+                json!({"title": "После выбора", "kind": "epic"}),
+            ),
+            ("project_list", json!({})),
+        ],
+    );
+
+    let created = &out[0];
+    assert_eq!(created["project"]["key"], json!("PRJ"), "ключ нормализован");
+    assert_eq!(created["switched"], json!(false), "создание не переключает");
+    assert_eq!(created["active_project"], json!("ALPHA"));
+    assert!(
+        created["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("project_select"),
+        "подсказка называет способ переключиться: {created}"
+    );
+
+    assert_eq!(out[1]["dot_id"], json!("ALPHA-1"));
+
+    let selected = &out[2];
+    assert_eq!(selected["active_project"], json!("PRJ"));
+    assert_eq!(selected["previous"], json!("ALPHA"));
+    assert_eq!(selected["switched"], json!(true));
+
+    assert_eq!(
+        out[3]["dot_id"],
+        json!("PRJ-1"),
+        "узел ушёл в выбранный проект"
+    );
+
+    let projects = out[4].as_array().expect("projects");
+    let alpha = projects
+        .iter()
+        .find(|project| project["key"] == json!("ALPHA"))
+        .expect("ALPHA");
+    let prj = projects
+        .iter()
+        .find(|project| project["key"] == json!("PRJ"))
+        .expect("PRJ");
+    assert_eq!(alpha["nodes"], json!(1));
+    assert_eq!(prj["nodes"], json!(1));
+}
+
+#[test]
+fn selecting_an_unknown_project_is_a_domain_error() {
+    let dir = temp_dir("projects-unknown");
+    cli(&dir, &["init", "--key", "ALPHA"]);
+
+    let mut child = Command::new(bin())
+        .current_dir(&dir)
+        .args(["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        )
+        .expect("init");
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                     "params": {"name": "project_select", "arguments": {"key": "NOPE"}}})).expect("call");
+    }
+    let output = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response: Value =
+        serde_json::from_str(stdout.lines().nth(1).expect("response")).expect("json");
+    assert_eq!(response["result"]["isError"], json!(true), "{response}");
+    let payload: Value = serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(payload["code"], json!("PROJECT_NOT_FOUND"));
+    assert!(
+        payload["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ALPHA")
+    );
+}
+
+/// Проект можно задать при старте сервера: так его прописывают в конфиге клиента.
+#[test]
+fn the_server_can_start_in_a_named_project() {
+    let dir = temp_dir("projects-start");
+    cli(&dir, &["init", "--key", "ALPHA"]);
+    cli(&dir, &["create", "project", "PRJ"]);
+    cli(&dir, &["--project", "PRJ", "add", "Узел в PRJ"]);
+
+    let mut child = Command::new(bin())
+        .current_dir(&dir)
+        .args(["mcp", "--project", "PRJ"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        )
+        .expect("init");
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                     "params": {"name": "node_list", "arguments": {}}})
+        )
+        .expect("call");
+    }
+    let output = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("project PRJ"),
+        "сервер сообщает проект: {stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response: Value =
+        serde_json::from_str(stdout.lines().nth(1).expect("response")).expect("json");
+    let nodes: Value = serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    let ids: Vec<&str> = nodes
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|node| node["dot_id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["PRJ-1"], "старт сразу в выбранном проекте");
 }

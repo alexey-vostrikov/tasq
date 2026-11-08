@@ -146,17 +146,35 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&outcome))
         }
         "project_create" => {
+            // Создание идёт через ядро: там проверка ключа, отказ на дубликат и нормализация
+            // регистра. Раньше вставка шла напрямую, и `{"key":"prj"}` создавал проект
+            // с ключом в нижнем регистре, несовместимым с dot-ID.
             let key = req_str(args, "key")?;
-            let project_name = req_str(args, "name")?;
-            let now = crate::db::now_iso();
-            ctx.conn.execute(
-                "INSERT INTO projects (key, name, description, status, timezone, tags, metadata,
-                                       created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'active', 'UTC', '[]', '{}', ?4, ?4)",
-                rusqlite::params![key, project_name, arg_str(args, "description"), now],
-            )?;
-            let id = ctx.conn.last_insert_rowid();
-            Ok(text(&json!({"id": id, "key": key, "name": project_name})))
+            let name = arg_str(args, "name");
+            let project = crate::project::create(&mut ctx.conn, key, name)?;
+            Ok(text(&json!({
+                "project": project,
+                "active_project": ctx.project.key,
+                "switched": false,
+                // Молчаливая смена контекста опаснее лишнего вызова: агент, создавший
+                // проект «на будущее», получил бы узлы в нём.
+                "hint": format!(
+                    "this session still works in {}; call project_select with key {} to switch",
+                    ctx.project.key, project.key
+                ),
+            })))
+        }
+        "project_select" => {
+            let key = req_str(args, "key")?;
+            let project = crate::project::select(&ctx.conn, Some(key))?;
+            let previous = ctx.project.key.clone();
+            ctx.project = project.clone();
+            Ok(text(&json!({
+                "active_project": project.key,
+                "name": project.name,
+                "previous": previous,
+                "switched": previous != project.key,
+            })))
         }
         "project_list" => {
             let mut stmt = ctx.conn.prepare(
@@ -825,6 +843,18 @@ pub fn definition(name: &str) -> Option<Value> {
             "List projects with their node counts",
             json!({"type": "object", "properties": {}}),
             (true, false, true),
+        ),
+        "project_select" => tool(
+            name,
+            "Switch this session to another project; every later call uses it",
+            json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Project key to work in"}
+                },
+                "required": ["key"]
+            }),
+            (false, false, false),
         ),
         "project_update" => tool(
             name,

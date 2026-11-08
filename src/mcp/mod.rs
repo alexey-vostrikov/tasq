@@ -40,8 +40,9 @@ impl Server {
         cwd: &std::path::Path,
         db: Option<&std::path::Path>,
         profile: Profile,
+        project_key: Option<&str>,
     ) -> Result<Self> {
-        let (context, unavailable) = match Self::connect(cwd, db) {
+        let (context, unavailable) = match Self::connect(cwd, db, project_key) {
             Ok(context) => (Some(context), None),
             Err(err) => (None, Some((err.code().to_string(), err.to_string()))),
         };
@@ -54,16 +55,27 @@ impl Server {
         })
     }
 
-    fn connect(cwd: &std::path::Path, db: Option<&std::path::Path>) -> Result<tools::Context> {
+    fn connect(
+        cwd: &std::path::Path,
+        db: Option<&std::path::Path>,
+        project_key: Option<&str>,
+    ) -> Result<tools::Context> {
         let db_path = crate::db::discover(cwd, db)?;
         let conn = crate::db::open_checked(&db_path)?;
-        let project = project::default_project(&conn)?;
+        let project = project::select(&conn, project_key)?;
         Ok(tools::Context {
             conn,
             project,
             db_path,
             cwd: cwd.to_path_buf(),
         })
+    }
+
+    /// Ключ активного проекта сессии (если база открыта).
+    pub fn project_key(&self) -> Option<&str> {
+        self.context
+            .as_ref()
+            .map(|context| context.project.key.as_str())
     }
 
     pub fn profile(&self) -> Profile {
@@ -162,7 +174,7 @@ impl Server {
             match crate::db::init(&self.cwd, key, project_name).and_then(|outcome| {
                 let db_path = PathBuf::from(&outcome.db_path);
                 let conn = crate::db::open_checked(&db_path)?;
-                let project = project::default_project(&conn)?;
+                let project = project::select(&conn, None)?;
                 Ok(tools::Context {
                     conn,
                     project,
@@ -184,6 +196,8 @@ impl Server {
 
         self.calls += 1;
         let context = self.context.as_mut().expect("база открыта выше");
+        // Контекст живёт в сессии: `project_select` меняет `ctx.project`, и следующий
+        // вызов инструмента обязан его видеть.
         tools::call(context, name, arguments)
     }
 }
@@ -215,8 +229,12 @@ pub fn serve(
     cwd: &std::path::Path,
     db: Option<&std::path::Path>,
     profile: Profile,
+    project_key: Option<&str>,
 ) -> Result<usize> {
-    let mut server = Server::open(cwd, db, profile)?;
+    let mut server = Server::open(cwd, db, profile, project_key)?;
+    if let Some(key) = server.project_key() {
+        eprintln!("tasq mcp: project {key}");
+    }
     match server.db_path() {
         Some(path) => eprintln!(
             "tasq mcp: profile {}, {} tool(s), database {}",

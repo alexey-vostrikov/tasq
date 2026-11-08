@@ -2219,7 +2219,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     value: format!("{profile} (allowed: full, agent, read-only, migration)"),
                 })?;
             let cwd = std::env::current_dir()?;
-            mcp::serve(&cwd, cli.db.as_deref(), profile)?;
+            mcp::serve(&cwd, cli.db.as_deref(), profile, cli.project.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
 

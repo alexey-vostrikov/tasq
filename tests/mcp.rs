@@ -95,7 +95,7 @@ fn handshake_and_tools_list_over_stdio() {
 
     let list = &responses[1];
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 43, "полный профиль отдаёт весь каталог");
+    assert_eq!(tools.len(), 44, "полный профиль отдаёт весь каталог");
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -436,7 +436,7 @@ fn server_starts_without_a_database_and_can_create_one() {
     // рукопожатие и каталог работают без базы
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], json!("tasq"));
     let tools = responses[1]["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 28, "профиль agent целиком, без базы");
+    assert_eq!(tools.len(), 29, "профиль agent целиком, без базы");
 
     // вызов без базы — доменный отказ с кодом и подсказкой, а не закрытие соединения
     let refused = &responses[2]["result"];
