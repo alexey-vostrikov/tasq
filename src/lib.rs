@@ -12,6 +12,7 @@ pub mod db;
 pub mod edge;
 pub mod error;
 pub mod lease;
+pub mod mcp;
 pub mod node;
 pub mod note;
 pub mod overview;

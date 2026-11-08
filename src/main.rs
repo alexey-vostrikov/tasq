@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use tasq::edge;
 use tasq::error::{Error, Result};
 use tasq::lease;
+use tasq::mcp;
 use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::resource;
@@ -359,6 +360,12 @@ enum Command {
         /// Validate and report without writing
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Run the MCP server over stdio
+    Mcp {
+        /// Tool profile: full | agent | read-only | migration
+        #[arg(long, default_value = "full")]
+        profile: String,
     },
 }
 
@@ -1789,6 +1796,17 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if result.checksum_verified {
                 println!("checksum verified");
             }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Mcp { profile } => {
+            let profile =
+                mcp::profile::Profile::parse(profile).ok_or_else(|| Error::InvalidValue {
+                    field: "profile".to_string(),
+                    value: format!("{profile} (allowed: full, agent, read-only, migration)"),
+                })?;
+            let cwd = std::env::current_dir()?;
+            mcp::serve(&cwd, cli.db.as_deref(), profile)?;
             Ok(ExitCode::SUCCESS)
         }
 
