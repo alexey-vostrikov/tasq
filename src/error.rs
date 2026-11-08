@@ -90,6 +90,24 @@ pub enum Error {
     #[error("token does not match an open attempt")]
     NotYourAttempt,
 
+    /// Запрошенный ресурс занят другой попыткой.
+    #[error("resource {kind}:{value} is held by {holder} on {dot_id} until {expires_at}")]
+    ResourceReservationConflict {
+        kind: String,
+        value: String,
+        holder: String,
+        dot_id: String,
+        expires_at: String,
+    },
+
+    /// Резервов на попытку больше предела.
+    #[error("too many reservations: {count} (max {max} per attempt)")]
+    TooManyReservations { count: i64, max: i64 },
+
+    /// Путь резерва выходит за корень проекта.
+    #[error("path {0} is outside the project root")]
+    PathOutsideProject(String),
+
     /// Действие допустимо только для `todo`.
     #[error("node {dot_id} is {status}: only todo nodes can be removed")]
     NotRemovable { dot_id: String, status: String },
@@ -138,6 +156,9 @@ impl Error {
             Error::ActiveAttemptExists { .. } => "ACTIVE_ATTEMPT_EXISTS",
             Error::LeaseExpired { .. } => "LEASE_EXPIRED",
             Error::NotYourAttempt => "NOT_YOUR_ATTEMPT",
+            Error::ResourceReservationConflict { .. } => "RESOURCE_RESERVATION_CONFLICT",
+            Error::TooManyReservations { .. } => "TOO_MANY_RESERVATIONS",
+            Error::PathOutsideProject(_) => "PATH_OUTSIDE_PROJECT",
             Error::NotRemovable { .. } => "NOT_REMOVABLE",
             Error::AlreadyInState { .. } => "ALREADY_IN_STATE",
             Error::DepthLimit => "DEPTH_LIMIT",
@@ -177,6 +198,11 @@ impl Error {
                 "claim the node again; checkpoints are inherited automatically"
             }
             Error::NotYourAttempt => "check the token: `tasq holders` lists live leases",
+            Error::ResourceReservationConflict { .. } => {
+                "wait for the lease to expire, drop the overlapping reserve, or pick another node"
+            }
+            Error::TooManyReservations { .. } => "reserve a directory instead of its files",
+            Error::PathOutsideProject(_) => "reservations are relative to the project root",
             Error::NotRemovable { .. } => {
                 "closed work keeps its history; cancel or archive it instead"
             }

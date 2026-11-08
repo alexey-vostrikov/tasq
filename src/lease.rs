@@ -13,6 +13,7 @@ use crate::db::{self, iso_at, now_iso};
 use crate::error::{Error, Result};
 use crate::node;
 use crate::project::Project;
+use crate::resource;
 
 /// Значение TTL по умолчанию и допустимые границы (README §8.1).
 pub const DEFAULT_TTL: i64 = 900;
@@ -58,6 +59,8 @@ pub struct ClaimRequest<'a> {
     pub steal: bool,
     pub force: bool,
     pub checkpoint: Option<&'a str>,
+    /// Ресурсы, которые забираются атомарно с арендой.
+    pub reservations: Vec<crate::resource::Resource>,
 }
 
 impl<'a> ClaimRequest<'a> {
@@ -68,6 +71,7 @@ impl<'a> ClaimRequest<'a> {
             steal: false,
             force: false,
             checkpoint: None,
+            reservations: Vec::new(),
         }
     }
 }
@@ -88,6 +92,9 @@ pub struct Lease {
     pub inherited_checkpoint: Option<String>,
     /// Попытка, которую пришлось вытеснить (просроченную или живую при `--steal`).
     pub superseded_attempt: Option<i64>,
+    /// Ресурсы, взятые атомарно с арендой.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<String>,
 }
 
 /// Токен аренды: 32 случайных байта в hex.
@@ -204,6 +211,13 @@ pub fn claim(
     let now_text = iso_at(now);
     let expires_at = iso_at(now + Duration::seconds(request.ttl_seconds));
 
+    // Заявка нормализуется до транзакции: ошибка в пути не должна доходить до записи.
+    let mut reservations = Vec::with_capacity(request.reservations.len());
+    for resource in &request.reservations {
+        reservations.push(resource::normalize(resource)?);
+    }
+    resource::check_limit(0, reservations.len() as i64)?;
+
     let tx = db::write_tx(conn)?;
 
     // Предыдущая попытка: живую вытесняем только по --steal, просроченную — всегда.
@@ -254,6 +268,18 @@ pub fn claim(
         });
     }
 
+    // Порядок проверок — по README §8.2: занятые файлы отказывают после аренды и блокеров,
+    // чтобы сообщение было про то, что мешает раньше по смыслу.
+    if let Some((existing, holder)) = resource::find_conflict(&tx, &reservations)? {
+        return Err(Error::ResourceReservationConflict {
+            kind: existing.kind.as_str().to_string(),
+            value: existing.value,
+            holder: holder.holder,
+            dot_id: holder.dot_id,
+            expires_at: holder.expires_at,
+        });
+    }
+
     let attempt_no: i64 = tx.query_row(
         "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM attempts WHERE node_id = ?1",
         params![node.id],
@@ -287,6 +313,30 @@ pub fn claim(
         other => Error::from(other),
     })?;
     let attempt_id = tx.last_insert_rowid();
+
+    if !reservations.is_empty() {
+        resource::insert_all(&tx, attempt_id, node.id, &reservations)?;
+        let listed = reservations
+            .iter()
+            .map(|r| r.key())
+            .collect::<Vec<_>>()
+            .join(", ");
+        activity::log(
+            &tx,
+            &Entry {
+                project_id: project.id,
+                node_id: Some(node.id),
+                entity_type: "node",
+                entity_id: node.id,
+                action: "reserve",
+                field_name: None,
+                old_value: None,
+                new_value: Some(listed.as_str()),
+                summary: Some(node.dot_id.as_str()),
+                actor: request.holder,
+            },
+        )?;
+    }
 
     tx.execute(
         "UPDATE nodes SET status = 'in_progress', updated_at = ?1 WHERE id = ?2",
@@ -322,6 +372,7 @@ pub fn claim(
         expires_at,
         inherited_checkpoint: inherited,
         superseded_attempt: superseded,
+        reservations: reservations.iter().map(|r| r.key()).collect(),
     })
 }
 
@@ -369,6 +420,11 @@ pub fn renew(
     )?;
     tx.commit()?;
 
+    let reservations = resource::attempt_reservations(conn, attempt.id)?
+        .iter()
+        .map(|r| r.key())
+        .collect();
+
     Ok(Lease {
         attempt_id: attempt.id,
         attempt_no: attempt.attempt_no,
@@ -381,6 +437,7 @@ pub fn renew(
         expires_at,
         inherited_checkpoint: attempt.checkpoint,
         superseded_attempt: None,
+        reservations,
     })
 }
 
@@ -580,27 +637,176 @@ pub struct Holding {
     pub started_at: String,
     pub expires_at: String,
     pub ttl_seconds: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reservations: Vec<String>,
 }
 
 pub fn holdings(conn: &Connection, project: &Project) -> Result<Vec<Holding>> {
     let now_text = now_iso();
     let mut stmt = conn.prepare(
-        "SELECT n.path, a.holder, a.attempt_no, a.started_at, a.expires_at, a.ttl_seconds
+        "SELECT n.path, a.holder, a.attempt_no, a.started_at, a.expires_at, a.ttl_seconds, a.id
          FROM attempts a
          JOIN nodes n ON n.id = a.node_id
          WHERE n.project_id = ?1 AND a.ended_at IS NULL AND a.expires_at > ?2
          ORDER BY a.expires_at",
     )?;
-    let rows = stmt.query_map(params![project.id, now_text], |row| {
-        let path: String = row.get(0)?;
-        Ok(Holding {
-            dot_id: project.dot_id(&path),
-            holder: row.get(1)?,
-            attempt_no: row.get(2)?,
-            started_at: row.get(3)?,
-            expires_at: row.get(4)?,
-            ttl_seconds: row.get(5)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    // Строки собираются вместе с id попытки: по нему досчитываются резервы.
+    let rows: Vec<(i64, Holding)> = stmt
+        .query_map(params![project.id, now_text], |row| {
+            let path: String = row.get(0)?;
+            let attempt_id: i64 = row.get(6)?;
+            Ok((
+                attempt_id,
+                Holding {
+                    dot_id: project.dot_id(&path),
+                    holder: row.get(1)?,
+                    attempt_no: row.get(2)?,
+                    started_at: row.get(3)?,
+                    expires_at: row.get(4)?,
+                    ttl_seconds: row.get(5)?,
+                    reservations: Vec::new(),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut holdings = Vec::with_capacity(rows.len());
+    for (attempt_id, mut holding) in rows {
+        holding.reservations = resource::attempt_reservations(conn, attempt_id)?
+            .iter()
+            .map(|r| r.key())
+            .collect();
+        holdings.push(holding);
+    }
+    Ok(holdings)
+}
+
+/// Добавляет резервы живой попытке по токену.
+pub fn reserve(
+    conn: &mut Connection,
+    project: &Project,
+    token: &str,
+    requested: &[resource::Resource],
+) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Err(Error::InvalidValue {
+            field: "reservation".to_string(),
+            value: "nothing requested".to_string(),
+        });
+    }
+    let mut normalized = Vec::with_capacity(requested.len());
+    for item in requested {
+        normalized.push(resource::normalize(item)?);
+    }
+
+    let now_text = now_iso();
+    let attempt = load_attempt(conn, token)?;
+    if attempt.ended_at.is_some() {
+        return Err(Error::NotYourAttempt);
+    }
+    if is_expired(&attempt.expires_at, &now_text) {
+        return Err(Error::LeaseExpired {
+            attempt_id: attempt.id,
+        });
+    }
+
+    let existing = resource::attempt_reservations(conn, attempt.id)?;
+    // Уже взятое тем же исполнителем не дублируется.
+    let fresh: Vec<resource::Resource> = normalized
+        .into_iter()
+        .filter(|want| !existing.contains(want))
+        .collect();
+    resource::check_limit(existing.len() as i64, fresh.len() as i64)?;
+
+    let tx = db::write_tx(conn)?;
+    if let Some((held, holder)) = resource::find_conflict_excluding(&tx, &fresh, attempt.id)? {
+        return Err(Error::ResourceReservationConflict {
+            kind: held.kind.as_str().to_string(),
+            value: held.value,
+            holder: holder.holder,
+            dot_id: holder.dot_id,
+            expires_at: holder.expires_at,
+        });
+    }
+    resource::insert_all(&tx, attempt.id, attempt.node_id, &fresh)?;
+    if !fresh.is_empty() {
+        let listed = fresh.iter().map(|r| r.key()).collect::<Vec<_>>().join(", ");
+        activity::log(
+            &tx,
+            &Entry {
+                project_id: project.id,
+                node_id: Some(attempt.node_id),
+                entity_type: "node",
+                entity_id: attempt.node_id,
+                action: "reserve",
+                field_name: None,
+                old_value: None,
+                new_value: Some(listed.as_str()),
+                summary: Some(attempt.dot_id.as_str()),
+                actor: attempt.holder.as_str(),
+            },
+        )?;
+    }
+    tx.commit()?;
+
+    Ok(resource::attempt_reservations(conn, attempt.id)?
+        .iter()
+        .map(|r| r.key())
+        .collect())
+}
+
+/// Снимает конкретные резервы живой попытки; `None` — снять все.
+pub fn unreserve(
+    conn: &mut Connection,
+    project: &Project,
+    token: &str,
+    requested: Option<&[resource::Resource]>,
+) -> Result<usize> {
+    let attempt = load_attempt(conn, token)?;
+    if attempt.ended_at.is_some() {
+        return Err(Error::NotYourAttempt);
+    }
+
+    let tx = db::write_tx(conn)?;
+    let removed = match requested {
+        None => resource::release_all(&tx, attempt.id)?,
+        Some(items) => {
+            let mut total = 0;
+            for item in items {
+                let normalized = resource::normalize(item)?;
+                total += tx.execute(
+                    "UPDATE reservations SET released_at = ?1
+                     WHERE attempt_id = ?2 AND released_at IS NULL
+                       AND kind = ?3 AND value = ?4",
+                    params![
+                        now_iso(),
+                        attempt.id,
+                        normalized.kind.as_str(),
+                        normalized.value
+                    ],
+                )?;
+            }
+            total
+        }
+    };
+    if removed > 0 {
+        let removed_text = removed.to_string();
+        activity::log(
+            &tx,
+            &Entry {
+                project_id: project.id,
+                node_id: Some(attempt.node_id),
+                entity_type: "node",
+                entity_id: attempt.node_id,
+                action: "unreserve",
+                field_name: None,
+                old_value: None,
+                new_value: Some(removed_text.as_str()),
+                summary: Some(attempt.dot_id.as_str()),
+                actor: attempt.holder.as_str(),
+            },
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed)
 }

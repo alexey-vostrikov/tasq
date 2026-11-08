@@ -312,6 +312,80 @@ fn only_one_process_wins_the_race() {
 }
 
 #[test]
+fn reserves_through_the_cli() {
+    let dir = temp_dir("reserves");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Epic"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Task A", "--parent", "TASQ-1"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Task B", "--parent", "TASQ-1"]).0, 0);
+
+    let (code, stdout, stderr) = run(
+        &dir,
+        &[
+            "claim",
+            "TASQ-1.1",
+            "--holder",
+            "agent-a",
+            "--reserve",
+            "src/api",
+            "--reserve-logical",
+            "port:8080",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("reserved   path:src/api"), "{stdout}");
+    assert!(stdout.contains("logical:port:8080"), "{stdout}");
+
+    // пересечение по границе сегмента — отказ с держателем
+    let (code, _, stderr) = run(
+        &dir,
+        &[
+            "claim",
+            "TASQ-1.2",
+            "--holder",
+            "agent-b",
+            "--reserve",
+            "src/api/handlers.rs",
+        ],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("RESOURCE_RESERVATION_CONFLICT"), "{stderr}");
+    assert!(stderr.contains("agent-a"), "{stderr}");
+
+    // соседний каталог свободен
+    let (code, stdout, stderr) = run(
+        &dir,
+        &[
+            "claim",
+            "TASQ-1.2",
+            "--holder",
+            "agent-b",
+            "--reserve",
+            "src/web",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let token_b = token_of(&stdout);
+
+    // holders показывает, кто что держит
+    let (_, stdout, _) = run(&dir, &["holders"]);
+    assert!(stdout.contains("path:src/api"), "{stdout}");
+    assert!(stdout.contains("path:src/web"), "{stdout}");
+
+    // снятие резерва освобождает ресурс для других
+    let (code, stdout, stderr) = run(&dir, &["unreserve", &token_b, "--path", "src/web"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("released 1"), "{stdout}");
+    let (code, _, stderr) = run(&dir, &["reserve", &token_b, "--path", "src/web"]);
+    assert_eq!(code, 0, "свой освобождённый ресурс берётся снова: {stderr}");
+
+    // а чужой резерв всё ещё держится: agent-a жив
+    let (code, _, stderr) = run(&dir, &["reserve", &token_b, "--path", "src/api"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("RESOURCE_RESERVATION_CONFLICT"), "{stderr}");
+}
+
+#[test]
 fn killed_holder_leaves_the_lease_until_it_expires() {
     let dir = temp_dir("killed");
     assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);

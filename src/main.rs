@@ -10,6 +10,7 @@ use tasq::error::{Error, Result};
 use tasq::lease;
 use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
+use tasq::resource;
 use tasq::status::{Kind, Status};
 use tasq::{activity, db};
 
@@ -194,6 +195,49 @@ enum Command {
         /// Checkpoint to store for the next holder
         #[arg(long)]
         checkpoint: Option<String>,
+        /// Take a file or directory (repeatable): --reserve src/api
+        #[arg(long, value_name = "PATH")]
+        reserve: Vec<String>,
+        /// Take a glob pattern (repeatable): --reserve-glob 'src/**/*.rs'
+        #[arg(long = "reserve-glob", value_name = "GLOB")]
+        reserve_glob: Vec<String>,
+        /// Take a logical key (repeatable): --reserve-logical port:8080
+        #[arg(long = "reserve-logical", value_name = "KEY")]
+        reserve_logical: Vec<String>,
+        /// Share instead of locking exclusively (applies to the reservations of this call)
+        #[arg(long)]
+        shared: bool,
+    },
+    /// Add reservations to a live lease
+    Reserve {
+        /// Lease token printed by `tasq claim`
+        token: String,
+        /// File or directory (repeatable)
+        #[arg(long, value_name = "PATH")]
+        path: Vec<String>,
+        /// Glob pattern (repeatable)
+        #[arg(long, value_name = "GLOB")]
+        glob: Vec<String>,
+        /// Logical key (repeatable)
+        #[arg(long, value_name = "KEY")]
+        logical: Vec<String>,
+        /// Shared reservation instead of exclusive
+        #[arg(long)]
+        shared: bool,
+    },
+    /// Drop reservations of a live lease (all of them without arguments)
+    Unreserve {
+        /// Lease token printed by `tasq claim`
+        token: String,
+        /// File or directory (repeatable)
+        #[arg(long, value_name = "PATH")]
+        path: Vec<String>,
+        /// Glob pattern (repeatable)
+        #[arg(long, value_name = "GLOB")]
+        glob: Vec<String>,
+        /// Logical key (repeatable)
+        #[arg(long, value_name = "KEY")]
+        logical: Vec<String>,
     },
     /// Extend a lease before it expires
     Renew {
@@ -253,6 +297,29 @@ fn parse_kind(value: &str) -> Result<Kind> {
         field: "kind".to_string(),
         value: value.to_string(),
     })
+}
+
+/// Собирает резервы из аргументов CLI в одном порядке: пути, шаблоны, логические ключи.
+fn collect_resources(
+    paths: &[String],
+    globs: &[String],
+    logical: &[String],
+    shared: bool,
+) -> Vec<resource::Resource> {
+    let mut items: Vec<resource::Resource> = Vec::new();
+    for value in paths {
+        items.push(resource::Resource::path(value));
+    }
+    for value in globs {
+        items.push(resource::Resource::glob(value));
+    }
+    for value in logical {
+        items.push(resource::Resource::logical(value));
+    }
+    if shared {
+        items = items.into_iter().map(|item| item.shared()).collect();
+    }
+    items
 }
 
 fn print_json<T: serde::Serialize>(value: &T) {
@@ -644,9 +711,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             steal,
             force,
             checkpoint,
+            reserve,
+            reserve_glob,
+            reserve_logical,
+            shared,
         } => {
             let (mut conn, project) = open(cli.db.as_deref())?;
             let holder = holder.clone().unwrap_or_else(|| "cli".to_string());
+            let resources = collect_resources(reserve, reserve_glob, reserve_logical, *shared);
             let lease = lease::claim(
                 &mut conn,
                 &project,
@@ -657,6 +729,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     steal: *steal,
                     force: *force,
                     checkpoint: checkpoint.as_deref(),
+                    reservations: resources,
                 },
             )?;
             if cli.json {
@@ -673,12 +746,55 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if let Some(attempt) = lease.superseded_attempt {
                 println!("superseded attempt #{attempt}");
             }
+            if !lease.reservations.is_empty() {
+                println!("reserved   {}", lease.reservations.join(", "));
+            }
             if let Some(note) = &lease.inherited_checkpoint {
                 println!("--- checkpoint from the previous attempt ---");
                 println!("{note}");
             }
             println!();
             println!("keep the token: renew and release need it");
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Reserve {
+            token,
+            path,
+            glob,
+            logical,
+            shared,
+        } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            let resources = collect_resources(path, glob, logical, *shared);
+            let held = lease::reserve(&mut conn, &project, token, &resources)?;
+            if cli.json {
+                print_json(&held);
+            } else {
+                println!("held: {}", held.join(", "));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Unreserve {
+            token,
+            path,
+            glob,
+            logical,
+        } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            let resources = collect_resources(path, glob, logical, false);
+            let requested = if resources.is_empty() {
+                None
+            } else {
+                Some(resources.as_slice())
+            };
+            let removed = lease::unreserve(&mut conn, &project, token, requested)?;
+            if cli.json {
+                print_json(&serde_json::json!({ "released": removed }));
+            } else {
+                println!("released {removed} reservation(s)");
+            }
             Ok(ExitCode::SUCCESS)
         }
 
@@ -740,6 +856,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     holding.expires_at,
                     holding.ttl_seconds
                 );
+                for reservation in &holding.reservations {
+                    println!("{:<18}   holds {reservation}", "");
+                }
             }
             Ok(ExitCode::SUCCESS)
         }

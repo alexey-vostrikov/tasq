@@ -11,6 +11,7 @@ pub mod error;
 pub mod lease;
 pub mod node;
 pub mod project;
+pub mod resource;
 pub mod status;
 
 pub use error::{Error, Result};
