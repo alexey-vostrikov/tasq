@@ -9,19 +9,24 @@ pub mod tools;
 
 use std::path::PathBuf;
 
-use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
-use crate::project::{self, Project};
+use crate::project;
 
 use profile::Profile;
 
-/// Сервер с открытой базой и выбранным профилем.
+/// Сервер с выбранным профилем.
+///
+/// База открывается при старте, но её отсутствие **не** мешает серверу подняться: клиент
+/// должен получить подключение и каталог инструментов, а не «connection closed» без причины.
+/// Внятный отказ приходит на сам вызов инструмента, и `tasq_init` умеет создать базу
+/// прямо из сессии.
 pub struct Server {
-    conn: Connection,
-    project: Project,
-    db_path: PathBuf,
+    /// Открытая база и проект; `None` — базы нет, см. `unavailable`.
+    context: Option<tools::Context>,
+    /// Почему база не открыта: код и текст ошибки для ответа на вызов.
+    unavailable: Option<(String, String)>,
     cwd: PathBuf,
     profile: Profile,
     /// Сколько вызовов инструментов обслужено — используется в тестах и `doctor`.
@@ -29,22 +34,35 @@ pub struct Server {
 }
 
 impl Server {
-    /// Открывает базу и проект; `db` — явный путь, иначе поиск `.tasq/tasq.db` вверх.
+    /// Пытается открыть базу и проект; `db` — явный путь, иначе поиск `.tasq/tasq.db` вверх.
+    /// Неудача запоминается, а не возвращается: сервер обязан ответить на рукопожатие.
     pub fn open(
         cwd: &std::path::Path,
         db: Option<&std::path::Path>,
         profile: Profile,
     ) -> Result<Self> {
+        let (context, unavailable) = match Self::connect(cwd, db) {
+            Ok(context) => (Some(context), None),
+            Err(err) => (None, Some((err.code().to_string(), err.to_string()))),
+        };
+        Ok(Server {
+            context,
+            unavailable,
+            cwd: cwd.to_path_buf(),
+            profile,
+            calls: 0,
+        })
+    }
+
+    fn connect(cwd: &std::path::Path, db: Option<&std::path::Path>) -> Result<tools::Context> {
         let db_path = crate::db::discover(cwd, db)?;
         let conn = crate::db::open_checked(&db_path)?;
         let project = project::default_project(&conn)?;
-        Ok(Server {
+        Ok(tools::Context {
             conn,
             project,
             db_path,
             cwd: cwd.to_path_buf(),
-            profile,
-            calls: 0,
         })
     }
 
@@ -52,8 +70,11 @@ impl Server {
         self.profile
     }
 
-    pub fn db_path(&self) -> &std::path::Path {
-        &self.db_path
+    /// Путь к базе, если она открыта.
+    pub fn db_path(&self) -> Option<&std::path::Path> {
+        self.context
+            .as_ref()
+            .map(|context| context.db_path.as_path())
     }
 
     /// Каталог инструментов для текущего профиля.
@@ -63,6 +84,25 @@ impl Server {
             .iter()
             .filter_map(|name| tools::definition(name))
             .collect()
+    }
+
+    /// Отказ «база не открыта» в том же формате, что и доменные ошибки инструментов.
+    fn no_database(&self, err: &(String, String)) -> Value {
+        json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&json!({
+                    "code": err.0,
+                    "message": err.1,
+                    "hint": format!(
+                        "no database from {} upward; call tasq_init to create one here, or pass --db / set TASQ_DB",
+                        self.cwd.display()
+                    ),
+                }))
+                .unwrap_or_default(),
+            }],
+            "isError": true,
+        })
     }
 
     /// Вызов инструмента с проверкой профиля.
@@ -104,19 +144,47 @@ impl Server {
                 "isError": true,
             });
         }
+
+        // Базы нет: `tasq_init` создаёт её здесь же, остальные вызовы получают отказ с кодом.
+        if self.context.is_none() {
+            if name != "tasq_init" {
+                let err = self.unavailable.clone().unwrap_or_else(|| {
+                    let err = Error::DbNotFound(self.cwd.display().to_string());
+                    (err.code().to_string(), err.to_string())
+                });
+                return self.no_database(&err);
+            }
+            let key = arguments
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or("TASQ");
+            let project_name = arguments.get("name").and_then(Value::as_str).unwrap_or(key);
+            match crate::db::init(&self.cwd, key, project_name).and_then(|outcome| {
+                let db_path = PathBuf::from(&outcome.db_path);
+                let conn = crate::db::open_checked(&db_path)?;
+                let project = project::default_project(&conn)?;
+                Ok(tools::Context {
+                    conn,
+                    project,
+                    db_path,
+                    cwd: self.cwd.clone(),
+                })
+            }) {
+                Ok(context) => {
+                    self.context = Some(context);
+                    self.unavailable = None;
+                }
+                Err(err) => {
+                    let code = err.code().to_string();
+                    let message = err.to_string();
+                    return self.no_database(&(code, message));
+                }
+            }
+        }
+
         self.calls += 1;
-        let mut ctx = tools::Context {
-            conn: std::mem::replace(
-                &mut self.conn,
-                Connection::open_in_memory().expect("scratch"),
-            ),
-            project: self.project.clone(),
-            db_path: self.db_path.clone(),
-            cwd: self.cwd.clone(),
-        };
-        let result = tools::call(&mut ctx, name, arguments);
-        self.conn = ctx.conn;
-        result
+        let context = self.context.as_mut().expect("база открыта выше");
+        tools::call(context, name, arguments)
     }
 }
 
@@ -149,11 +217,18 @@ pub fn serve(
     profile: Profile,
 ) -> Result<usize> {
     let mut server = Server::open(cwd, db, profile)?;
-    eprintln!(
-        "tasq mcp: profile {}, {} tool(s), database {}",
-        profile.as_str(),
-        server.catalogue().len(),
-        server.db_path().display()
-    );
+    match server.db_path() {
+        Some(path) => eprintln!(
+            "tasq mcp: profile {}, {} tool(s), database {}",
+            profile.as_str(),
+            server.catalogue().len(),
+            path.display()
+        ),
+        None => eprintln!(
+            "tasq mcp: profile {}, {} tool(s), no database yet (tasq_init will create one)",
+            profile.as_str(),
+            server.catalogue().len()
+        ),
+    }
     Ok(rpc::serve(&mut server)?)
 }

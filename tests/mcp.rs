@@ -410,3 +410,117 @@ fn migration_profile_moves_data_and_hides_work_tools() {
     let (_, stdout, _) = run(&target, &["ls"]);
     assert!(stdout.contains("Эпик"), "{stdout}");
 }
+
+/// Сервер без базы обязан подняться: клиент получает подключение и каталог, а внятный отказ
+/// приходит на вызов. Раньше сервер молча закрывал соединение, и клиент видел
+/// «connection closed» без причины — так и не подключился MCP-клиент у агента.
+#[test]
+fn server_starts_without_a_database_and_can_create_one() {
+    let dir = temp_dir("nodb");
+
+    let responses = session(
+        &dir,
+        "agent",
+        &[
+            initialize(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "node_list", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                   "params": {"name": "tasq_init", "arguments": {"key": "LIVE", "name": "Живой"}}}),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                   "params": {"name": "node_create", "arguments": {"title": "Эпик"}}}),
+        ],
+    );
+
+    // рукопожатие и каталог работают без базы
+    assert_eq!(responses[0]["result"]["serverInfo"]["name"], json!("tasq"));
+    let tools = responses[1]["result"]["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 28, "профиль agent целиком, без базы");
+
+    // вызов без базы — доменный отказ с кодом и подсказкой, а не закрытие соединения
+    let refused = &responses[2]["result"];
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    let payload: Value =
+        serde_json::from_str(refused["content"][0]["text"].as_str().expect("text")).expect("json");
+    assert_eq!(payload["code"], json!("DB_NOT_FOUND"));
+    assert!(
+        payload["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tasq_init"),
+        "подсказка называет способ создать базу: {payload}"
+    );
+
+    // tasq_init создаёт базу прямо в сессии, и дальше инструменты работают
+    let created = &responses[3]["result"];
+    assert_eq!(created["isError"], json!(false), "{created}");
+    let init: Value =
+        serde_json::from_str(created["content"][0]["text"].as_str().unwrap()).expect("json");
+    assert_eq!(init["project_key"], json!("LIVE"));
+
+    let node = &responses[4]["result"];
+    assert_eq!(node["isError"], json!(false), "{node}");
+    let node: Value =
+        serde_json::from_str(node["content"][0]["text"].as_str().unwrap()).expect("json");
+    assert_eq!(node["dot_id"], json!("LIVE-1"));
+
+    // и база осталась на диске после выхода
+    let (code, stdout, _) = run(&dir, &["ls"]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("LIVE-1"), "{stdout}");
+}
+
+/// `TASQ_DB` задаёт базу без флага: так её прописывают в конфиге MCP-клиента.
+#[test]
+fn tasq_db_environment_variable_selects_the_database() {
+    let project = temp_dir("envdb");
+    assert_eq!(run(&project, &["init", "--key", "ENV"]).0, 0);
+    assert_eq!(run(&project, &["add", "Эпик"]).0, 0);
+
+    // Работаем из пустого каталога: без переменной базы тут нет.
+    let elsewhere = temp_dir("envdb-elsewhere");
+    let mut child = Command::new(bin())
+        .current_dir(&elsewhere)
+        .env("TASQ_DB", project.join(".tasq/tasq.db"))
+        .args(["ls"])
+        .output()
+        .expect("run tasq");
+    assert!(
+        child.status.success(),
+        "TASQ_DB не подхватился: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(stdout.contains("ENV-1"), "{stdout}");
+
+    // И сервер тоже видит базу через переменную.
+    child = Command::new(bin())
+        .current_dir(&elsewhere)
+        .env("TASQ_DB", project.join(".tasq/tasq.db"))
+        .args(["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            {
+                let stdin = child.stdin.as_mut().expect("stdin");
+                writeln!(stdin, "{}", initialize())?;
+                writeln!(
+                    stdin,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                             "params": {"name": "node_list", "arguments": {}}})
+                )?;
+            }
+            child.wait_with_output()
+        })
+        .expect("run mcp");
+
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    let response: Value =
+        serde_json::from_str(stdout.lines().nth(1).expect("call response")).expect("json");
+    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+}

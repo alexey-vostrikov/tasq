@@ -28,7 +28,7 @@ use tasq::{activity, budget, burnup, comment, db, note, overview, template, tran
 )]
 struct Cli {
     /// Path to the database; overrides the upward search for .tasq/tasq.db
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", env = "TASQ_DB")]
     db: Option<PathBuf>,
 
     /// Machine-readable output
