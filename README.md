@@ -785,7 +785,30 @@ tasq --version | --help
 11. Экспорт → импорт в чистую БД даёт идентичный проект (dot-ID, рёбра, комментарии, заметки, шаблоны).
 12. `cargo fmt`/`clippy -D warnings`/`test`/`deny`/`tokens` зелёные на чистом клоне.
 
-## 22. Открытые вопросы (решить до M1)
+## 22. Сборка, гейты и CI
+
+Принцип: **на хосте rust-тулчейна нет, всё собирается в контейнере на базе `rust:1.99.1-bookworm`**,
+и локальные гейты, `act` и GitHub Actions используют один и тот же образ. Расхождение возможно только
+в версии rustfmt/clippy, поэтому они ставятся явно и там, и там.
+
+- `Dockerfile` — `FROM rust:1.99.1-bookworm` + `rustup component add rustfmt clippy`: официальный образ
+  этих компонентов не несёт, и без шага `cargo fmt --check` падает с «cargo-fmt is not installed».
+- `make` (по умолчанию) — `fmt` + `clippy` + `test`; `make build` — release-бинарь; `make smoke` —
+  `init` + `doctor` во временном каталоге внутри контейнера; `make act` — прогон workflow на хосте.
+- Кэш cargo/target — в `~/.cache/tasq/{cargo,target,home}`, вне репозитория; каталоги создаются от
+  хостового uid (`cache-init`), иначе docker создаёт их root-овыми и следующий прогон падает
+  `Permission denied`.
+- `.github/workflows/ci.yml` — job `check` с `container: rust:1.99.1-bookworm`; шаги: компоненты →
+  `fmt --check` → `clippy -D warnings` → `test` → `build --release` → smoke (`init` + `doctor --json`
+  с проверкой `"ok": true`). Тот же файл исполняет `act` с хоста.
+- Подводный камень `act`: шаги он запускает через `sh -e` (это dash), поэтому `set -euo pipefail` падает
+  `Illegal option -o pipefail`. У шага smoke явно указан `shell: bash` — на GitHub Actions поведение
+  не меняется, в `act` работает.
+- Готовый бинарь требует glibc ≥ 2.34 (фактический максимум символов — `GLIBC_2.34`, база bookworm 2.36);
+  для хостов старше Debian 12 / Astra надо пересобрать на более старой базе и проверить
+  `objdump -T | grep GLIBC_`.
+
+## 23. Открытые вопросы (решить до M1)
 
 1. **Идентификатор исполнителя**: строка от клиента (`holder`) или пара `holder + проект`? Влияет на
    `assigned_to` и на лог.
