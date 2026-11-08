@@ -603,3 +603,25 @@ fn glob_prefix_is_stripped_before_the_emptiness_check() {
     let twice = resource::normalize(&normalized).expect("повторная нормализация");
     assert_eq!(twice, normalized);
 }
+
+/// Пробел или табуляция на краю сегмента пути отвергается: иначе нормализация
+/// неидемпотентна (`a\t/` → `a\t`, повторный проход → `a`). Найдено property-тестом в CI.
+#[test]
+fn whitespace_at_segment_edges_is_rejected() {
+    // Пробелы на краю всего значения снимаются `trim` и потому идемпотентны — это нормально.
+    // Неидемпотентны только пробелы внутри пути, на краю сегмента.
+    for value in ["a\t/", "a /", "src/ a/x", "src/a \t/b"] {
+        match resource::normalize(&Resource::path(value)) {
+            Ok(normalized) => panic!("{value:?} принят как {:?}", normalized.value),
+            Err(error) => assert_eq!(error.code(), "INVALID_VALUE", "{value:?}"),
+        }
+    }
+
+    // Обычные пути не задеты.
+    for value in ["src/api", "src/api/", "./src/api", "src//api"] {
+        let normalized = resource::normalize(&Resource::path(value)).expect("normalize");
+        assert_eq!(normalized.value, "src/api", "{value:?}");
+        let twice = resource::normalize(&normalized).expect("twice");
+        assert_eq!(twice, normalized, "{value:?}");
+    }
+}

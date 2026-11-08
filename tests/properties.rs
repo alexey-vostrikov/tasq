@@ -95,7 +95,7 @@ fn any_mode() -> impl Strategy<Value = Mode> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
     /// Разбор ссылки не паникует: любой вход даёт либо узел, либо ошибку с кодом.
     #[test]

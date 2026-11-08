@@ -127,7 +127,19 @@ pub fn normalize_path(value: &str) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
     for component in path.components() {
         match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::Normal(part) => {
+                let part = part.to_string_lossy().to_string();
+                // Пробел или табуляция на краю сегмента делает нормализацию
+                // неидемпотентной: `a\t/` дал бы `a\t`, а повторный проход — уже `a`.
+                // Молча переименовывать заявку нельзя, поэтому такой путь отвергается.
+                if part.trim() != part {
+                    return Err(Error::InvalidValue {
+                        field: "path".to_string(),
+                        value: format!("whitespace at the edge of a segment in {trimmed:?}"),
+                    });
+                }
+                parts.push(part);
+            }
             Component::CurDir => {}
             Component::ParentDir => {
                 if parts.pop().is_none() {
