@@ -108,6 +108,10 @@ pub enum Error {
     #[error("path {0} is outside the project root")]
     PathOutsideProject(String),
 
+    /// Контрольная сумма экспорта не совпала с содержимым файла.
+    #[error("export checksum mismatch: file declares {expected}, content hashes to {actual}")]
+    ExportChecksumMismatch { expected: String, actual: String },
+
     /// Ребро зависимости соединяет узел сам с собой.
     #[error("cannot link {dot_id} to itself")]
     SelfEdge { dot_id: String },
@@ -181,6 +185,7 @@ impl Error {
             Error::ResourceReservationConflict { .. } => "RESOURCE_RESERVATION_CONFLICT",
             Error::TooManyReservations { .. } => "TOO_MANY_RESERVATIONS",
             Error::PathOutsideProject(_) => "PATH_OUTSIDE_PROJECT",
+            Error::ExportChecksumMismatch { .. } => "EXPORT_CHECKSUM_MISMATCH",
             Error::SelfEdge { .. } => "SELF_EDGE",
             Error::CrossProjectEdge { .. } => "CROSS_PROJECT_EDGE",
             Error::AncestorBlockEdge { .. } => "ANCESTOR_BLOCK_EDGE",
@@ -229,6 +234,9 @@ impl Error {
             }
             Error::TooManyReservations { .. } => "reserve a directory instead of its files",
             Error::PathOutsideProject(_) => "reservations are relative to the project root",
+            Error::ExportChecksumMismatch { .. } => {
+                "the file was edited after export; re-export it or restore the original"
+            }
             Error::SelfEdge { .. } => "a node cannot depend on itself",
             Error::CrossProjectEdge { .. } => "links only work inside one project",
             Error::AncestorBlockEdge { .. } => {

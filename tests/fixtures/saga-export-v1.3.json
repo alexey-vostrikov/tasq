@@ -1,0 +1,79 @@
+{
+  "format_version": "1.3",
+  "exported_at": "2026-10-30T10:00:00.000Z",
+  "project": {
+    "name": "Imported",
+    "description": "из saga",
+    "status": "active",
+    "tags": [],
+    "metadata": {},
+    "epics": [
+      {
+        "_original_id": 7,
+        "name": "Эпик из saga",
+        "description": "описание эпика",
+        "status": "in_progress",
+        "priority": "high",
+        "sort_order": 0,
+        "branch": "feature/x",
+        "tags": "[\"tag1\"]",
+        "metadata": "{}",
+        "tasks": [
+          {
+            "_original_id": 21,
+            "title": "Задача из saga",
+            "description": "тело",
+            "status": "completed",
+            "priority": "critical",
+            "sort_order": 0,
+            "assigned_to": "agent",
+            "estimated_hours": 3.5,
+            "actual_hours": 2.0,
+            "due_date": "2026-11-20",
+            "source_ref": "src/lib.rs:10",
+            "description_locked": true,
+            "tags": "[]",
+            "metadata": "{}",
+            "depends_on": [],
+            "subtasks": [
+              { "title": "Подзадача 1", "status": "done", "sort_order": 0 },
+              { "title": "Подзадача 2", "status": "todo", "sort_order": 1 }
+            ],
+            "comments": [
+              {
+                "author": "agent-a",
+                "content": "проверено",
+                "created_at": "2026-10-29T10:00:00.000Z",
+                "is_deleted": 0,
+                "deleted_at": null,
+                "deleted_by": null,
+                "delete_reason": null
+              }
+            ]
+          },
+          {
+            "_original_id": 22,
+            "title": "Вторая задача",
+            "status": "todo",
+            "priority": "medium",
+            "sort_order": 1,
+            "depends_on": [21],
+            "subtasks": [],
+            "comments": []
+          }
+        ]
+      }
+    ]
+  },
+  "notes": [
+    {
+      "title": "Решение из saga",
+      "content": "текст",
+      "note_type": "decision",
+      "related_entity_type": "task",
+      "_original_related_entity_id": 21,
+      "tags": "[]",
+      "metadata": "{}"
+    }
+  ]
+}

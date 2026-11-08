@@ -13,7 +13,7 @@ use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::resource;
 use tasq::status::{Kind, Status};
-use tasq::{activity, burnup, comment, db, note, overview, template};
+use tasq::{activity, burnup, comment, db, note, overview, template, transfer};
 
 #[derive(Parser)]
 #[command(
@@ -336,6 +336,29 @@ enum Command {
         /// Allowed lag between elapsed time and completed work, 0..1
         #[arg(long, default_value_t = 0.2)]
         threshold: f64,
+    },
+    /// Export the project as JSON with a checksum
+    Export {
+        /// Write to a file instead of stdout
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Include soft-deleted nodes
+        #[arg(long)]
+        include_deleted: bool,
+    },
+    /// Import a project from JSON
+    Import {
+        /// Path to the export file
+        file: PathBuf,
+        /// merge (add missing nodes) or replace (wipe and load)
+        #[arg(long, default_value = "merge")]
+        mode: String,
+        /// Read a saga-mcp tracker_export file
+        #[arg(long)]
+        from_saga: bool,
+        /// Validate and report without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1665,6 +1688,106 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     node.gap * 100.0,
                     node.title
                 );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Export {
+            out,
+            include_deleted,
+        } => {
+            let (conn, project) = open(cli.db.as_deref())?;
+            let document = transfer::export(&conn, &project, *include_deleted)?;
+            let text = serde_json::to_string_pretty(&document).expect("serialisable");
+            match out {
+                Some(path) => {
+                    std::fs::write(path, &text)?;
+                    if !cli.json {
+                        let summary = transfer::describe(&document);
+                        println!(
+                            "exported to {}: {} node(s), {} link(s), {} comment(s), {} note(s), {} template(s)",
+                            path.display(),
+                            summary["nodes"],
+                            summary["edges"],
+                            summary["comments"],
+                            summary["notes"],
+                            summary["templates"]
+                        );
+                        println!(
+                            "sha256 {}",
+                            document
+                                .get("sha256")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("-")
+                        );
+                    }
+                }
+                None => println!("{text}"),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Import {
+            file,
+            mode,
+            from_saga,
+            dry_run,
+        } => {
+            let mode_value = transfer::Mode::parse(mode).ok_or_else(|| Error::InvalidValue {
+                field: "mode".to_string(),
+                value: format!("{mode} (allowed: merge, replace)"),
+            })?;
+            let raw = std::fs::read_to_string(file)?;
+            let document: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|err| Error::InvalidValue {
+                    field: "file".to_string(),
+                    value: format!("not valid JSON: {err}"),
+                })?;
+
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            let result = if *from_saga {
+                if *dry_run {
+                    let nodes = document
+                        .get("project")
+                        .and_then(|value| value.get("epics"))
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    transfer::Imported {
+                        mode: "saga dry-run".to_string(),
+                        nodes_created: nodes,
+                        nodes_skipped: 0,
+                        edges: 0,
+                        comments: 0,
+                        notes: 0,
+                        templates: 0,
+                        checksum_verified: false,
+                    }
+                } else {
+                    transfer::import_saga(&mut conn, &project, &document, "-")?
+                }
+            } else if *dry_run {
+                transfer::dry_run(&conn, &project, &document)?
+            } else {
+                transfer::import(&mut conn, &project, &document, mode_value, "-")?
+            };
+
+            if cli.json {
+                print_json(&result);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "{}: {} node(s) created, {} skipped, {} link(s), {} comment(s), {} note(s), {} template(s)",
+                result.mode,
+                result.nodes_created,
+                result.nodes_skipped,
+                result.edges,
+                result.comments,
+                result.notes,
+                result.templates
+            );
+            if result.checksum_verified {
+                println!("checksum verified");
             }
             Ok(ExitCode::SUCCESS)
         }
