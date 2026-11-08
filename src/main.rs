@@ -384,6 +384,16 @@ enum Command {
         #[command(subcommand)]
         what: ListWhat,
     },
+    /// Change something: a project
+    Update {
+        #[command(subcommand)]
+        what: UpdateWhat,
+    },
+    /// Delete something: a project, with all of its content
+    Delete {
+        #[command(subcommand)]
+        what: DeleteWhat,
+    },
     /// Generate the reference documentation from the binary itself
     Docs {
         /// Where to write (default: docs)
@@ -445,6 +455,41 @@ enum CreateWhat {
 enum ListWhat {
     /// Projects of the current database, with live node counts
     Projects,
+}
+
+/// Что меняет команда `tasq update`.
+#[derive(Subcommand)]
+enum UpdateWhat {
+    /// Rename or re-status a project
+    Project {
+        /// Project to change (default: the --project value, else the first one)
+        key: Option<String>,
+        /// New human-readable name
+        #[arg(long)]
+        name: Option<String>,
+        /// New description
+        #[arg(long)]
+        description: Option<String>,
+        /// New status: active, on_hold, completed, archived
+        #[arg(long)]
+        status: Option<String>,
+        /// New key; every dot-ID of the project changes with it
+        #[arg(long, value_name = "KEY")]
+        new_key: Option<String>,
+    },
+}
+
+/// Что удаляет команда `tasq delete`.
+#[derive(Subcommand)]
+enum DeleteWhat {
+    /// Delete a project with all of its nodes, notes and history
+    Project {
+        /// Project to delete (default: the --project value, else the first one)
+        key: Option<String>,
+        /// Delete even when the project still has live nodes or is the last one
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -977,6 +1022,82 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         item.key, item.status, item.nodes, item.name
                     );
                 }
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+
+        Command::Update { what } => match what {
+            UpdateWhat::Project {
+                key,
+                name,
+                description,
+                status,
+                new_key,
+            } => {
+                let cwd = std::env::current_dir()?;
+                let path = db::discover(&cwd, cli.db.as_deref())?;
+                let mut conn = db::open_checked(&path)?;
+                // Порядок: явный ключ, затем глобальный --project, затем проект по умолчанию.
+                let target = key.as_deref().or(cli.project.as_deref());
+                let patch = project::Patch {
+                    name: name.as_deref(),
+                    description: description.as_deref(),
+                    status: status.as_deref(),
+                    key: new_key.as_deref(),
+                };
+                let (updated, previous_key) = project::update(&mut conn, target, &patch)?;
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "project": updated,
+                        "previous_key": previous_key,
+                        "nodes": project::live_nodes(&conn, &updated)?,
+                    }));
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if updated.key == previous_key {
+                    println!("updated project {} ({})", updated.key, updated.name);
+                } else {
+                    let nodes = project::live_nodes(&conn, &updated)?;
+                    println!(
+                        "project {} renamed to {} ({}, {} node(s))",
+                        previous_key, updated.key, updated.name, nodes
+                    );
+                    if nodes > 0 {
+                        // Ключ входит в dot-ID, поэтому переименование ключа меняет все адреса.
+                        println!(
+                            "all dot-IDs of this project now start with {}-",
+                            updated.key
+                        );
+                    }
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+
+        Command::Delete { what } => match what {
+            DeleteWhat::Project { key, force } => {
+                let cwd = std::env::current_dir()?;
+                let path = db::discover(&cwd, cli.db.as_deref())?;
+                let mut conn = db::open_checked(&path)?;
+                let target = key.as_deref().or(cli.project.as_deref());
+                let nodes = {
+                    let project = project::select(&conn, target)?;
+                    project::live_nodes(&conn, &project)?
+                };
+                let removed = project::delete(&mut conn, target, *force)?;
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "deleted": removed.key,
+                        "name": removed.name,
+                        "nodes": nodes,
+                    }));
+                    return Ok(ExitCode::SUCCESS);
+                }
+                println!(
+                    "deleted project {} ({}) with {} live node(s)",
+                    removed.key, removed.name, nodes
+                );
+                println!("remaining: {}", project::known_keys(&conn)?);
                 Ok(ExitCode::SUCCESS)
             }
         },

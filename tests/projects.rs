@@ -238,3 +238,239 @@ fn creating_a_project_needs_a_database() {
         "база не создаётся побочным эффектом"
     );
 }
+
+#[test]
+fn a_project_is_renamed_by_name() {
+    let dir = temp_dir("rename-name");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    assert_eq!(run(&dir, &["create", "project", "PRJ"]).0, 0);
+
+    let (code, stdout, stderr) = run(&dir, &["update", "project", "PRJ", "--name", "Новое имя"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("updated project PRJ"), "{stdout}");
+
+    let (_, stdout, _) = run(&dir, &["--json", "list", "projects"]);
+    let projects: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let prj = projects
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|project| project["key"] == serde_json::json!("PRJ"))
+        .expect("PRJ");
+    assert_eq!(prj["name"], serde_json::json!("Новое имя"));
+}
+
+/// Ключ входит в dot-ID, поэтому его смена — операция над всем проектом: адреса узлов
+/// меняются разом, и это должно быть видно в выводе, а не выясняться потом.
+#[test]
+fn renaming_the_key_moves_every_dot_id() {
+    let dir = temp_dir("rename-key");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    assert_eq!(run(&dir, &["create", "project", "PRJ"]).0, 0);
+    assert_eq!(run(&dir, &["--project", "PRJ", "add", "Задача"]).0, 0);
+    assert_eq!(run(&dir, &["--project", "PRJ", "add", "Вторая"]).0, 0);
+
+    let (code, stdout, stderr) = run(&dir, &["update", "project", "PRJ", "--new-key", "BETA"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("renamed to BETA"), "{stdout}");
+    assert!(
+        stdout.contains("dot-IDs of this project now start with BETA-"),
+        "предупреждение о смене адресов есть:
+{stdout}"
+    );
+
+    // Новые адреса работают, старых больше нет.
+    let (_, stdout, _) = run(&dir, &["--project", "BETA", "ls"]);
+    assert!(stdout.contains("BETA-1"), "{stdout}");
+    assert!(stdout.contains("BETA-2"), "{stdout}");
+    assert!(
+        !stdout.contains("PRJ-"),
+        "старый префикс исчез:
+{stdout}"
+    );
+
+    let (code, _, stderr) = run(&dir, &["--project", "PRJ", "ls"]);
+    assert_eq!(code, 1, "старый ключ больше не проект: {stderr}");
+    assert!(stderr.contains("PROJECT_NOT_FOUND"), "{stderr}");
+}
+
+#[test]
+fn a_key_collision_on_rename_is_refused() {
+    let dir = temp_dir("rename-collision");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    assert_eq!(run(&dir, &["create", "project", "PRJ"]).0, 0);
+
+    let (code, _, stderr) = run(&dir, &["update", "project", "PRJ", "--new-key", "ALPHA"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("DUPLICATE_KEY"), "{stderr}");
+
+    // Ключ проекта остался прежним.
+    let (_, stdout, _) = run(&dir, &["--json", "list", "projects"]);
+    let projects: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert!(
+        projects
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|project| project["key"] == serde_json::json!("PRJ"))
+    );
+}
+
+#[test]
+fn status_is_validated_against_the_schema() {
+    let dir = temp_dir("status");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+
+    let (code, _, stderr) = run(
+        &dir,
+        &["update", "project", "ALPHA", "--status", "nonsense"],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("INVALID_VALUE"), "{stderr}");
+    assert!(
+        stderr.contains("on_hold"),
+        "перечислены допустимые:
+{stderr}"
+    );
+
+    let (code, _, stderr) = run(
+        &dir,
+        &["update", "project", "ALPHA", "--status", "archived"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (_, stdout, _) = run(&dir, &["--json", "list", "projects"]);
+    let projects: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(projects[0]["status"], serde_json::json!("archived"));
+}
+
+#[test]
+fn updating_nothing_is_an_error() {
+    let dir = temp_dir("nochange");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    let (code, _, stderr) = run(&dir, &["update", "project", "ALPHA"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("nothing to change"), "{stderr}");
+}
+
+#[test]
+fn a_non_empty_project_needs_force_to_be_deleted() {
+    let dir = temp_dir("delete-nonempty");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    assert_eq!(run(&dir, &["create", "project", "PRJ"]).0, 0);
+    assert_eq!(run(&dir, &["--project", "PRJ", "add", "Задача"]).0, 0);
+
+    let (code, _, stderr) = run(&dir, &["delete", "project", "PRJ"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("PROJECT_NOT_EMPTY"), "{stderr}");
+    assert!(
+        stderr.contains("--force"),
+        "подсказка называет флаг:
+{stderr}"
+    );
+
+    // Отказ ничего не удалил.
+    let (_, stdout, _) = run(&dir, &["list", "projects"]);
+    assert!(stdout.contains("PRJ"), "{stdout}");
+
+    let (code, stdout, stderr) = run(&dir, &["delete", "project", "PRJ", "--force"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("deleted project PRJ"), "{stdout}");
+    assert!(stdout.contains("remaining: ALPHA"), "{stdout}");
+
+    let (_, stdout, _) = run(&dir, &["list", "projects"]);
+    assert!(
+        !stdout.contains("PRJ"),
+        "проект удалён:
+{stdout}"
+    );
+}
+
+#[test]
+fn deletion_takes_the_content_with_it() {
+    let dir = temp_dir("delete-cascade");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    assert_eq!(run(&dir, &["create", "project", "PRJ"]).0, 0);
+    assert_eq!(run(&dir, &["--project", "PRJ", "add", "Эпик"]).0, 0);
+    assert_eq!(
+        run(
+            &dir,
+            &["--project", "PRJ", "add", "Задача", "--parent", "PRJ-1"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        run(
+            &dir,
+            &[
+                "--project",
+                "PRJ",
+                "note",
+                "save",
+                "--title",
+                "N",
+                "--content",
+                "c"
+            ]
+        )
+        .0,
+        0
+    );
+    assert_eq!(run(&dir, &["delete", "project", "PRJ", "--force"]).0, 0);
+
+    // Каскад сработал: в базе не осталось ни узлов, ни заметок чужого проекта.
+    let (_, stdout, _) = run(&dir, &["--json", "list", "projects"]);
+    let projects: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(projects.as_array().map(Vec::len), Some(1));
+    assert_eq!(projects[0]["nodes"], serde_json::json!(0));
+
+    let (code, _, stderr) = run(&dir, &["doctor", "--check"]);
+    assert_eq!(code, 0, "целостность после каскада: {stderr}");
+}
+
+#[test]
+fn the_last_project_cannot_be_deleted_without_force() {
+    let dir = temp_dir("delete-last");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+
+    let (code, _, stderr) = run(&dir, &["delete", "project", "ALPHA"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("LAST_PROJECT"), "{stderr}");
+
+    let (code, _, stderr) = run(&dir, &["delete", "project", "ALPHA", "--force"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    // База без проектов — состояние, о котором команды говорят прямо.
+    let (code, _, stderr) = run(&dir, &["ls"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("NO_PROJECT"), "{stderr}");
+}
+
+#[test]
+fn update_and_delete_default_to_the_selected_project() {
+    let dir = temp_dir("defaults");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    assert_eq!(run(&dir, &["create", "project", "PRJ"]).0, 0);
+
+    // Без аргумента берётся проект из --project, а не первый по порядку.
+    let (code, stdout, stderr) = run(
+        &dir,
+        &[
+            "--project",
+            "PRJ",
+            "update",
+            "project",
+            "--name",
+            "Из селектора",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("updated project PRJ"), "{stdout}");
+
+    let (code, _, stderr) = run(&dir, &["--project", "PRJ", "delete", "project"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let (_, stdout, _) = run(&dir, &["list", "projects"]);
+    assert!(stdout.contains("ALPHA"), "{stdout}");
+    assert!(!stdout.contains("PRJ"), "{stdout}");
+}

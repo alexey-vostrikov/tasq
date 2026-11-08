@@ -26,6 +26,18 @@ pub enum Error {
     #[error("project {key} not found (known: {known})")]
     ProjectNotFound { key: String, known: String },
 
+    /// Удаление непустого проекта без явного согласия.
+    #[error(
+        "project {key} still has {nodes} live node(s); use --force to delete it with everything"
+    )]
+    ProjectNotEmpty { key: String, nodes: i64 },
+
+    /// Удаление последнего проекта в базе.
+    #[error(
+        "project {0} is the only one in this database; use --force or delete the database file"
+    )]
+    LastProject(String),
+
     /// Ключ проекта не проходит `[A-Z0-9]{2,8}`.
     #[error("invalid project key {0}: expected 2-8 characters of A-Z and 0-9")]
     InvalidKey(String),
@@ -173,6 +185,8 @@ impl Error {
             Error::SchemaTooNew { .. } => "SCHEMA_TOO_NEW",
             Error::DuplicateKey(_) => "DUPLICATE_KEY",
             Error::ProjectNotFound { .. } => "PROJECT_NOT_FOUND",
+            Error::ProjectNotEmpty { .. } => "PROJECT_NOT_EMPTY",
+            Error::LastProject(_) => "LAST_PROJECT",
             Error::InvalidKey(_) => "INVALID_KEY",
             Error::InvalidRef(_) => "INVALID_REF",
             Error::NodeNotFound(_) => "NODE_NOT_FOUND",
@@ -211,6 +225,10 @@ impl Error {
             Error::SchemaTooNew { .. } => "upgrade the tasq binary; downgrades are not supported",
             Error::DuplicateKey(_) => "pick another key or reuse the existing project",
             Error::ProjectNotFound { .. } => "run `tasq list projects` to see the available keys",
+            Error::ProjectNotEmpty { .. } => {
+                "archive it instead, or pass --force to delete the content"
+            }
+            Error::LastProject(_) => "keep at least one project, or remove the database itself",
             Error::InvalidKey(_) => "use uppercase letters and digits, for example TASQ or API2",
             Error::InvalidRef(_) => "run `tasq ls` to see the available dot-notation IDs",
             Error::NodeNotFound(_) => "run `tasq ls` to see the available nodes",

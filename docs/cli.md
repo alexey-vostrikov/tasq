@@ -644,6 +644,49 @@ Projects of the current database, with live node counts
 tasq projects [ОПЦИИ]
 ```
 
+## `update`
+
+Change something: a project
+
+```
+tasq update [ОПЦИИ]
+```
+
+### `project`
+
+Rename or re-status a project
+
+```
+tasq project [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--name` | `NAME` | — | New human-readable name |
+| `--description` | `DESCRIPTION` | — | New description |
+| `--status` | `STATUS` | — | New status: active, on_hold, completed, archived |
+| `--new-key` | `KEY` | — | New key; every dot-ID of the project changes with it |
+
+## `delete`
+
+Delete something: a project, with all of its content
+
+```
+tasq delete [ОПЦИИ]
+```
+
+### `project`
+
+Delete a project with all of its nodes, notes and history
+
+```
+tasq project [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--force` | — | — | Delete even when the project still has live nodes or is the last one |
+
 ## `docs`
 
 Generate the reference documentation from the binary itself
