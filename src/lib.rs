@@ -5,8 +5,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod activity;
 pub mod db;
 pub mod error;
+pub mod node;
+pub mod project;
+pub mod status;
 
 pub use error::{Error, Result};
 

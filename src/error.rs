@@ -1,4 +1,4 @@
-//! Domain errors with stable machine-readable codes (README §18).
+//! Domain errors with stable machine-readable codes (README §19).
 
 use serde::Serialize;
 
@@ -9,6 +9,10 @@ pub enum Error {
     /// Файла базы нет: работа без `tasq init` бессмысленна.
     #[error("no tasq database found (looked for .tasq/tasq.db upwards from {0})")]
     DbNotFound(String),
+
+    /// В базе нет ни одного проекта.
+    #[error("no project in the database")]
+    NoProject,
 
     /// `meta.schema_version` больше, чем знает этот бинарь.
     #[error("database schema version {found} is newer than supported {supported}")]
@@ -22,6 +26,66 @@ pub enum Error {
     #[error("invalid project key {0}: expected 2-8 characters of A-Z and 0-9")]
     InvalidKey(String),
 
+    /// Ссылка не разобрана: ни dot-ID, ни `#id`.
+    #[error("invalid node reference {0}: expected KEY-12.3.1, 12.3.1 or #4711")]
+    InvalidRef(String),
+
+    /// Узел не найден (или удалён).
+    #[error("node {0} not found")]
+    NodeNotFound(String),
+
+    /// Одна и та же ссылка подходит к узлам разных проектов.
+    #[error("reference {0} is ambiguous: {1}")]
+    AmbiguousId(String, String),
+
+    /// Переход не разрешён матрицей.
+    #[error("cannot move {kind} from {from} to {to}")]
+    InvalidTransition {
+        from: String,
+        to: String,
+        kind: String,
+    },
+
+    /// Переход из закрытого состояния требует `force`.
+    #[error("moving from {from} to {to} requires force")]
+    ForceRequired { from: String, to: String },
+
+    /// У узла есть незавершённые дети.
+    #[error("node {dot_id} has {unfinished} unfinished child(ren)")]
+    ChildrenUnfinished { dot_id: String, unfinished: i64 },
+
+    /// Незакрытые блокеры.
+    #[error("node {dot_id} is blocked by {blockers}")]
+    UnmetPrerequisites { dot_id: String, blockers: String },
+
+    /// Постановка защищена от перезаписи.
+    #[error("description of {dot_id} is locked")]
+    DescriptionLocked { dot_id: String },
+
+    /// `in_progress` даёт только живая аренда.
+    #[error("status in_progress requires an active lease; use `tasq claim`")]
+    LeaseRequired,
+
+    /// Действие допустимо только для `todo`.
+    #[error("node {dot_id} is {status}: only todo nodes can be removed")]
+    NotRemovable { dot_id: String, status: String },
+
+    /// Узел уже в целевом состоянии (архив/удаление).
+    #[error("node {dot_id} is already {state}")]
+    AlreadyInState { dot_id: String, state: String },
+
+    /// Глубина или длина пути за пределом (64 сегмента, 200 байт).
+    #[error("node path would exceed the depth limit (64 segments, 200 bytes)")]
+    DepthLimit,
+
+    /// Родитель не может быть потомком перемещаемого узла.
+    #[error("cannot move {dot_id} under its own descendant {target}")]
+    MoveIntoSelf { dot_id: String, target: String },
+
+    /// Поле не проходит проверку.
+    #[error("invalid {field} value {value}")]
+    InvalidValue { field: String, value: String },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -33,9 +97,24 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Error::DbNotFound(_) => "DB_NOT_FOUND",
+            Error::NoProject => "NO_PROJECT",
             Error::SchemaTooNew { .. } => "SCHEMA_TOO_NEW",
             Error::DuplicateKey(_) => "DUPLICATE_KEY",
             Error::InvalidKey(_) => "INVALID_KEY",
+            Error::InvalidRef(_) => "INVALID_REF",
+            Error::NodeNotFound(_) => "NODE_NOT_FOUND",
+            Error::AmbiguousId(_, _) => "AMBIGUOUS_ID",
+            Error::InvalidTransition { .. } => "INVALID_TRANSITION",
+            Error::ForceRequired { .. } => "FORCE_REQUIRED",
+            Error::ChildrenUnfinished { .. } => "CHILDREN_UNFINISHED",
+            Error::UnmetPrerequisites { .. } => "UNMET_PREREQUISITES",
+            Error::DescriptionLocked { .. } => "DESCRIPTION_LOCKED",
+            Error::LeaseRequired => "LEASE_REQUIRED",
+            Error::NotRemovable { .. } => "NOT_REMOVABLE",
+            Error::AlreadyInState { .. } => "ALREADY_IN_STATE",
+            Error::DepthLimit => "DEPTH_LIMIT",
+            Error::MoveIntoSelf { .. } => "MOVE_INTO_SELF",
+            Error::InvalidValue { .. } => "INVALID_VALUE",
             Error::Io(_) | Error::Sqlite(_) => "STORAGE_ERROR",
         }
     }
@@ -43,9 +122,32 @@ impl Error {
     pub fn hint(&self) -> &'static str {
         match self {
             Error::DbNotFound(_) => "run `tasq init` in the project root",
+            Error::NoProject => "run `tasq init` to register a project",
             Error::SchemaTooNew { .. } => "upgrade the tasq binary; downgrades are not supported",
             Error::DuplicateKey(_) => "pick another key or reuse the existing project",
             Error::InvalidKey(_) => "use uppercase letters and digits, for example TASQ or API2",
+            Error::InvalidRef(_) => "run `tasq ls` to see the available dot-notation IDs",
+            Error::NodeNotFound(_) => "run `tasq ls` to see the available nodes",
+            Error::AmbiguousId(_, _) => "prefix the reference with the project key",
+            Error::InvalidTransition { .. } => "see the transition matrix in the README, §7",
+            Error::ForceRequired { .. } => "add --force to reopen a closed node",
+            Error::ChildrenUnfinished { .. } => {
+                "finish or cancel the children first, or add --force"
+            }
+            Error::UnmetPrerequisites { .. } => {
+                "unblock the referenced nodes first, or add --force"
+            }
+            Error::DescriptionLocked { .. } => {
+                "unlock the description first (tasq set --unlock-desc)"
+            }
+            Error::LeaseRequired => "take a lease with `tasq claim` (M2)",
+            Error::NotRemovable { .. } => {
+                "closed work keeps its history; cancel or archive it instead"
+            }
+            Error::AlreadyInState { .. } => "nothing to do",
+            Error::DepthLimit => "flatten the tree or move the node higher",
+            Error::MoveIntoSelf { .. } => "pick a parent outside the moved subtree",
+            Error::InvalidValue { .. } => "check the allowed values with --help",
             Error::Io(_) | Error::Sqlite(_) => "check file permissions and disk space",
         }
     }
@@ -61,7 +163,7 @@ impl Error {
     }
 }
 
-/// Единая форма успешного вывода при `--json`.
+/// Форма ошибки в `--json` для потребителей, которым нужен тип.
 #[derive(Debug, Serialize)]
 pub struct JsonError {
     pub code: &'static str,
