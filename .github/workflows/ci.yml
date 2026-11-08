@@ -9,7 +9,9 @@ on:
 # поэтому гейты на хосте и в GitHub Actions не расходятся.
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # ОС раннера фиксируется: работа всё равно идёт в контейнере,
+    # а ubuntu-latest уже объявлен к переезду на Ubuntu 26.
+    runs-on: ubuntu-24.04
     container: rust:1.99.1-bookworm
     env:
       CARGO_TERM_COLOR: always
