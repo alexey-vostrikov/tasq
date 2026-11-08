@@ -3,7 +3,7 @@
 Файл сгенерирован командой `tasq docs`; править его руками бессмысленно — гейт `tasq docs --check` в CI падает, если содержимое разошлось с бинарём.
 
 ```
-tasq 0.1.2
+tasq 0.2.0
 Local-first task tracker for AI agents
 ```
 
