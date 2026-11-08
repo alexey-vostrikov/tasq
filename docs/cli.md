@@ -13,6 +13,7 @@ Local-first task tracker for AI agents
 | --- | --- | --- | --- |
 | `--db` | `PATH` | — | Path to the database; overrides the upward search for .tasq/tasq.db |
 | `--json` | — | — | Machine-readable output |
+| `--project` | `KEY` | — | Project key to work in (default: the first project by creation order) |
 
 
 ## Команды
@@ -606,6 +607,42 @@ tasq mcp [ОПЦИИ]
 | флаг | значение | по умолчанию | описание |
 | --- | --- | --- | --- |
 | `--profile` | `PROFILE` | `full` | Tool profile: full \| agent \| read-only \| migration |
+
+## `create`
+
+Create something: a project
+
+```
+tasq create [ОПЦИИ]
+```
+
+### `project`
+
+Create a project in the current database
+
+```
+tasq project [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--name` | `NAME` | — | Human-readable name (default: the key) |
+
+## `list`
+
+List things: projects
+
+```
+tasq list [ОПЦИИ]
+```
+
+### `projects`
+
+Projects of the current database, with live node counts
+
+```
+tasq projects [ОПЦИИ]
+```
 
 ## `docs`
 

@@ -22,6 +22,10 @@ pub enum Error {
     #[error("project key {0} is already used")]
     DuplicateKey(String),
 
+    /// Проекта с указанным ключом нет в базе.
+    #[error("project {key} not found (known: {known})")]
+    ProjectNotFound { key: String, known: String },
+
     /// Ключ проекта не проходит `[A-Z0-9]{2,8}`.
     #[error("invalid project key {0}: expected 2-8 characters of A-Z and 0-9")]
     InvalidKey(String),
@@ -168,6 +172,7 @@ impl Error {
             Error::NoProject => "NO_PROJECT",
             Error::SchemaTooNew { .. } => "SCHEMA_TOO_NEW",
             Error::DuplicateKey(_) => "DUPLICATE_KEY",
+            Error::ProjectNotFound { .. } => "PROJECT_NOT_FOUND",
             Error::InvalidKey(_) => "INVALID_KEY",
             Error::InvalidRef(_) => "INVALID_REF",
             Error::NodeNotFound(_) => "NODE_NOT_FOUND",
@@ -205,6 +210,7 @@ impl Error {
             Error::NoProject => "run `tasq init` to register a project",
             Error::SchemaTooNew { .. } => "upgrade the tasq binary; downgrades are not supported",
             Error::DuplicateKey(_) => "pick another key or reuse the existing project",
+            Error::ProjectNotFound { .. } => "run `tasq list projects` to see the available keys",
             Error::InvalidKey(_) => "use uppercase letters and digits, for example TASQ or API2",
             Error::InvalidRef(_) => "run `tasq ls` to see the available dot-notation IDs",
             Error::NodeNotFound(_) => "run `tasq ls` to see the available nodes",
