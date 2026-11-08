@@ -62,6 +62,14 @@ pub fn discover(start: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Открывает соединение с нужными прагмами. Файл базы должен существовать.
+///
+/// Регистрирует две функции, которых нет в SQLite по умолчанию:
+/// - `uni_lower(text)` — приведение к нижнему регистру по правилам Unicode. Встроенный
+///   `lower()` в SQLite понимает только ASCII, поэтому `lower('Миграции')` возвращает строку
+///   без изменений и кириллический поиск молча становится регистрозависимым
+///   (аналог истории с utf8 против utf8mb4 в MySQL);
+/// - коллация `UNICODE_NOCASE` — сравнение и сортировка без учёта регистра для любого письма.
+///   Встроенная `NOCASE` тоже ограничена ASCII.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -70,7 +78,26 @@ pub fn open(path: &Path) -> Result<Connection> {
          PRAGMA foreign_keys = ON;
          PRAGMA busy_timeout = 5000;",
     )?;
+    register_unicode(&conn)?;
     Ok(conn)
+}
+
+/// Регистрирует Unicode-осведомлённые `uni_lower` и `UNICODE_NOCASE`.
+fn register_unicode(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "uni_lower",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text: String = ctx.get(0)?;
+            Ok(text.to_lowercase())
+        },
+    )?;
+    conn.create_collation("UNICODE_NOCASE", |a, b| {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    })?;
+    Ok(())
 }
 
 /// Транзакция записи: `BEGIN IMMEDIATE` (README §5).

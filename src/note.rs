@@ -263,7 +263,7 @@ pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<Vec<N
     let needle = format!("%{}%", query.trim().to_lowercase());
     let mut stmt = conn.prepare(&format!(
         "{NOTE_SELECT} WHERE n.project_id = ?1
-           AND (lower(n.title) LIKE ?2 OR lower(n.content) LIKE ?2)
+           AND (uni_lower(n.title) LIKE ?2 OR uni_lower(n.content) LIKE ?2)
          ORDER BY n.created_at DESC"
     ))?;
     let rows = stmt.query_map(params![project.id, needle], |row| map_note(row, project))?;

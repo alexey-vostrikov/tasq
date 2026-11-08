@@ -66,7 +66,9 @@ fn like_notes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<H
     );
     let mut values: Vec<Value> = vec![Value::Integer(project.id)];
     for word in &words {
-        sql.push_str(" AND (instr(lower(nt.title), ?) > 0 OR instr(lower(nt.content), ?) > 0)");
+        sql.push_str(
+            " AND (instr(uni_lower(nt.title), ?) > 0 OR instr(uni_lower(nt.content), ?) > 0)",
+        );
         values.push(Value::Text(word.clone()));
         values.push(Value::Text(word.clone()));
     }
@@ -179,7 +181,7 @@ fn like_nodes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<H
     let mut values: Vec<Value> = vec![Value::Integer(project.id)];
     for word in &words {
         sql.push_str(
-            " AND (instr(lower(title), ?) > 0 OR instr(lower(COALESCE(description, '')), ?) > 0)",
+            " AND (instr(uni_lower(title), ?) > 0 OR instr(uni_lower(COALESCE(description, '')), ?) > 0)",
         );
         values.push(Value::Text(word.clone()));
         values.push(Value::Text(word.clone()));

@@ -13,7 +13,7 @@ use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::resource;
 use tasq::status::{Kind, Status};
-use tasq::{activity, comment, db, note, overview, template};
+use tasq::{activity, burnup, comment, db, note, overview, template};
 
 #[derive(Parser)]
 #[command(
@@ -309,6 +309,33 @@ enum Command {
     Bulk {
         #[command(subcommand)]
         command: BulkCommand,
+    },
+    /// Burn-up: scope against completed work, with a forecast
+    Burnup {
+        /// Metric: count | points | hours
+        #[arg(long, default_value = "count")]
+        metric: String,
+        /// Start day, YYYY-MM-DD
+        #[arg(long)]
+        since: Option<String>,
+        /// End day, YYYY-MM-DD
+        #[arg(long)]
+        until: Option<String>,
+        /// Draw an ASCII chart
+        #[arg(long)]
+        ascii: bool,
+        /// Write snapshots for the whole series
+        #[arg(long)]
+        snapshot: bool,
+        /// Chart width in columns
+        #[arg(long, default_value_t = 70)]
+        width: usize,
+    },
+    /// Nodes that fall behind their own due date
+    Risk {
+        /// Allowed lag between elapsed time and completed work, 0..1
+        #[arg(long, default_value_t = 0.2)]
+        threshold: f64,
     },
 }
 
@@ -1531,6 +1558,117 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 })
             }
         },
+
+        Command::Burnup {
+            metric,
+            since,
+            until,
+            ascii,
+            snapshot,
+            width,
+        } => {
+            let metric = burnup::Metric::parse(metric).ok_or_else(|| Error::InvalidValue {
+                field: "metric".to_string(),
+                value: format!("{metric} (allowed: count, points, hours)"),
+            })?;
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            let series =
+                burnup::series(&conn, &project, metric, since.as_deref(), until.as_deref())?;
+
+            if *snapshot {
+                let written = burnup::snapshot_all(&mut conn, &project, metric)?;
+                if !cli.json {
+                    println!("snapshots written: {written}\n");
+                }
+            }
+
+            if cli.json {
+                print_json(&series);
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            println!(
+                "{}  metric {}  scope {:.1}  done {:.1}  added {:.1}",
+                series.project,
+                series.metric,
+                series.scope_total,
+                series.scope_done,
+                series.scope_added
+            );
+            if let Some(days) = series.days_left {
+                if days < 0 {
+                    println!("deadline passed {} day(s) ago", -days);
+                } else {
+                    println!("deadline in {days} day(s)");
+                }
+            }
+            if let Some(forecast) = &series.forecast {
+                let tail = match forecast.days_late {
+                    Some(late) if late > 0 => format!(", {late} day(s) late"),
+                    Some(late) if late < 0 => format!(", {} day(s) early", -late),
+                    Some(_) => ", on time".to_string(),
+                    None => String::new(),
+                };
+                println!(
+                    "forecast {} at {:.2}/day over {} day(s){tail}",
+                    forecast.day, forecast.rate_per_day, forecast.window_days
+                );
+            } else if series.scope_done < series.scope_total {
+                println!("forecast: no completed work in the window, cannot extrapolate");
+            }
+
+            if *ascii {
+                println!();
+                print!("{}", burnup::ascii(&series, *width));
+            } else {
+                // Без графика — компактная таблица последних точек.
+                let tail = series.points.iter().rev().take(7).collect::<Vec<_>>();
+                for point in tail.iter().rev() {
+                    println!(
+                        "  {}  total {:>6.1}  done {:>6.1}  added {:>5.1}",
+                        point.day, point.total, point.done, point.added
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Risk { threshold } => {
+            if !(0.0..=1.0).contains(threshold) {
+                return Err(Error::InvalidValue {
+                    field: "threshold".to_string(),
+                    value: format!("{threshold} (expected 0..1)"),
+                });
+            }
+            let (conn, project) = open(cli.db.as_deref())?;
+            let risky = burnup::at_risk(&conn, &project, *threshold)?;
+            if cli.json {
+                print_json(&risky);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if risky.is_empty() {
+                println!("no node is behind its own deadline");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for node in &risky {
+                let left = if node.days_left < 0 {
+                    format!("{}d overdue", -node.days_left)
+                } else {
+                    format!("{}d left", node.days_left)
+                };
+                println!(
+                    "{:<14} {:<10} done {:>3.0}% elapsed {:>3.0}% gap {:>3.0}%  {}",
+                    node.dot_id,
+                    left,
+                    node.done * 100.0,
+                    node.elapsed * 100.0,
+                    node.gap * 100.0,
+                    node.title
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Template { command } => {
             let (mut conn, project) = open(cli.db.as_deref())?;
             match command {
