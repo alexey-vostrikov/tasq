@@ -1,7 +1,7 @@
 # Сборка и гейты — в контейнере на базе rust:1.99.1-bookworm (см. Dockerfile).
 # На хосте rust-тулчейн не нужен: нужен только docker.
 #
-#   make            — fmt + clippy + test
+#   make            — fmt + clippy + deny + test + tokens
 #   make build      — release-бинарь в кэше, копия в ~/.local/bin
 #   make act        — прогон GitHub Actions локально (nektos/act), тот же образ
 #
@@ -16,9 +16,9 @@ DOCKER_FILE  = --rm -v $(CURDIR):/src -v $(CACHE)/cargo:/cache/cargo \
                -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target -e HOME=/cache/home
 RUN          = docker run $(DOCKER_FILE) $(IMAGE)
 
-.PHONY: all image cache-init fmt clippy test build install smoke act clean tokens
+.PHONY: all image cache-init fmt clippy deny test build install smoke act clean tokens
 
-all: fmt clippy test tokens
+all: fmt clippy deny test tokens
 
 image:
 	docker build -q -t $(IMAGE) -f Dockerfile .
@@ -32,6 +32,10 @@ fmt: cache-init
 
 clippy: cache-init
 	$(RUN) cargo clippy --all-targets -- -D warnings
+
+# Политика зависимостей: уязвимости, лицензии, источники, дубли, запрещённые крейты.
+deny: cache-init
+	$(RUN) cargo deny check
 
 test: cache-init
 	$(RUN) cargo test --all-targets

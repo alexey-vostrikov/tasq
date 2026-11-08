@@ -1,0 +1,50 @@
+# Политика зависимостей (README §19). Проверяется `cargo deny check` в том же образе, что и сборка.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Политика не должна зависеть от того, на какой машине её запустили: набор целей фиксирован.
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+# Уязвимость в зависимости — всегда ошибка: сборка не выпускается с известной дырой.
+yanked = "deny"
+# Пустой список по умолчанию. Исключение добавляется только вместе с разбором:
+# почему уязвимость не применима к нам и до какой версии это терпимо.
+ignore = []
+
+[licenses]
+version = 2
+# Только те лицензии, которые реально есть в дереве (снято `cargo deny list`):
+# Apache-2.0, MIT, Unicode-3.0, Unlicense, Zlib. Список намеренно не «на будущее»:
+# новая лицензия — повод посмотреть на зависимость, а не молча её принять.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+# Две версии одного крейта — предупреждение: это видно, но не блокирует работу.
+# Полный запрет включается точечно, когда дубль действительно мешает.
+multiple-versions = "warn"
+wildcards = "deny"
+# Запрет на конкретные крейты ставится здесь, когда есть причина: тяжёлый рантайм,
+# дублирующая альтернатива, известная проблема.
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

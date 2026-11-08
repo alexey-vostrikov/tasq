@@ -865,14 +865,23 @@ COLLATE UNICODE_NOCASE`, поиск в верхнем и нижнем регис
 
 - `Dockerfile` — `FROM rust:1.99.1-bookworm` + `rustup component add rustfmt clippy`: официальный образ
   этих компонентов не несёт, и без шага `cargo fmt --check` падает с «cargo-fmt is not installed».
-- `make` (по умолчанию) — `fmt` + `clippy` + `test`; `make build` — release-бинарь; `make smoke` —
-  `init` + `doctor` во временном каталоге внутри контейнера; `make act` — прогон workflow на хосте.
+- `make` (по умолчанию) — `fmt` + `clippy` + `deny` + `test` + `tokens`; `make build` — release-бинарь;
+  `make smoke` — `init` + `doctor` во временном каталоге внутри контейнера; `make act` — прогон
+  workflow на хосте.
+- `cargo-deny` ставится готовым musl-бинарём (0.20.2) одним скриптом `scripts/install-cargo-deny.sh`
+  и в `Dockerfile`, и шагом CI: две копии логики установки разъехались бы, и «проходит локально»
+  перестало бы что-либо значить. Скрипт сверяет `sha256` скачанного архива.
+- `deny.toml`: `[advisories]` — любая уязвимость и любой yank роняют сборку, `ignore = []`;
+  `[licenses]` — только реально встречающиеся в дереве лицензии (MIT, Apache-2.0, Unicode-3.0,
+  Unlicense, Zlib), снятые `cargo deny list`, а не список «на будущее»: новая лицензия — повод
+  посмотреть на зависимость. `[sources]` разрешает только crates.io.
 - Кэш cargo/target — в `~/.cache/tasq/{cargo,target,home}`, вне репозитория; каталоги создаются от
   хостового uid (`cache-init`), иначе docker создаёт их root-овыми и следующий прогон падает
   `Permission denied`.
-- `.github/workflows/ci.yml` — job `check` с `container: rust:1.99.1-bookworm`; шаги: компоненты →
-  `fmt --check` → `clippy -D warnings` → `test` → `build --release` → smoke (`init` + `doctor --json`
-  с проверкой `"ok": true`). Тот же файл исполняет `act` с хоста.
+- `.github/workflows/ci.yml` — job `check` с `container: rust:1.99.1-bookworm`; шаги: компоненты
+  (rustfmt, clippy) → `cargo-deny` → `fmt --check` → `clippy -D warnings` → `cargo deny check` →
+  `test` → `build --release` → smoke (`init` + `doctor --json` с проверкой `"ok": true`) →
+  бюджет схем. Тот же файл исполняет `act` с хоста.
 - Подводный камень `act`: шаги он запускает через `sh -e` (это dash), поэтому `set -euo pipefail` падает
   `Illegal option -o pipefail`. У шага smoke явно указан `shell: bash` — на GitHub Actions поведение
   не меняется, в `act` работает.
