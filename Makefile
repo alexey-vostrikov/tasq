@@ -16,9 +16,9 @@ DOCKER_FILE  = --rm -v $(CURDIR):/src -v $(CACHE)/cargo:/cache/cargo \
                -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target -e HOME=/cache/home
 RUN          = docker run $(DOCKER_FILE) $(IMAGE)
 
-.PHONY: all image cache-init fmt clippy test build install smoke act clean
+.PHONY: all image cache-init fmt clippy test build install smoke act clean tokens
 
-all: fmt clippy test
+all: fmt clippy test tokens
 
 image:
 	docker build -q -t $(IMAGE) -f Dockerfile .
@@ -50,6 +50,10 @@ smoke: build
 	  /dist/tasq doctor --check; \
 	  /dist/tasq doctor --json > doctor.json; \
 	  cat doctor.json; grep -q "\"ok\": true" doctor.json'
+
+# Гейт бюджета схем MCP: тот же порог, что в CI.
+tokens: build
+	$(CACHE)/target/release/tasq tokens --max 6000
 
 act:
 	act push -j check

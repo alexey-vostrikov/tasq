@@ -44,5 +44,8 @@ jobs:
           "$bin" --version
           "$bin" init --key TASQ --name "smoke"
           "$bin" doctor --check
-          "$bin" doctor --json | tee doctor.json
+          "$bin" doctor --json > doctor.json
           grep -q '"ok": true' doctor.json
+
+      - name: Tool schema budget
+        run: ./target/release/tasq tokens --max 6000

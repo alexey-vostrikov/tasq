@@ -14,7 +14,7 @@ use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::resource;
 use tasq::status::{Kind, Status};
-use tasq::{activity, burnup, comment, db, note, overview, template, transfer};
+use tasq::{activity, budget, burnup, comment, db, note, overview, template, transfer};
 
 #[derive(Parser)]
 #[command(
@@ -366,6 +366,18 @@ enum Command {
         /// Tool profile: full | agent | read-only | migration
         #[arg(long, default_value = "full")]
         profile: String,
+    },
+    /// Measure the MCP tool schemas in tokens against the budget
+    Tokens {
+        /// Only this profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Fail (exit 1) if a profile exceeds this many tokens
+        #[arg(long, value_name = "N")]
+        max: Option<usize>,
+        /// Show the cost of each tool
+        #[arg(long)]
+        per_tool: bool,
     },
 }
 
@@ -1795,6 +1807,65 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             );
             if result.checksum_verified {
                 println!("checksum verified");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Tokens {
+            profile,
+            max,
+            per_tool,
+        } => {
+            let reports = match profile {
+                Some(value) => {
+                    let profile =
+                        mcp::profile::Profile::parse(value).ok_or_else(|| Error::InvalidValue {
+                            field: "profile".to_string(),
+                            value: format!("{value} (allowed: full, agent, read-only, migration)"),
+                        })?;
+                    vec![budget::measure(profile)]
+                }
+                None => budget::measure_all(),
+            };
+
+            if cli.json {
+                print_json(&reports);
+            } else {
+                for report in &reports {
+                    let mark = if report.within_budget { "ok" } else { "OVER" };
+                    println!(
+                        "{:<10} {:>3} tool(s)  {:>5} tokens  budget {:>5}  headroom {:>5}  {mark}",
+                        report.profile, report.tools, report.tokens, report.budget, report.headroom
+                    );
+                    if *per_tool {
+                        for cost in report.per_tool.iter().take(10) {
+                            println!("    {:>5}  {}", cost.tokens, cost.name);
+                        }
+                    }
+                }
+            }
+
+            // Гейт: `--max` проверяет каждый показанный профиль.
+            let over: Vec<&budget::Report> = match max {
+                Some(limit) => reports
+                    .iter()
+                    .filter(|report| report.tokens > *limit)
+                    .collect(),
+                None => reports.iter().filter(|r| !r.within_budget).collect(),
+            };
+            if !over.is_empty() {
+                if !cli.json {
+                    for report in &over {
+                        eprintln!(
+                            "budget exceeded: {} has {} tokens (limit {})",
+                            report.profile,
+                            report.tokens,
+                            max.map(|value| value.to_string())
+                                .unwrap_or_else(|| report.budget.to_string())
+                        );
+                    }
+                }
+                return Ok(ExitCode::from(1));
             }
             Ok(ExitCode::SUCCESS)
         }
