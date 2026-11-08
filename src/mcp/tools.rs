@@ -420,6 +420,17 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
         // ------------------------------------------------ ресурсы
         "tasq_reserve" => {
             let token = req_str(args, "token")?;
+            // `remove` — список ресурсов. Присланное `true` раньше молча игнорировалось,
+            // и вызов «снять резерв» на деле добавлял его: ошибка в типе не должна
+            // превращаться в противоположное действие.
+            if let Some(raw) = args.get("remove")
+                && !raw.is_array()
+            {
+                return Err(Error::InvalidValue {
+                    field: "remove".to_string(),
+                    value: format!("{raw} (expected an array of resources)"),
+                });
+            }
             if let Some(remove) = args.get("remove").and_then(Value::as_array) {
                 let values: Vec<crate::resource::Resource> = remove
                     .iter()

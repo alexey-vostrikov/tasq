@@ -40,7 +40,7 @@ deny: cache-init
 # Покрытие. Порог — пол, ниже которого сборка не выпускается, а не цель: он не должен
 # мешать добавлять код, но обязан ловить «написали и не проверили».
 # Отдельная цель, потому что инструментированная сборка пересобирает всё дерево.
-COVERAGE_MIN ?= 70
+COVERAGE_MIN ?= 78
 cov: cache-init
 	$(RUN) cargo llvm-cov --all-targets --summary-only --fail-under-lines $(COVERAGE_MIN)
 

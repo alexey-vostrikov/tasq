@@ -317,3 +317,31 @@ fn deep_template_nesting_is_bounded() {
         "разбор вернул управление"
     );
 }
+
+/// Родитель в ответе `template apply` без `--parent` — ключ проекта, а не «TASQ--».
+/// «TASQ--» выглядит как ссылка на узел, но ни на что не указывает (найдено тестом MCP).
+#[test]
+fn template_applied_at_root_names_the_project() {
+    let (mut conn, project) = fixture("template-root");
+    let tree = serde_json::json!([{"title": "{resource}: контроллер"}]);
+    template::save(
+        &mut conn,
+        &project,
+        "api",
+        None,
+        &serde_json::to_string(&tree).expect("serialise"),
+        "tester",
+    )
+    .expect("save");
+    let applied = template::apply(
+        &mut conn,
+        &project,
+        "api",
+        None,
+        &[("resource".to_string(), "orders".to_string())],
+    )
+    .expect("apply");
+
+    assert_eq!(applied.parent, project.key, "родитель — ключ проекта");
+    assert_eq!(applied.created.len(), 1);
+}

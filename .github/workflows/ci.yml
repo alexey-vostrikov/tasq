@@ -40,7 +40,7 @@ jobs:
       - name: Coverage floor
         run: |
           sh scripts/install-cargo-llvm-cov.sh
-          cargo llvm-cov --all-targets --summary-only --fail-under-lines 70
+          cargo llvm-cov --all-targets --summary-only --fail-under-lines 78
 
       - name: Build
         run: cargo build --release

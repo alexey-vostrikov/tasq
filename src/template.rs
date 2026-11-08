@@ -372,7 +372,10 @@ pub fn apply(
             &mut created,
         )?;
     }
-    let parent = parent_dot.unwrap_or_else(|| project.dot_id("-"));
+    // Без родителя узлы создаются в корне проекта, и «родитель» — ключ проекта.
+    // `dot_id("-")` давал бы «TASQ--»: такая строка выглядит как ссылка на узел,
+    // но ни на что не указывает.
+    let parent = parent_dot.unwrap_or_else(|| project.key.clone());
     // Каждый созданный узел уже попал в лог активности из node::create;
     // отдельная запись «apply» дублировала бы её без пользы.
     Ok(Applied {
