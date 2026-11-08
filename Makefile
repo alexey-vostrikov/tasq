@@ -16,9 +16,9 @@ DOCKER_FILE  = --rm -v $(CURDIR):/src -v $(CACHE)/cargo:/cache/cargo \
                -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target -e HOME=/cache/home
 RUN          = docker run $(DOCKER_FILE) $(IMAGE)
 
-.PHONY: all image cache-init fmt clippy deny test cov build install smoke act clean tokens
+.PHONY: all image cache-init fmt clippy deny test cov build install smoke act clean tokens docs
 
-all: fmt clippy deny test tokens
+all: fmt clippy deny test tokens docs
 
 image:
 	docker build -q -t $(IMAGE) -f Dockerfile .
@@ -65,6 +65,11 @@ smoke: build
 # Гейт бюджета схем MCP: тот же порог, что в CI.
 tokens: build
 	$(CACHE)/target/release/tasq tokens --max 6000
+
+# Справочник в docs/ снимается с бинаря; правка руками ловится гейтом.
+docs: build
+	$(CACHE)/target/release/tasq docs
+	$(CACHE)/target/release/tasq docs --check
 
 act:
 	act push -j check

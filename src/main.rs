@@ -6,7 +6,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 
+use clap::CommandFactory;
 use tasq::connect;
+use tasq::docs;
 use tasq::edge;
 use tasq::error::{Error, Result};
 use tasq::lease;
@@ -367,6 +369,15 @@ enum Command {
         /// Tool profile: full | agent | read-only | migration
         #[arg(long, default_value = "full")]
         profile: String,
+    },
+    /// Generate the reference documentation from the binary itself
+    Docs {
+        /// Where to write (default: docs)
+        #[arg(long, value_name = "DIR", default_value = "docs")]
+        out: PathBuf,
+        /// Only compare with what is on disk; exit 3 on drift
+        #[arg(long)]
+        check: bool,
     },
     /// Measure the MCP tool schemas in tokens against the budget
     Tokens {
@@ -785,6 +796,42 @@ fn line(node: &Node, indent: usize) -> String {
 fn run(cli: &Cli) -> Result<ExitCode> {
     // `connect` работает с конфигами клиентов и не требует базы: его можно запускать
     // в проекте, где `tasq init` ещё не делали.
+    // `docs` тоже не нуждается в базе проекта: схема снимается с пустой временной базы.
+    if let Command::Docs { out, check } = &cli.command {
+        let files = docs::generate(&Cli::command())?;
+        if *check {
+            let drift = docs::check(out, &files)?;
+            if !drift.is_empty() {
+                if cli.json {
+                    print_json(&serde_json::json!({"ok": false, "drift": drift}));
+                } else {
+                    for item in &drift {
+                        eprintln!("{item}");
+                    }
+                    eprintln!("run `tasq docs` to regenerate");
+                }
+                return Ok(ExitCode::from(3));
+            }
+            if !cli.json {
+                println!("docs: up to date ({})", out.display());
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        let written = docs::write(out, &files)?;
+        if cli.json {
+            let names: Vec<String> = written
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            print_json(&serde_json::json!({"ok": true, "written": names}));
+            return Ok(ExitCode::SUCCESS);
+        }
+        for path in &written {
+            println!("{}", path.display());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if let Command::Connect {
         client,
         scope,
@@ -2057,6 +2104,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Connect { .. } => unreachable!("обработан до открытия базы"),
+        Command::Docs { .. } => unreachable!("обработан до открытия базы"),
 
         Command::Mcp { profile } => {
             let profile =

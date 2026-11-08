@@ -11,6 +11,7 @@ pub mod burnup;
 pub mod comment;
 pub mod connect;
 pub mod db;
+pub mod docs;
 pub mod edge;
 pub mod error;
 pub mod lease;

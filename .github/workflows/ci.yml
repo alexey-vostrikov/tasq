@@ -60,3 +60,6 @@ jobs:
 
       - name: Tool schema budget
         run: ./target/release/tasq tokens --max 6000
+
+      - name: Reference docs are up to date
+        run: ./target/release/tasq docs --check
