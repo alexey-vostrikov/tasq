@@ -126,6 +126,7 @@ pub const ALL_TOOLS: &[&str] = &[
     "project_create",
     "project_list",
     "project_update",
+    "project_delete",
     "project_select",
     // Узлы (9)
     "node_create",
@@ -185,13 +186,13 @@ mod tests {
 
     #[test]
     fn full_profile_has_exactly_the_declared_catalogue() {
-        // 42 из ТЗ плюс tasq_risk (M6) и project_select (проекты): 44.
-        assert_eq!(ALL_TOOLS.len(), 44, "каталог v1 — 44 инструмента");
+        // 42 из ТЗ плюс tasq_risk (M6) и project_select/project_delete (проекты): 45.
+        assert_eq!(ALL_TOOLS.len(), 45, "каталог v1 — 45 инструментов");
         let mut unique: Vec<&str> = ALL_TOOLS.to_vec();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), ALL_TOOLS.len(), "имена не повторяются");
-        assert_eq!(Profile::Full.tools().len(), 44);
+        assert_eq!(Profile::Full.tools().len(), 45);
     }
 
     #[test]

@@ -133,14 +133,14 @@ mod tests {
             migration.tokens < full.tokens / 3,
             "migration — самый узкий"
         );
-        assert_eq!(full.tools, 44);
+        assert_eq!(full.tools, 45);
         assert_eq!(migration.tools, 6);
     }
 
     #[test]
     fn per_tool_costs_are_sorted_and_sum_roughly_to_the_total() {
         let report = measure(Profile::Full);
-        assert_eq!(report.per_tool.len(), 44);
+        assert_eq!(report.per_tool.len(), 45);
         for pair in report.per_tool.windows(2) {
             assert!(
                 pair[0].tokens >= pair[1].tokens,

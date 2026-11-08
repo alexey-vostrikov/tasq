@@ -1,4 +1,4 @@
-//! Каталог MCP целиком: каждый из 44 инструментов вызывается через настоящий сервер.
+//! Каталог MCP целиком: каждый из 45 инструментов вызывается через настоящий сервер.
 //!
 //! Смысл не в проверке форм ответов (это делают тесты ядра), а в том, что **каждый
 //! инструмент каталога действительно подключён к обработчику**: забыть одну ветку `match`
@@ -39,8 +39,33 @@ fn cli(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// Запуск CLI без требования успеха: нужен, когда проверяется именно отказ.
+fn run_cli(dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(bin())
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run tasq");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
 /// Один сеанс с сервером: все вызовы подряд, ответы в том же порядке.
+///
+/// Ошибкой домена (`isError: true`) считается провал теста — если только тест не проверяет
+/// отказ специально: тогда он берёт `session_lenient` и смотрит на код сам.
 fn session(dir: &std::path::Path, calls: &[(&str, Value)]) -> Vec<Value> {
+    session_inner(dir, calls, true)
+}
+
+fn session_lenient(dir: &std::path::Path, calls: &[(&str, Value)]) -> Vec<Value> {
+    session_inner(dir, calls, false)
+}
+
+fn session_inner(dir: &std::path::Path, calls: &[(&str, Value)], expect_ok: bool) -> Vec<Value> {
     let mut child = Command::new(bin())
         .current_dir(dir)
         .args(["mcp", "--profile", "full"])
@@ -85,15 +110,17 @@ fn session(dir: &std::path::Path, calls: &[(&str, Value)]) -> Vec<Value> {
     );
 
     // Первый ответ — initialize; дальше по одному на вызов.
-    for (index, response) in responses.iter().enumerate().skip(1) {
-        let (name, _) = &calls[index - 1];
-        let result = &response["result"];
-        assert_eq!(
-            result["isError"],
-            json!(false),
-            "инструмент {name} вернул ошибку: {}",
-            serde_json::to_string_pretty(result).unwrap_or_default()
-        );
+    if expect_ok {
+        for (index, response) in responses.iter().enumerate().skip(1) {
+            let (name, _) = &calls[index - 1];
+            let result = &response["result"];
+            assert_eq!(
+                result["isError"],
+                json!(false),
+                "инструмент {name} вернул ошибку: {}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
+        }
     }
 
     responses[1..]
@@ -140,11 +167,15 @@ fn project_and_init_tools() {
         json!("TASQ"),
         "сеанс остался в своём проекте"
     );
-    assert_eq!(out[3]["key"], json!("TASQ"), "правка ушла в проект сеанса");
     assert_eq!(
-        out[3]["updated"],
-        json!(true),
-        "project_update отвечает флагом"
+        out[3]["project"]["key"],
+        json!("TASQ"),
+        "правка ушла в проект сеанса"
+    );
+    assert_eq!(
+        out[3]["project"]["name"],
+        json!("Демо-2"),
+        "project_update вернул обновлённый проект"
     );
 
     // Переименован проект сеанса, второй проект не тронут.
@@ -565,7 +596,7 @@ fn every_catalogue_entry_has_a_handler() {
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
             .collect()
     };
-    assert_eq!(names.len(), 44, "каталог на 44 инструмента");
+    assert_eq!(names.len(), 45, "каталог на 45 инструментов");
 
     for name in &names {
         let out = Command::new(bin())
@@ -772,4 +803,214 @@ fn the_server_can_start_in_a_named_project() {
         .filter_map(|node| node["dot_id"].as_str())
         .collect();
     assert_eq!(ids, vec!["PRJ-1"], "старт сразу в выбранном проекте");
+}
+
+/// Переименование в MCP: ключ проекта сессии меняется вместе с контекстом, иначе
+/// следующий вызов ушёл бы в первый проект по порядку.
+#[test]
+fn a_project_is_renamed_over_mcp_without_losing_the_session() {
+    let dir = temp_dir("project-rename");
+    cli(&dir, &["init", "--key", "ALPHA", "--name", "Первый"]);
+    cli(&dir, &["create", "project", "PRJ", "--name", "Второй"]);
+    cli(&dir, &["--project", "PRJ", "add", "Задача в PRJ"]);
+
+    let out = session(
+        &dir,
+        &[
+            ("project_select", json!({"key": "PRJ"})),
+            ("project_update", json!({"name": "Переименован"})),
+            ("project_update", json!({"new_key": "BETA"})),
+            ("node_list", json!({})),
+            ("project_list", json!({})),
+        ],
+    );
+
+    assert_eq!(out[0]["active_project"], json!("PRJ"));
+    assert_eq!(out[1]["project"]["name"], json!("Переименован"));
+    assert_eq!(
+        out[1]["active_project"],
+        json!("PRJ"),
+        "имя сменилось, проект тот же"
+    );
+
+    // Смена ключа: адреса узлов переехали, сессия осталась в том же проекте.
+    assert_eq!(out[2]["project"]["key"], json!("BETA"));
+    assert_eq!(out[2]["previous_key"], json!("PRJ"));
+    assert_eq!(
+        out[2]["active_project"],
+        json!("BETA"),
+        "контекст переехал вместе с ключом"
+    );
+    assert_eq!(out[2]["nodes"], json!(1));
+
+    let ids: Vec<&str> = out[3]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter_map(|node| node["dot_id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["BETA-1"], "dot-ID собраны из нового ключа");
+
+    let projects = out[4].as_array().expect("projects");
+    assert!(
+        projects
+            .iter()
+            .any(|project| project["key"] == json!("BETA")),
+        "{projects:?}"
+    );
+    assert!(
+        !projects
+            .iter()
+            .any(|project| project["key"] == json!("PRJ")),
+        "старого ключа нет: {projects:?}"
+    );
+}
+
+#[test]
+fn status_is_validated_over_mcp_too() {
+    let dir = temp_dir("project-status");
+    cli(&dir, &["init", "--key", "ALPHA"]);
+
+    let mut child = Command::new(bin())
+        .current_dir(&dir)
+        .args(["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        )
+        .expect("init");
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                     "params": {"name": "project_update", "arguments": {"status": "nonsense"}}})).expect("call");
+    }
+    let output = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response: Value =
+        serde_json::from_str(stdout.lines().nth(1).expect("response")).expect("json");
+    assert_eq!(response["result"]["isError"], json!(true), "{response}");
+    let payload: Value = serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    // Доменная ошибка, а не STORAGE_ERROR от CHECK-ограничения базы.
+    assert_eq!(payload["code"], json!("INVALID_VALUE"), "{payload}");
+
+    // И в базе ничего не изменилось.
+    let (_, list, _) = run_cli(&dir, &["--json", "list", "projects"]);
+    let projects: Value = serde_json::from_str(&list).expect("json");
+    assert_eq!(projects[0]["status"], json!("active"));
+}
+
+#[test]
+fn deleting_the_session_project_moves_the_session_to_another_one() {
+    let dir = temp_dir("project-delete");
+    cli(&dir, &["init", "--key", "ALPHA"]);
+    cli(&dir, &["create", "project", "PRJ"]);
+    cli(&dir, &["--project", "PRJ", "add", "Задача"]);
+
+    let out = session_lenient(
+        &dir,
+        &[
+            ("project_select", json!({"key": "PRJ"})),
+            // Без force удаление непустого проекта — отказ, и содержимое цело.
+            ("project_delete", json!({})),
+            ("node_list", json!({})),
+            ("project_delete", json!({"force": true})),
+            ("project_list", json!({})),
+        ],
+    );
+
+    let refused = &out[1];
+    assert_eq!(refused["code"], json!("PROJECT_NOT_EMPTY"), "{refused}");
+    assert_eq!(
+        out[2].as_array().map(Vec::len),
+        Some(1),
+        "после отказа узел на месте"
+    );
+
+    let deleted = &out[3];
+    assert_eq!(deleted["deleted"], json!("PRJ"));
+    assert_eq!(deleted["nodes"], json!(1));
+    assert_eq!(
+        deleted["active_project"],
+        json!("ALPHA"),
+        "сессия переехала"
+    );
+    assert_eq!(deleted["switched_to"], json!("ALPHA"));
+
+    let projects = out[4].as_array().expect("projects");
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["key"], json!("ALPHA"));
+}
+
+#[test]
+fn deleting_the_last_project_over_mcp_reports_no_active_project() {
+    let dir = temp_dir("project-delete-last");
+    cli(&dir, &["init", "--key", "ALPHA"]);
+
+    let out = session(&dir, &[("project_delete", json!({"force": true}))]);
+    assert_eq!(out[0]["deleted"], json!("ALPHA"));
+    assert_eq!(out[0]["active_project"], Value::Null);
+    assert!(
+        out[0]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("project_create"),
+        "подсказка называет способ вернуться: {}",
+        out[0]
+    );
+}
+
+#[test]
+fn project_delete_is_not_in_the_agent_profile() {
+    let dir = temp_dir("project-delete-profile");
+    cli(&dir, &["init", "--key", "ALPHA"]);
+    cli(&dir, &["create", "project", "PRJ"]);
+
+    // Агентский профиль не удаляет проекты: это операция уровня full.
+    let mut child = Command::new(bin())
+        .current_dir(&dir)
+        .args(["mcp", "--profile", "agent"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        )
+        .expect("init");
+        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                     "params": {"name": "project_delete", "arguments": {"key": "PRJ", "force": true}}})).expect("call");
+    }
+    let output = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response: Value =
+        serde_json::from_str(stdout.lines().nth(1).expect("response")).expect("json");
+    let payload: Value = serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(payload["code"], json!("TOOL_NOT_IN_PROFILE"));
+
+    // Проект не удалён.
+    let (_, list, _) = run_cli(&dir, &["list", "projects"]);
+    assert!(list.contains("PRJ"), "{list}");
 }

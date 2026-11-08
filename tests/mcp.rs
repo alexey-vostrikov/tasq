@@ -95,7 +95,7 @@ fn handshake_and_tools_list_over_stdio() {
 
     let list = &responses[1];
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 44, "полный профиль отдаёт весь каталог");
+    assert_eq!(tools.len(), 45, "полный профиль отдаёт весь каталог");
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())

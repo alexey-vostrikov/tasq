@@ -195,31 +195,69 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&projects))
         }
         "project_update" => {
-            let mut changes = Vec::new();
-            let mut values: Vec<String> = Vec::new();
-            for (column, key) in [
-                ("name", "name"),
-                ("description", "description"),
-                ("status", "status"),
-            ] {
-                if let Some(value) = arg_str(args, key) {
-                    changes.push(format!("{column} = ?"));
-                    values.push(value.to_string());
+            // Правка идёт через ядро: там проверка статуса по схеме, нормализация ключа
+            // и отказ на занятый ключ. Раньше SQL собирался на месте, и `--status nonsense`
+            // отбивался `CHECK` базы как STORAGE_ERROR, то есть «внутренняя ошибка».
+            let target = arg_str(args, "key").unwrap_or(&ctx.project.key);
+            let patch = crate::project::Patch {
+                name: arg_str(args, "name"),
+                description: arg_str(args, "description"),
+                status: arg_str(args, "status"),
+                key: arg_str(args, "new_key"),
+            };
+            let (updated, previous_key) =
+                crate::project::update(&mut ctx.conn, Some(target), &patch)?;
+            // Если правили проект сессии (в том числе переименовали ключ) — контекст
+            // должен остаться на нём, иначе следующий вызов уйдёт в первый по порядку.
+            if ctx.project.id == updated.id {
+                ctx.project = updated.clone();
+            }
+            Ok(text(&json!({
+                "project": updated,
+                "previous_key": previous_key,
+                "active_project": ctx.project.key,
+                "nodes": crate::project::live_nodes(&ctx.conn, &updated)?,
+            })))
+        }
+        "project_delete" => {
+            let target = arg_str(args, "key").unwrap_or(&ctx.project.key).to_string();
+            let deleting_active = {
+                let project = crate::project::select(&ctx.conn, Some(&target))?;
+                project.id == ctx.project.id
+            };
+            let nodes = {
+                let project = crate::project::select(&ctx.conn, Some(&target))?;
+                crate::project::live_nodes(&ctx.conn, &project)?
+            };
+            let removed =
+                crate::project::delete(&mut ctx.conn, Some(&target), arg_bool(args, "force"))?;
+            // Удалили проект сессии — переезжаем в первый оставшийся, иначе контекст
+            // указывает на несуществующую строку и все вызовы падают.
+            let mut switched_to = None;
+            if deleting_active {
+                match crate::project::default_project(&ctx.conn) {
+                    Ok(next) => {
+                        switched_to = Some(next.key.clone());
+                        ctx.project = next;
+                    }
+                    Err(_) => {
+                        return Ok(text(&json!({
+                            "deleted": removed.key,
+                            "nodes": nodes,
+                            "active_project": Value::Null,
+                            "hint": "no projects left; call tasq_init or project_create",
+                        })));
+                    }
                 }
             }
-            if changes.is_empty() {
-                return Err(Error::InvalidValue {
-                    field: "project".to_string(),
-                    value: "nothing to change".to_string(),
-                });
-            }
-            changes.push("updated_at = ?".to_string());
-            values.push(crate::db::now_iso());
-            values.push(ctx.project.id.to_string());
-            let sql = format!("UPDATE projects SET {} WHERE id = ?", changes.join(", "));
-            ctx.conn
-                .execute(&sql, rusqlite::params_from_iter(values.iter()))?;
-            Ok(text(&json!({"key": ctx.project.key, "updated": true})))
+            Ok(text(&json!({
+                "deleted": removed.key,
+                "name": removed.name,
+                "nodes": nodes,
+                "active_project": ctx.project.key,
+                "switched_to": switched_to,
+                "remaining": crate::project::known_keys(&ctx.conn)?,
+            })))
         }
 
         // ------------------------------------------------ узлы
@@ -858,16 +896,30 @@ pub fn definition(name: &str) -> Option<Value> {
         ),
         "project_update" => tool(
             name,
-            "Change project name, description or status",
+            "Rename a project or change its description and status",
             json!({
                 "type": "object",
                 "properties": {
+                    "key": {"type": "string", "description": "Project to change (default: this session's)"},
                     "name": {"type": "string", "description": "New name"},
                     "description": {"type": "string", "description": "New description"},
-                    "status": {"type": "string", "enum": ["active", "on_hold", "completed", "archived"]}
+                    "status": {"type": "string", "enum": ["active", "on_hold", "completed", "archived"]},
+                    "new_key": {"type": "string", "description": "New key; every dot-ID of the project changes"}
                 }
             }),
             (false, false, true),
+        ),
+        "project_delete" => tool(
+            name,
+            "Delete a project with all of its nodes, notes and history",
+            json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Project to delete (default: this session's)"},
+                    "force": {"type": "boolean", "description": "Delete even if it still has live nodes or is the last one"}
+                }
+            }),
+            (true, false, true),
         ),
         // ------------------------------------------------ узлы
         "node_create" => tool(

@@ -2,14 +2,14 @@
 
 Файл сгенерирован командой `tasq docs` из каталога самого сервера: имя, описание и схема берутся из того же кода, что отвечает на `tools/list`.
 
-Всего инструментов: 44.
+Всего инструментов: 45.
 
 ## Профили
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 44 | 6000 | 4474 |
-| `agent` | 29 | 4000 | 3093 |
+| `full` | 45 | 6000 | 4623 |
+| `agent` | 29 | 4000 | 3136 |
 | `read-only` | 16 | 2000 | 1401 |
 | `migration` | 6 | 800 | 549 |
 
@@ -20,7 +20,8 @@
 | `tasq_init` | full, agent, migration | 102 | — | Initialise the tracker in the current directory and register a project |
 | `project_create` | full, migration | 113 | `key`, `name` | Create another project in the same database |
 | `project_list` | full, agent, read-only, migration | 60 | — | List projects with their node counts |
-| `project_update` | full, agent | 103 | — | Change project name, description or status |
+| `project_update` | full, agent | 146 | — | Rename a project or change its description and status |
+| `project_delete` | full | 107 | — | Delete a project with all of its nodes, notes and history |
 | `project_select` | full, agent | 84 | `key` | Switch this session to another project; every later call uses it |
 | `node_create` | full, agent | 195 | `title` | Create a node; without parent it becomes a root epic |
 | `node_get` | full, agent, read-only, migration | 84 | `ref` | One node with children, comments and the parent chain |
