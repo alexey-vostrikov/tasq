@@ -6,14 +6,18 @@
 #![forbid(unsafe_code)]
 
 pub mod activity;
+pub mod comment;
 pub mod db;
 pub mod edge;
 pub mod error;
 pub mod lease;
 pub mod node;
+pub mod note;
+pub mod overview;
 pub mod project;
 pub mod resource;
 pub mod status;
+pub mod template;
 
 pub use error::{Error, Result};
 

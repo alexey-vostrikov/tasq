@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use tasq::db;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_tasq")
 }
@@ -70,7 +72,10 @@ fn doctor_json_is_machine_readable() {
     assert_eq!(code, 0);
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
     assert_eq!(value["ok"], serde_json::Value::Bool(true));
-    assert_eq!(value["schema_version"], serde_json::json!(1));
+    assert_eq!(
+        value["schema_version"],
+        serde_json::json!(db::SUPPORTED_SCHEMA_VERSION)
+    );
     assert_eq!(value["projects"], serde_json::json!(1));
 }
 
@@ -383,6 +388,112 @@ fn reserves_through_the_cli() {
     let (code, _, stderr) = run(&dir, &["reserve", &token_b, "--path", "src/api"]);
     assert_eq!(code, 1);
     assert!(stderr.contains("RESOURCE_RESERVATION_CONFLICT"), "{stderr}");
+}
+
+#[test]
+fn memory_commands_through_the_cli() {
+    let dir = temp_dir("memory");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Эпик", "--desc", "зачем"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Задача", "--parent", "TASQ-1"]).0, 0);
+
+    // заметки
+    let (code, _, stderr) = run(
+        &dir,
+        &[
+            "note",
+            "save",
+            "--title",
+            "Выбрали WAL",
+            "--content",
+            "параллельные читатели",
+            "--type",
+            "decision",
+            "--node",
+            "TASQ-1.1",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, _) = run(&dir, &["note", "ls"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("decision"), "{stdout}");
+    assert!(stdout.contains("Выбрали WAL"), "{stdout}");
+
+    // комментарии
+    let (code, _, stderr) = run(
+        &dir,
+        &["comment", "add", "TASQ-1.1", "начал", "--author", "agent-a"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (_, stdout, _) = run(&dir, &["comment", "ls", "TASQ-1.1"]);
+    assert!(stdout.contains("agent-a"), "{stdout}");
+    let (code, _, stderr) = run(&dir, &["comment", "rm", "1", "--reason", "устарело"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (_, stdout, _) = run(&dir, &["comment", "ls", "TASQ-1.1"]);
+    assert!(stdout.contains("no comments"), "удалённый скрыт: {stdout}");
+    let (_, stdout, _) = run(&dir, &["comment", "ls", "TASQ-1.1", "--include-deleted"]);
+    assert!(stdout.contains("устарело"), "{stdout}");
+
+    // шаблоны: --tree, а не --json (глобальный --json занят)
+    let tree = r#"[{"title":"Ручка {res}","kind":"task","children":[{"title":"Тест {res}","kind":"subtask"}]}]"#;
+    let (code, _, stderr) = run(&dir, &["template", "save", "api", "--tree", tree]);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, _) = run(&dir, &["template", "ls"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("api"), "{stdout}");
+    let (code, stdout, stderr) = run(
+        &dir,
+        &[
+            "template",
+            "apply",
+            "api",
+            "--parent",
+            "TASQ-1",
+            "--var",
+            "res=orders",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("2 node(s)"), "{stdout}");
+
+    // поиск, контекст, доска, время, пакетная правка
+    let (code, stdout, _) = run(&dir, &["find", "параллельные"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Выбрали WAL"), "{stdout}");
+
+    let (code, stdout, _) = run(&dir, &["ctx", "TASQ-1.1"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Эпик"), "{stdout}");
+    assert!(stdout.contains("зачем"), "{stdout}");
+
+    let (code, stdout, _) = run(&dir, &["board"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("open"), "{stdout}");
+
+    let (code, stdout, _) = run(&dir, &["time"]);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("no tracked work") || stdout.contains("total"),
+        "{stdout}"
+    );
+
+    let (code, stdout, _) = run(
+        &dir,
+        &["bulk", "set", "--status", "blocked", "TASQ-1.1", "TASQ-1.2"],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("updated 2"), "{stdout}");
+}
+
+#[test]
+fn template_inline_json_flag_does_not_collide_with_the_global_one() {
+    let dir = temp_dir("tplflag");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+    // `--json` остаётся машинным выводом, `--tree` — телом шаблона
+    let (code, stdout, _) = run(&dir, &["template", "ls", "--json"]);
+    assert_eq!(code, 0);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(value, serde_json::json!([]));
 }
 
 #[test]

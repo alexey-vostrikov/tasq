@@ -13,7 +13,7 @@ use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::resource;
 use tasq::status::{Kind, Status};
-use tasq::{activity, db};
+use tasq::{activity, comment, db, note, overview, template};
 
 #[derive(Parser)]
 #[command(
@@ -274,6 +274,151 @@ enum Command {
         /// How many candidates to show
         #[arg(long, default_value_t = 3)]
         limit: usize,
+    },
+    /// Notes: decisions, context, meetings, blockers, releases
+    Note {
+        #[command(subcommand)]
+        command: NoteCommand,
+    },
+    /// Comments on a node: a chronological thread
+    Comment {
+        #[command(subcommand)]
+        command: CommentCommand,
+    },
+    /// Task templates with {variable} placeholders
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
+    },
+    /// Full-text search across nodes and notes
+    Find {
+        /// Query; supports FTS syntax (prefix `migr*`, phrases, OR)
+        query: String,
+    },
+    /// Context chain from the root epic down to the node
+    Ctx { reference: String },
+    /// Board: nodes grouped by status, with overdue and live leases
+    Board,
+    /// Hours: estimate against the time actually spent in attempts
+    Time {
+        /// Only this subtree
+        #[arg(long, value_name = "REF")]
+        parent: Option<String>,
+    },
+    /// Batch operations
+    Bulk {
+        #[command(subcommand)]
+        command: BulkCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum NoteCommand {
+    /// Save a note: without --id it creates, with --id it updates
+    Save {
+        /// Note title
+        #[arg(long)]
+        title: Option<String>,
+        /// Note body
+        #[arg(long)]
+        content: Option<String>,
+        /// Type: general | decision | context | meeting | technical | blocker | progress | release
+        #[arg(long = "type")]
+        note_type: Option<String>,
+        /// Attach to a node
+        #[arg(long, value_name = "REF")]
+        node: Option<String>,
+        /// Update this note instead of creating one
+        #[arg(long)]
+        id: Option<i64>,
+    },
+    /// List notes, newest first
+    Ls {
+        #[arg(long = "type")]
+        note_type: Option<String>,
+        #[arg(long, value_name = "REF")]
+        node: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Search notes by keyword
+    Search { query: String },
+    /// Delete a note
+    Rm { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum CommentCommand {
+    /// Add a comment to a node
+    Add {
+        reference: String,
+        content: String,
+        /// Author name; defaults to $TASQ_HOLDER or `cli`
+        #[arg(long, env = "TASQ_HOLDER")]
+        author: Option<String>,
+    },
+    /// List comments of a node
+    Ls {
+        reference: String,
+        /// Show soft-deleted comments with their reasons
+        #[arg(long)]
+        include_deleted: bool,
+    },
+    /// Soft-delete a comment; the row stays for the audit trail
+    Rm {
+        id: i64,
+        /// Why it is removed
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Bring a soft-deleted comment back
+    Restore { id: i64 },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    /// Save a template from a JSON file or inline JSON
+    Save {
+        name: String,
+        /// Path to a JSON file with the template tree
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Inline JSON (array of nodes or {"nodes": [...]})
+        #[arg(long = "tree", value_name = "JSON")]
+        tree: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List templates with their variables
+    Ls,
+    /// Show one template with its tree
+    Show { name: String },
+    /// Create nodes from a template
+    Apply {
+        name: String,
+        /// Parent node; without it the roots land at the project top level
+        #[arg(long, value_name = "REF")]
+        parent: Option<String>,
+        /// Variable value as name=value (repeatable)
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        vars: Vec<String>,
+    },
+    /// Delete a template
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum BulkCommand {
+    /// Move several nodes to one status; failures are reported per node
+    Set {
+        /// Target status
+        #[arg(long)]
+        status: String,
+        /// Node references
+        #[arg(required = true, value_name = "REF")]
+        refs: Vec<String>,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1048,6 +1193,498 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+
+        Command::Note { command } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            match command {
+                NoteCommand::Save {
+                    title,
+                    content,
+                    note_type,
+                    node,
+                    id,
+                } => {
+                    let saved = note::save(
+                        &mut conn,
+                        &project,
+                        note::SaveNote {
+                            id: *id,
+                            title: title.as_deref(),
+                            content: content.as_deref(),
+                            note_type: note_type.as_deref(),
+                            node: node.as_deref(),
+                            actor: None,
+                        },
+                    )?;
+                    if cli.json {
+                        print_json(&saved);
+                    } else {
+                        println!("#{} {:<10} {}", saved.id, saved.note_type, saved.title);
+                        if let Some(dot) = &saved.dot_id {
+                            println!("   about {dot}");
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                NoteCommand::Ls {
+                    note_type,
+                    node,
+                    limit,
+                } => {
+                    let notes = note::list(
+                        &conn,
+                        &project,
+                        &note::Filter {
+                            note_type: note_type.as_deref(),
+                            node: node.as_deref(),
+                            limit: Some(*limit),
+                        },
+                    )?;
+                    if cli.json {
+                        print_json(&notes);
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    if notes.is_empty() {
+                        println!("no notes");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    for note in &notes {
+                        let about = note.dot_id.as_deref().unwrap_or("-");
+                        println!(
+                            "#{:<4} {:<10} {:<12} {}",
+                            note.id, note.note_type, about, note.title
+                        );
+                        let preview: String = note
+                            .content
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(70)
+                            .collect();
+                        if !preview.is_empty() {
+                            println!("      {preview}");
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                NoteCommand::Search { query } => {
+                    let notes = note::search(&conn, &project, query)?;
+                    if cli.json {
+                        print_json(&notes);
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    if notes.is_empty() {
+                        println!("nothing found for {query:?}");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    for note in &notes {
+                        println!("#{:<4} {:<10} {}", note.id, note.note_type, note.title);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                NoteCommand::Rm { id } => {
+                    let removed = note::delete(&mut conn, &project, *id, "-")?;
+                    if !cli.json {
+                        if removed {
+                            println!("removed note #{id}");
+                        } else {
+                            println!("no note #{id}");
+                        }
+                    }
+                    Ok(if removed {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    })
+                }
+            }
+        }
+
+        Command::Comment { command } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            match command {
+                CommentCommand::Add {
+                    reference,
+                    content,
+                    author,
+                } => {
+                    let author = author.clone().unwrap_or_else(|| "cli".to_string());
+                    let comment = comment::add(&mut conn, &project, reference, content, &author)?;
+                    if cli.json {
+                        print_json(&comment);
+                    } else {
+                        println!("#{} {}: {}", comment.id, comment.dot_id, comment.content);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                CommentCommand::Ls {
+                    reference,
+                    include_deleted,
+                } => {
+                    let comments = comment::list(&conn, &project, reference, *include_deleted)?;
+                    if cli.json {
+                        print_json(&comments);
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    if comments.is_empty() {
+                        println!("no comments");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    for comment in &comments {
+                        let author = comment.author.as_deref().unwrap_or("-");
+                        let mark = if comment.is_deleted { " (removed)" } else { "" };
+                        println!(
+                            "#{} {} {}:{mark} {}",
+                            comment.id, comment.created_at, author, comment.content
+                        );
+                        if let Some(reason) = &comment.delete_reason {
+                            println!("      reason: {reason}");
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                CommentCommand::Rm { id, reason } => {
+                    let comment =
+                        comment::delete(&mut conn, &project, *id, "-", reason.as_deref())?;
+                    if cli.json {
+                        print_json(&comment);
+                    } else {
+                        println!("removed comment #{} (kept for the audit trail)", comment.id);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                CommentCommand::Restore { id } => {
+                    let comment = comment::restore(&mut conn, &project, *id, "-")?;
+                    if cli.json {
+                        print_json(&comment);
+                    } else {
+                        println!("restored comment #{}", comment.id);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+
+        Command::Find { query } => {
+            let (conn, project) = open(cli.db.as_deref())?;
+            let hits = overview::search(&conn, &project, query)?;
+            if cli.json {
+                print_json(&hits);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if hits.is_empty() {
+                println!("nothing found for {query:?}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for hit in &hits {
+                let target = hit.dot_id.as_deref().unwrap_or("-");
+                println!("{:<6} {:<14} {}", hit.entity, target, hit.title);
+                if !hit.snippet.is_empty() {
+                    println!("       {}", hit.snippet);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Ctx { reference } => {
+            let (conn, project) = open(cli.db.as_deref())?;
+            let chain = overview::context(&conn, &project, reference)?;
+            if cli.json {
+                print_json(&chain);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let last = chain.len().saturating_sub(1);
+            for (index, entry) in chain.iter().enumerate() {
+                let marker = if index == last { "->" } else { "  " };
+                println!(
+                    "{marker} {:<14} {:<9} {:<11} {}",
+                    entry.dot_id, entry.kind, entry.status, entry.title
+                );
+                if let Some(description) = &entry.description {
+                    for line in description.lines().take(6) {
+                        println!("       {line}");
+                    }
+                }
+                if let Some(due) = &entry.due_date {
+                    println!("       due {due}");
+                }
+                if let Some(holder) = &entry.lease_holder {
+                    println!("       held by {holder}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Board => {
+            let (conn, project) = open(cli.db.as_deref())?;
+            let board = overview::board(&conn, &project)?;
+            if cli.json {
+                print_json(&board);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "{}  open {}  done {}  overdue {}  leased {}",
+                board.project, board.open, board.done, board.overdue, board.leased
+            );
+            for column in &board.columns {
+                println!("\n{} ({})", column.status, column.count);
+                for row in &column.rows {
+                    let mut flags = String::new();
+                    if row.days_overdue > 0 {
+                        flags.push_str(&format!(" OVERDUE {}d", row.days_overdue));
+                    }
+                    if let Some(holder) = &row.lease_holder {
+                        flags.push_str(&format!(" [{holder}]"));
+                    }
+                    let due = row.due_date.as_deref().unwrap_or("");
+                    println!(
+                        "  {:<14} {:<8} {:>5} {:<10} {}{}",
+                        row.dot_id, row.priority, row.progress, due, row.title, flags
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Time { parent } => {
+            let (conn, project) = open(cli.db.as_deref())?;
+            let rows = overview::time_report(&conn, &project, parent.as_deref())?;
+            if cli.json {
+                print_json(&rows);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mut total_estimate = 0.0;
+            let mut total_actual = 0.0;
+            let mut any = false;
+            for row in &rows {
+                if row.attempts == 0 && row.estimated_hours.is_none() {
+                    continue;
+                }
+                any = true;
+                let estimate = row
+                    .estimated_hours
+                    .map(|value| format!("{value:.1}h"))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<14} {:>7} est  {:>7} fact  {} attempt(s)  {}",
+                    row.dot_id,
+                    estimate,
+                    format!("{:.2}h", row.actual_hours),
+                    row.attempts,
+                    row.title
+                );
+                total_estimate += row.estimated_hours.unwrap_or(0.0);
+                total_actual += row.actual_hours;
+            }
+            if !any {
+                println!("no tracked work yet: claim a node to start the clock");
+            } else {
+                println!(
+                    "\ntotal: {:.1}h estimated, {:.2}h actual",
+                    total_estimate, total_actual
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Bulk { command } => match command {
+            BulkCommand::Set {
+                status,
+                refs,
+                force,
+            } => {
+                let target = parse_status(status)?;
+                let (mut conn, project) = open(cli.db.as_deref())?;
+                let result = overview::bulk_status(&mut conn, &project, refs, target, *force, "-")?;
+                overview::log_bulk(
+                    &conn,
+                    &project,
+                    "bulk",
+                    &format!(
+                        "{} node(s) -> {}; {} failed",
+                        result.updated.len(),
+                        target.as_str(),
+                        result.failed.len()
+                    ),
+                    "-",
+                )?;
+                if cli.json {
+                    print_json(&result);
+                } else {
+                    for dot in &result.updated {
+                        println!("{dot} -> {}", target.as_str());
+                    }
+                    for failure in &result.failed {
+                        println!("{}: {} ({})", failure.dot_id, failure.message, failure.code);
+                    }
+                    println!(
+                        "updated {}, failed {}",
+                        result.updated.len(),
+                        result.failed.len()
+                    );
+                }
+                Ok(if result.failed.is_empty() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                })
+            }
+        },
+        Command::Template { command } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            match command {
+                TemplateCommand::Save {
+                    name,
+                    file,
+                    tree,
+                    description,
+                } => {
+                    let raw = match (file, tree) {
+                        (Some(path), _) => std::fs::read_to_string(path)?,
+                        (None, Some(inline)) => inline.clone(),
+                        (None, None) => {
+                            return Err(Error::InvalidValue {
+                                field: "template".to_string(),
+                                value: "pass --file or --tree".to_string(),
+                            });
+                        }
+                    };
+                    let saved = template::save(
+                        &mut conn,
+                        &project,
+                        name,
+                        description.as_deref(),
+                        &raw,
+                        "-",
+                    )?;
+                    if cli.json {
+                        print_json(&saved);
+                    } else {
+                        println!(
+                            "template {}: {} root node(s), variables: {}",
+                            saved.name,
+                            saved.tree.nodes.len(),
+                            if saved.variables.is_empty() {
+                                "-".to_string()
+                            } else {
+                                saved
+                                    .variables
+                                    .iter()
+                                    .map(|v| format!("{{{v}}}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            }
+                        );
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                TemplateCommand::Ls => {
+                    let templates = template::list(&conn, &project)?;
+                    if cli.json {
+                        print_json(&templates);
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    if templates.is_empty() {
+                        println!("no templates");
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    for template in &templates {
+                        println!(
+                            "{:<24} {:>2} root(s)  {}",
+                            template.name,
+                            template.tree.nodes.len(),
+                            template.variables.join(" ")
+                        );
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                TemplateCommand::Show { name } => {
+                    let template = template::by_name(&conn, &project, name)?;
+                    if cli.json {
+                        print_json(&template);
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    println!("{}", template.name);
+                    if let Some(description) = &template.description {
+                        println!("description {description}");
+                    }
+                    if !template.variables.is_empty() {
+                        println!(
+                            "variables   {}",
+                            template
+                                .variables
+                                .iter()
+                                .map(|v| format!("{{{v}}}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                    }
+                    print_template_nodes(&template.tree.nodes, 0);
+                    Ok(ExitCode::SUCCESS)
+                }
+                TemplateCommand::Apply { name, parent, vars } => {
+                    let mut values = Vec::new();
+                    for pair in vars {
+                        let (key, value) =
+                            pair.split_once('=').ok_or_else(|| Error::InvalidValue {
+                                field: "--var".to_string(),
+                                value: format!("{pair}: expected name=value"),
+                            })?;
+                        values.push((key.trim().to_string(), value.to_string()));
+                    }
+                    let applied =
+                        template::apply(&mut conn, &project, name, parent.as_deref(), &values)?;
+                    if cli.json {
+                        print_json(&applied);
+                    } else {
+                        println!(
+                            "applied {}: {} node(s)",
+                            applied.template,
+                            applied.created.len()
+                        );
+                        for dot in &applied.created {
+                            println!("  {dot}");
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                TemplateCommand::Rm { name } => {
+                    let removed = template::delete(&mut conn, &project, name, "-")?;
+                    if !cli.json {
+                        println!(
+                            "{}",
+                            if removed {
+                                format!("removed template {name}")
+                            } else {
+                                format!("no template {name}")
+                            }
+                        );
+                    }
+                    Ok(if removed {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn print_template_nodes(nodes: &[template::TemplateNode], indent: usize) {
+    for node in nodes {
+        let kind = node.kind.as_deref().unwrap_or("auto");
+        let priority = node.priority.as_deref().unwrap_or("-");
+        println!(
+            "{:indent$}{:<8} {:<8} {}",
+            "",
+            kind,
+            priority,
+            node.title,
+            indent = indent
+        );
+        print_template_nodes(&node.children, indent + 2);
     }
 }
 
