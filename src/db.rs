@@ -19,16 +19,20 @@ const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.s
 /// Время в UTC, ровно в том виде, в каком его печатает `strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
 /// чтобы строковые сравнения в SQL и в коде были согласованы.
 pub fn now_iso() -> String {
-    let now = OffsetDateTime::now_utc();
+    iso_at(OffsetDateTime::now_utc())
+}
+
+/// Та же форма времени для произвольного момента: `expires_at` считается из `now + ttl`.
+pub fn iso_at(moment: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second(),
-        now.millisecond()
+        moment.year(),
+        u8::from(moment.month()),
+        moment.day(),
+        moment.hour(),
+        moment.minute(),
+        moment.second(),
+        moment.millisecond()
     )
 }
 
@@ -64,6 +68,14 @@ pub fn open(path: &Path) -> Result<Connection> {
          PRAGMA busy_timeout = 5000;",
     )?;
     Ok(conn)
+}
+
+/// Транзакция записи: `BEGIN IMMEDIATE` (README §5).
+///
+/// Немедленный захват блокировки записи убирает гонку «прочитал, что свободно,
+/// и пишу» — второй писатель ждёт на `busy_timeout`, а не проходит на устаревшем чтении.
+pub fn write_tx(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
+    Ok(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
 }
 
 /// Открывает базу и проверяет, что версия схемы не новее поддерживаемой.
@@ -146,7 +158,7 @@ pub fn init(dir: &Path, key: &str, name: &str) -> Result<InitOutcome> {
         Some(key) => (key, false),
         None => {
             let now = now_iso();
-            let tx = conn.transaction()?;
+            let tx = write_tx(&mut conn)?;
             tx.execute(
                 "INSERT INTO projects (key, name, status, timezone, tags, metadata, created_at, updated_at)
                  VALUES (?1, ?2, 'active', 'UTC', '[]', '{}', ?3, ?3)",
@@ -174,7 +186,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<bool> {
         if *version <= current {
             continue;
         }
-        let tx = conn.transaction()?;
+        let tx = write_tx(conn)?;
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)

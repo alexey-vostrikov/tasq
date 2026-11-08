@@ -66,6 +66,30 @@ pub enum Error {
     #[error("status in_progress requires an active lease; use `tasq claim`")]
     LeaseRequired,
 
+    /// Узел уже закрыт: захватывать и менять его нельзя.
+    #[error("node {dot_id} is {status}: claim is not allowed")]
+    NodeClosed { dot_id: String, status: String },
+
+    /// На узле есть живая аренда другого исполнителя.
+    #[error(
+        "node {dot_id} is held by {holder} until {expires_at} (attempt {attempt_no}); \
+         renew your own lease or wait for expiry"
+    )]
+    ActiveAttemptExists {
+        dot_id: String,
+        holder: String,
+        expires_at: String,
+        attempt_no: i64,
+    },
+
+    /// Аренда истекла: продлевать нечего, нужен новый захват.
+    #[error("lease of attempt {attempt_id} has expired; claim the node again")]
+    LeaseExpired { attempt_id: i64 },
+
+    /// Токен не принадлежит живой попытке.
+    #[error("token does not match an open attempt")]
+    NotYourAttempt,
+
     /// Действие допустимо только для `todo`.
     #[error("node {dot_id} is {status}: only todo nodes can be removed")]
     NotRemovable { dot_id: String, status: String },
@@ -110,6 +134,10 @@ impl Error {
             Error::UnmetPrerequisites { .. } => "UNMET_PREREQUISITES",
             Error::DescriptionLocked { .. } => "DESCRIPTION_LOCKED",
             Error::LeaseRequired => "LEASE_REQUIRED",
+            Error::NodeClosed { .. } => "NODE_CLOSED",
+            Error::ActiveAttemptExists { .. } => "ACTIVE_ATTEMPT_EXISTS",
+            Error::LeaseExpired { .. } => "LEASE_EXPIRED",
+            Error::NotYourAttempt => "NOT_YOUR_ATTEMPT",
             Error::NotRemovable { .. } => "NOT_REMOVABLE",
             Error::AlreadyInState { .. } => "ALREADY_IN_STATE",
             Error::DepthLimit => "DEPTH_LIMIT",
@@ -141,6 +169,14 @@ impl Error {
                 "unlock the description first (tasq set --unlock-desc)"
             }
             Error::LeaseRequired => "take a lease with `tasq claim` (M2)",
+            Error::NodeClosed { .. } => "reopen the node first (tasq set --status todo --force)",
+            Error::ActiveAttemptExists { .. } => {
+                "wait for the lease to expire, renew your own token, or take it over with --steal"
+            }
+            Error::LeaseExpired { .. } => {
+                "claim the node again; checkpoints are inherited automatically"
+            }
+            Error::NotYourAttempt => "check the token: `tasq holders` lists live leases",
             Error::NotRemovable { .. } => {
                 "closed work keeps its history; cancel or archive it instead"
             }

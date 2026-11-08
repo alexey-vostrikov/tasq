@@ -8,6 +8,7 @@
 pub mod activity;
 pub mod db;
 pub mod error;
+pub mod lease;
 pub mod node;
 pub mod project;
 pub mod status;

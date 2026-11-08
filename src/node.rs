@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::Serialize;
 
 use crate::activity::{self, Entry};
-use crate::db::now_iso;
+use crate::db::{self, now_iso};
 use crate::error::{Error, Result};
 use crate::project::Project;
 use crate::status::{Kind, Status, check_transition};
@@ -248,7 +248,7 @@ pub fn create(conn: &mut Connection, project: &Project, req: NewNode<'_>) -> Res
         validate_due(due)?;
     }
 
-    let tx = conn.transaction()?;
+    let tx = db::write_tx(conn)?;
     let (parent_id, depth, parent_path) = match req.parent {
         Some(reference) => {
             let parent = resolve(&tx, project, reference)?;
@@ -571,7 +571,7 @@ pub fn update(
     values.push(Value::Integer(node.id));
     let sql = format!("UPDATE nodes SET {assignments}, updated_at = ? WHERE id = ?");
 
-    let tx = conn.transaction()?;
+    let tx = db::write_tx(conn)?;
     tx.execute(&sql, params_from_iter(values.iter()))?;
     let actor = patch.actor.unwrap_or("-");
     for change in &changes {
@@ -693,7 +693,7 @@ pub fn move_node(
         None => (None, 1, String::new()),
     };
 
-    let tx = conn.transaction()?;
+    let tx = db::write_tx(conn)?;
     let seq: i64 = if renumber {
         tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM nodes WHERE project_id = ?1 AND parent_id IS ?2",
@@ -799,7 +799,7 @@ pub fn move_node(
 
 /// Задаёт порядок сиблингов.
 pub fn reorder(conn: &mut Connection, project: &Project, references: &[String]) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = db::write_tx(conn)?;
     let now = now_iso();
     let mut ids = Vec::new();
     for reference in references {
@@ -853,7 +853,7 @@ pub fn archive(
     }
 
     let now = now_iso();
-    let tx = conn.transaction()?;
+    let tx = db::write_tx(conn)?;
     let affected = tx.execute(
         "UPDATE nodes SET archived_at = ?1, updated_at = ?2
          WHERE project_id = ?3 AND (path = ?4 OR path GLOB ?5)",
@@ -894,7 +894,7 @@ pub fn delete(conn: &mut Connection, project: &Project, reference: &str) -> Resu
         });
     }
     let now = now_iso();
-    let tx = conn.transaction()?;
+    let tx = db::write_tx(conn)?;
     tx.execute(
         "UPDATE nodes SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
         params![now, node.id],
@@ -932,7 +932,7 @@ pub fn restore(conn: &mut Connection, project: &Project, reference: &str) -> Res
             state: "present".to_string(),
         });
     };
-    let tx = conn.transaction()?;
+    let tx = db::write_tx(conn)?;
     tx.execute(
         "UPDATE nodes SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
         params![now_iso(), node.id],

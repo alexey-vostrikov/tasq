@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 
 use tasq::error::{Error, Result};
+use tasq::lease;
 use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::status::{Kind, Status};
@@ -174,6 +175,50 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: i64,
     },
+    /// Take a lease on a node and print its token
+    Claim {
+        /// Node reference
+        reference: String,
+        /// Who takes the lease (agent name); defaults to $TASQ_HOLDER or `cli`
+        #[arg(long, env = "TASQ_HOLDER")]
+        holder: Option<String>,
+        /// Lease time to live in seconds
+        #[arg(long, default_value_t = tasq::lease::DEFAULT_TTL)]
+        ttl: i64,
+        /// Take over a live lease (the previous attempt is recorded as superseded)
+        #[arg(long)]
+        steal: bool,
+        /// Claim despite unfinished blockers
+        #[arg(long)]
+        force: bool,
+        /// Checkpoint to store for the next holder
+        #[arg(long)]
+        checkpoint: Option<String>,
+    },
+    /// Extend a lease before it expires
+    Renew {
+        /// Lease token printed by `tasq claim`
+        token: String,
+        /// New time to live in seconds
+        #[arg(long, default_value_t = tasq::lease::DEFAULT_TTL)]
+        ttl: i64,
+    },
+    /// Close a lease: released | failed | completed
+    Release {
+        /// Lease token printed by `tasq claim`
+        token: String,
+        /// What happened to the work
+        #[arg(long, default_value = "released")]
+        outcome: String,
+        /// Checkpoint for whoever picks the node up next
+        #[arg(long)]
+        checkpoint: Option<String>,
+        /// Finish despite unfinished children or blockers
+        #[arg(long)]
+        force: bool,
+    },
+    /// Live leases: who holds what and until when
+    Holders,
 }
 
 fn main() -> ExitCode {
@@ -297,7 +342,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 println!("status:    {}", if report.ok { "ok" } else { "FAILED" });
             }
             if *gc {
-                println!("--gc is not implemented yet (planned for M2)");
+                let cwd = std::env::current_dir()?;
+                let path = db::discover(&cwd, cli.db.as_deref())?;
+                let mut conn = db::open_checked(&path)?;
+                let project = project::default_project(&conn)?;
+                let closed = lease::gc(&mut conn, &project)?;
+                if cli.json {
+                    print_json(&serde_json::json!({ "expired_attempts_closed": closed }));
+                } else {
+                    println!("closed {closed} expired attempt(s)");
+                }
             }
             Ok(if report.ok {
                 ExitCode::SUCCESS
@@ -578,6 +632,113 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 println!(
                     "{} {:<10} {:<12} {}",
                     record.created_at, record.action, target, detail
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Claim {
+            reference,
+            holder,
+            ttl,
+            steal,
+            force,
+            checkpoint,
+        } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            let holder = holder.clone().unwrap_or_else(|| "cli".to_string());
+            let lease = lease::claim(
+                &mut conn,
+                &project,
+                reference,
+                &lease::ClaimRequest {
+                    holder: &holder,
+                    ttl_seconds: *ttl,
+                    steal: *steal,
+                    force: *force,
+                    checkpoint: checkpoint.as_deref(),
+                },
+            )?;
+            if cli.json {
+                print_json(&lease);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!("{}", lease.dot_id);
+            println!("token      {}", lease.token);
+            println!("holder     {} (attempt {})", lease.holder, lease.attempt_no);
+            println!(
+                "expires    {} (ttl {}s)",
+                lease.expires_at, lease.ttl_seconds
+            );
+            if let Some(attempt) = lease.superseded_attempt {
+                println!("superseded attempt #{attempt}");
+            }
+            if let Some(note) = &lease.inherited_checkpoint {
+                println!("--- checkpoint from the previous attempt ---");
+                println!("{note}");
+            }
+            println!();
+            println!("keep the token: renew and release need it");
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Renew { token, ttl } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            let lease = lease::renew(&mut conn, &project, token, *ttl)?;
+            if cli.json {
+                print_json(&lease);
+            } else {
+                println!("{} renewed until {}", lease.dot_id, lease.expires_at);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Release {
+            token,
+            outcome,
+            checkpoint,
+            force,
+        } => {
+            let (mut conn, project) = open(cli.db.as_deref())?;
+            let outcome = lease::Outcome::parse(outcome).ok_or_else(|| Error::InvalidValue {
+                field: "outcome".to_string(),
+                value: outcome.clone(),
+            })?;
+            let node = lease::release(
+                &mut conn,
+                &project,
+                token,
+                outcome,
+                checkpoint.as_deref(),
+                *force,
+            )?;
+            if cli.json {
+                print_json(&node);
+            } else {
+                println!("{} -> {}", node.dot_id, node.status);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Holders => {
+            let (conn, project) = open(cli.db.as_deref())?;
+            let live = lease::holdings(&conn, &project)?;
+            if cli.json {
+                print_json(&live);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if live.is_empty() {
+                println!("no live leases");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for holding in &live {
+                println!(
+                    "{:<18} {:<14} attempt {} until {} (ttl {}s)",
+                    holding.dot_id,
+                    holding.holder,
+                    holding.attempt_no,
+                    holding.expires_at,
+                    holding.ttl_seconds
                 );
             }
             Ok(ExitCode::SUCCESS)
