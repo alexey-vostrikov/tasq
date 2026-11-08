@@ -1,0 +1,92 @@
+name: release
+
+# Релиз собирается тем же контейнером, что и CI: артефакт должен воспроизводиться,
+# а не зависеть от того, на каком раннере его собрали.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: rust:1.99.1-bookworm
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Strip and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          target="x86_64-unknown-linux-gnu"
+          name="tasq-${version}-${target}"
+
+          # Debug-символы в релизном артефакте не нужны: они втрое увеличивают файл
+          # и не помогают никому, у кого нет нашего дерева исходников.
+          strip --strip-debug target/release/tasq
+
+          mkdir -p "dist/${name}"
+          install -m 0755 target/release/tasq "dist/${name}/tasq"
+          cp LICENSE README.md "dist/${name}/"
+
+          # Требование к glibc попадает в релиз, а не выясняется пользователем по ошибке
+          # «version `GLIBC_2.34' not found».
+          {
+            echo "tasq ${version} (${target})"
+            echo
+            echo "Требуется glibc не ниже той, что в базе сборки:"
+            objdump -T "dist/${name}/tasq" | grep -o 'GLIBC_[0-9.]*' | sort -V -u | tail -1
+            echo
+            echo "Установка:"
+            echo "  tar -xzf ${name}.tar.gz"
+            echo "  install -m 0755 ${name}/tasq ~/.local/bin/tasq"
+            echo
+            echo "Проверка контрольной суммы:"
+            echo "  sha256sum -c ${name}.tar.gz.sha256"
+          } > "dist/${name}/GLIBC.txt"
+
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+          echo "ARTIFACT=dist/${name}.tar.gz" >> "$GITHUB_ENV"
+          echo "CHECKSUM=dist/${name}.tar.gz.sha256" >> "$GITHUB_ENV"
+          cat "dist/${name}.tar.gz.sha256"
+
+      - name: Smoke test the packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Проверяется именно распакованный артефакт: сборка могла пройти, а упаковка — нет.
+          work="$(mktemp -d)"
+          tar -C "$work" -xzf "$ARTIFACT"
+          bin="$(find "$work" -name tasq -type f | head -1)"
+          cd "$work"
+          "$bin" --version
+          "$bin" init --key TASQ --name smoke
+          "$bin" doctor --check
+          "$bin" tokens --max 6000
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARTIFACT }}
+            ${{ env.CHECKSUM }}
+          generate_release_notes: true
+          body: |
+            Статическая сборка под x86_64 Linux в контейнере `rust:1.99.1-bookworm`.
+
+            Требование к glibc и порядок установки — в `GLIBC.txt` внутри архива.
+            Контрольная сумма: `sha256sum -c tasq-*.tar.gz.sha256`.
+
+            Гейты, пройденные перед релизом: `fmt`, `clippy -D warnings`, `cargo deny check`,
+            все тесты, пол покрытия 78 %, бюджет схем MCP, актуальность `docs/`.
