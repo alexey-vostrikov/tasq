@@ -537,3 +537,81 @@ fn killed_holder_leaves_the_lease_until_it_expires() {
     assert_eq!(code, 1);
     assert!(stderr.contains("NOT_YOUR_ATTEMPT"), "{stderr}");
 }
+
+/// `--db` уважается и командой `init`: раньше флаг работал для всех команд, кроме той,
+/// которая создаёт базу, — и база появлялась в текущем каталоге вместо указанного.
+#[test]
+fn init_honours_an_explicit_database_path() {
+    let work = temp_dir("init-explicit");
+    let target = work.join("nested/dir/store.db");
+
+    let (code, stdout, stderr) = run(
+        &work,
+        &[
+            "--db",
+            target.to_str().expect("path"),
+            "init",
+            "--key",
+            "EXPL",
+            "--name",
+            "explicit",
+        ],
+    );
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(
+        target.is_file(),
+        "база создана по указанному пути: {stdout}"
+    );
+    assert!(
+        !work.join(".tasq/tasq.db").exists(),
+        "в текущем каталоге базы быть не должно"
+    );
+
+    // Дальше этот же путь работает для остальных команд и не требует поиска вверх.
+    let (code, stdout, _) = run(&work, &["--db", target.to_str().expect("path"), "ls"]);
+    assert_eq!(code, 0, "{stdout}");
+}
+
+/// Опечатка в пути к базе — это «файла нет», а не пустая база и ошибка схемы.
+#[test]
+fn a_missing_explicit_database_is_reported_as_not_found() {
+    let work = temp_dir("missing-db");
+    let (code, _, stderr) = run(&work, &["--db", "/nonexistent/tasq.db", "ls"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("DB_NOT_FOUND"), "{stderr}");
+    assert!(
+        !stderr.contains("STORAGE_ERROR"),
+        "ошибка должна называть причину: {stderr}"
+    );
+}
+
+/// Путь из переменной окружения работает так же, как флаг.
+#[test]
+fn database_path_can_come_from_the_environment() {
+    let work = temp_dir("env-db");
+    let target = work.join("store.db");
+    let out = Command::new(bin())
+        .current_dir(&work)
+        .env("TASQ_DB", &target)
+        .args(["init", "--key", "ENVV"])
+        .output()
+        .expect("run tasq");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(target.is_file(), "база создана по TASQ_DB");
+
+    let out = Command::new(bin())
+        .current_dir(&work)
+        .env("TASQ_DB", &target)
+        .args(["ls"])
+        .output()
+        .expect("run tasq");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -47,6 +47,11 @@ pub fn db_path_in(dir: &Path) -> PathBuf {
 /// Ищет `.tasq/tasq.db` вверх от `start`; `explicit` отменяет поиск.
 pub fn discover(start: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
+        // Явно указанный путь не создаётся молча: опечатка в `--db` иначе превратилась бы
+        // в пустую базу и ошибку схемы вместо «файла нет».
+        if !path.is_file() {
+            return Err(Error::DbNotFound(path.display().to_string()));
+        }
         return Ok(path.to_path_buf());
     }
     let mut dir = start.to_path_buf();
@@ -168,13 +173,19 @@ pub fn validate_key(key: &str) -> Result<()> {
 ///
 /// Существующая база не перезаписывается: проект создаётся только если в базе их нет.
 pub fn init(dir: &Path, key: &str, name: &str) -> Result<InitOutcome> {
+    init_at(&db_path_in(dir), key, name)
+}
+
+/// Инициализация по полному пути к файлу базы: нужна для `--db` и `TASQ_DB`,
+/// где путь задан явно и каталог `.tasq` вычислять не из чего.
+pub fn init_at(db_path: &Path, key: &str, name: &str) -> Result<InitOutcome> {
     validate_key(key)?;
-    let db_dir = dir.join(DB_DIR);
-    fs::create_dir_all(&db_dir)?;
-    let db_path = db_dir.join(DB_FILE);
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let existed = db_path.is_file();
 
-    let mut conn = open(&db_path)?;
+    let mut conn = open(db_path)?;
     let migrated = apply_migrations(&mut conn)?;
     let version = schema_version(&conn)?;
 

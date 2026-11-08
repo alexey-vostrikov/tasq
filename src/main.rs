@@ -856,7 +856,19 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Init { key, name } => {
             let cwd = std::env::current_dir()?;
             let name = name.clone().unwrap_or_else(|| key.clone());
-            let outcome = db::init(&cwd, key, &name)?;
+            // Явный путь (`--db` или `TASQ_DB`) уважается и здесь: иначе флаг работал бы
+            // для всех команд, кроме той, которая создаёт базу.
+            let outcome = match cli.db.as_deref() {
+                Some(path) => {
+                    let path = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        cwd.join(path)
+                    };
+                    db::init_at(&path, key, &name)?
+                }
+                None => db::init(&cwd, key, &name)?,
+            };
             if cli.json {
                 print_json(&outcome);
             } else {
