@@ -14,6 +14,10 @@ pub enum Error {
     #[error("no project in the database")]
     NoProject,
 
+    /// Команда работает в одном проекте, а селектор не задан.
+    #[error("no project selected: this command works in one project (known: {known})")]
+    ProjectRequired { known: String },
+
     /// `meta.schema_version` больше, чем знает этот бинарь.
     #[error("database schema version {found} is newer than supported {supported}")]
     SchemaTooNew { found: i64, supported: i64 },
@@ -150,8 +154,8 @@ pub enum Error {
         path: String,
     },
 
-    /// Действие допустимо только для `todo`.
-    #[error("node {dot_id} is {status}: only todo nodes can be removed")]
+    /// Действие допустимо только для узла, ещё не начатого работой.
+    #[error("node {dot_id} is {status}: only idea, backlog or todo nodes can be removed")]
     NotRemovable { dot_id: String, status: String },
 
     /// Узел уже в целевом состоянии (архив/удаление).
@@ -165,6 +169,10 @@ pub enum Error {
     /// Родитель не может быть потомком перемещаемого узла.
     #[error("cannot move {dot_id} under its own descendant {target}")]
     MoveIntoSelf { dot_id: String, target: String },
+
+    /// Миграция оставила нарушения внешних ключей — база не переживёт пересборку таблицы.
+    #[error("migration {version} left {violations} foreign key violation(s); rolled back")]
+    MigrationBroken { version: i64, violations: i64 },
 
     /// Поле не проходит проверку.
     #[error("invalid {field} value {value}")]
@@ -182,6 +190,7 @@ impl Error {
         match self {
             Error::DbNotFound(_) => "DB_NOT_FOUND",
             Error::NoProject => "NO_PROJECT",
+            Error::ProjectRequired { .. } => "PROJECT_REQUIRED",
             Error::SchemaTooNew { .. } => "SCHEMA_TOO_NEW",
             Error::DuplicateKey(_) => "DUPLICATE_KEY",
             Error::ProjectNotFound { .. } => "PROJECT_NOT_FOUND",
@@ -213,6 +222,7 @@ impl Error {
             Error::AlreadyInState { .. } => "ALREADY_IN_STATE",
             Error::DepthLimit => "DEPTH_LIMIT",
             Error::MoveIntoSelf { .. } => "MOVE_INTO_SELF",
+            Error::MigrationBroken { .. } => "MIGRATION_BROKEN",
             Error::InvalidValue { .. } => "INVALID_VALUE",
             Error::Io(_) | Error::Sqlite(_) => "STORAGE_ERROR",
         }
@@ -222,6 +232,10 @@ impl Error {
         match self {
             Error::DbNotFound(_) => "run `tasq init` in the project root",
             Error::NoProject => "run `tasq init` to register a project",
+            Error::ProjectRequired { .. } => {
+                "name the project you work on: --project KEY / TASQ_PROJECT in the CLI, \
+                 project_select or the `project` argument in MCP; `tasq list projects` lists the keys"
+            }
             Error::SchemaTooNew { .. } => "upgrade the tasq binary; downgrades are not supported",
             Error::DuplicateKey(_) => "pick another key or reuse the existing project",
             Error::ProjectNotFound { .. } => "run `tasq list projects` to see the available keys",
@@ -273,6 +287,9 @@ impl Error {
             Error::AlreadyInState { .. } => "nothing to do",
             Error::DepthLimit => "flatten the tree or move the node higher",
             Error::MoveIntoSelf { .. } => "pick a parent outside the moved subtree",
+            Error::MigrationBroken { .. } => {
+                "restore the database from a backup: the migration was rolled back untouched"
+            }
             Error::InvalidValue { .. } => "check the allowed values with --help",
             Error::Io(_) | Error::Sqlite(_) => "check file permissions and disk space",
         }
@@ -307,6 +324,9 @@ mod tests {
         vec![
             Error::DbNotFound("/tmp/x".to_string()),
             Error::NoProject,
+            Error::ProjectRequired {
+                known: "TASQ, RRL".to_string(),
+            },
             Error::SchemaTooNew {
                 found: 9,
                 supported: 2,
@@ -399,6 +419,10 @@ mod tests {
             Error::MoveIntoSelf {
                 dot_id: "TASQ-1".to_string(),
                 target: "TASQ-1.1".to_string(),
+            },
+            Error::MigrationBroken {
+                version: 3,
+                violations: 2,
             },
             Error::InvalidValue {
                 field: "priority".to_string(),

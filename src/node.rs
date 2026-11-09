@@ -906,10 +906,14 @@ pub fn archive(
     Ok(affected)
 }
 
-/// Мягкое удаление: только `todo` (README §5.3, инвариант 10).
+/// Мягкое удаление: только узлы до начала работы — `idea`, `backlog`, `todo`
+/// (README §5.3, инвариант 10).
 pub fn delete(conn: &mut Connection, project: &Project, reference: &str) -> Result<()> {
     let node = resolve(conn, project, reference)?;
-    if node.stored_status() != Status::Todo {
+    if !matches!(
+        node.stored_status(),
+        Status::Idea | Status::Backlog | Status::Todo
+    ) {
         return Err(Error::NotRemovable {
             dot_id: node.dot_id.clone(),
             status: node.status.clone(),

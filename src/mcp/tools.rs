@@ -13,12 +13,43 @@ use crate::project::Project;
 use crate::status::{Kind, Status};
 use crate::{comment, edge, lease, node, note, overview, template, transfer};
 
-/// Контекст вызова: открытая база, проект и каталог для файловых операций.
+/// Контекст вызова: открытая база, выбранный проект и каталог для файловых операций.
+///
+/// Проект **необязателен**: он выбирается явно (`project_select` или аргумент `project` у
+/// вызова), а «первого по порядку создания» не бывает. Пока проект не выбран, инструменты,
+/// работающие внутри одного проекта, отказывают `PROJECT_REQUIRED` со списком ключей —
+/// инструменты уровня базы (`project_list`, `project_create`, `tasq_init`) работают всегда.
 pub struct Context {
     pub conn: Connection,
-    pub project: Project,
+    pub active: Option<Project>,
     pub db_path: PathBuf,
     pub cwd: PathBuf,
+}
+
+impl Context {
+    /// Проект вызова: аргумент `project` важнее выбранного в сессии.
+    ///
+    /// Возвращается владеемый `Project`, а не ссылка: иначе вызов вида
+    /// `node::delete(&mut ctx.conn, &project, …)` не собрался бы — изменяемое заимствование
+    /// поля и неизменяемое всего контекста в одном вызове.
+    pub fn project(&self, args: &Value) -> Result<Project> {
+        if let Some(key) = arg_str(args, "project") {
+            return crate::project::select(&self.conn, Some(key));
+        }
+        if let Some(active) = &self.active {
+            return Ok(active.clone());
+        }
+        // В базе с единственным проектом выбора нет — это не дефолт среди вариантов.
+        crate::project::select(&self.conn, None)
+    }
+
+    /// Ключ активного проекта для ответов (`null`, если проект не выбран).
+    fn active_key(&self) -> Value {
+        match &self.active {
+            Some(project) => Value::from(project.key.clone()),
+            None => Value::Null,
+        }
+    }
 }
 
 fn text(result: &impl serde::Serialize) -> Value {
@@ -200,28 +231,38 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             let key = req_str(args, "key")?;
             let name = arg_str(args, "name");
             let project = crate::project::create(&mut ctx.conn, key, name)?;
+            // Проект создан, но контекст не переключён: `switched` и подсказка объясняют,
+            // каким вызовом это сделать. Молчаливая смена опаснее лишнего шага — агент,
+            // создавший проект «на будущее», иначе писал бы узлы в него не заметив.
+            let active = ctx.active_key();
+            let hint = match &ctx.active {
+                Some(current) => format!(
+                    "this session still works in {}; call project_select with key {} to switch",
+                    current.key, project.key
+                ),
+                None => format!(
+                    "no project is selected in this session; call project_select with key {}",
+                    project.key
+                ),
+            };
             Ok(text(&json!({
                 "project": project,
-                "active_project": ctx.project.key,
+                "active_project": active,
                 "switched": false,
-                // Молчаливая смена контекста опаснее лишнего вызова: агент, создавший
-                // проект «на будущее», получил бы узлы в нём.
-                "hint": format!(
-                    "this session still works in {}; call project_select with key {} to switch",
-                    ctx.project.key, project.key
-                ),
+                "hint": hint,
             })))
         }
         "project_select" => {
             let key = req_str(args, "key")?;
             let project = crate::project::select(&ctx.conn, Some(key))?;
-            let previous = ctx.project.key.clone();
-            ctx.project = project.clone();
+            let previous = ctx.active.as_ref().map(|active| active.key.clone());
+            ctx.active = Some(project.clone());
             Ok(text(&json!({
                 "active_project": project.key,
                 "name": project.name,
                 "previous": previous,
-                "switched": previous != project.key,
+                // Ничего не было выбрано — это не «переключение», и ответ это различает.
+                "switched": previous.as_deref() != Some(project.key.as_str()),
             })))
         }
         "project_list" => {
@@ -246,7 +287,11 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             // Правка идёт через ядро: там проверка статуса по схеме, нормализация ключа
             // и отказ на занятый ключ. Раньше SQL собирался на месте, и `--status nonsense`
             // отбивался `CHECK` базы как STORAGE_ERROR, то есть «внутренняя ошибка».
-            let target = arg_str(args, "key").unwrap_or(&ctx.project.key);
+            // Без `key` правим проект сессии; если его нет — отказ, а не «первый по порядку».
+            let target = match arg_str(args, "key") {
+                Some(key) => key.to_string(),
+                None => ctx.project(args)?.key,
+            };
             let patch = crate::project::Patch {
                 name: arg_str(args, "name"),
                 description: arg_str(args, "description"),
@@ -254,24 +299,29 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 key: arg_str(args, "new_key"),
             };
             let (updated, previous_key) =
-                crate::project::update(&mut ctx.conn, Some(target), &patch)?;
+                crate::project::update(&mut ctx.conn, Some(&target), &patch)?;
             // Если правили проект сессии (в том числе переименовали ключ) — контекст
-            // должен остаться на нём, иначе следующий вызов уйдёт в первый по порядку.
-            if ctx.project.id == updated.id {
-                ctx.project = updated.clone();
+            // должен остаться на нём, а не съехать на другой проект.
+            if let Some(active) = &ctx.active
+                && active.id == updated.id
+            {
+                ctx.active = Some(updated.clone());
             }
             Ok(text(&json!({
                 "project": updated,
                 "previous_key": previous_key,
-                "active_project": ctx.project.key,
+                "active_project": ctx.active_key(),
                 "nodes": crate::project::live_nodes(&ctx.conn, &updated)?,
             })))
         }
         "project_delete" => {
-            let target = arg_str(args, "key").unwrap_or(&ctx.project.key).to_string();
+            let target = match arg_str(args, "key") {
+                Some(key) => key.to_string(),
+                None => ctx.project(args)?.key,
+            };
             let deleting_active = {
                 let project = crate::project::select(&ctx.conn, Some(&target))?;
-                project.id == ctx.project.id
+                ctx.active.as_ref().map(|active| active.id) == Some(project.id)
             };
             let nodes = {
                 let project = crate::project::select(&ctx.conn, Some(&target))?;
@@ -279,14 +329,33 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             };
             let removed =
                 crate::project::delete(&mut ctx.conn, Some(&target), arg_bool(args, "force"))?;
-            // Удалили проект сессии — переезжаем в первый оставшийся, иначе контекст
-            // указывает на несуществующую строку и все вызовы падают.
+            // Удалили проект сессии — контекст больше ни на что не указывает. Если в базе
+            // остался ровно один проект, сессия переезжает в него (выбора нет — есть одна
+            // возможность); если их несколько, активного снова нет и нужен project_select.
             let mut switched_to = None;
             if deleting_active {
-                match crate::project::default_project(&ctx.conn) {
-                    Ok(next) => {
+                ctx.active = None;
+                // Единственный оставшийся проект — не «дефолт», а единственная
+                // возможность: сессия переезжает туда и говорит об этом (`switched_to`).
+                match crate::project::first_project_if_single(&ctx.conn) {
+                    Ok(Some(next)) => {
                         switched_to = Some(next.key.clone());
-                        ctx.project = next;
+                        ctx.active = Some(next);
+                    }
+                    Ok(None) => {
+                        // Пустая база и несколько проектов — разные подсказки: в первом
+                        // случае выбирать не из чего, во втором нужен явный выбор.
+                        let hint = if crate::project::count(&ctx.conn)? == 0 {
+                            "no projects left; call tasq_init or project_create"
+                        } else {
+                            "several projects remain; call project_list and then project_select"
+                        };
+                        return Ok(text(&json!({
+                            "deleted": removed.key,
+                            "nodes": nodes,
+                            "active_project": Value::Null,
+                            "hint": hint,
+                        })));
                     }
                     Err(_) => {
                         return Ok(text(&json!({
@@ -302,7 +371,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 "deleted": removed.key,
                 "name": removed.name,
                 "nodes": nodes,
-                "active_project": ctx.project.key,
+                "active_project": ctx.active_key(),
                 "switched_to": switched_to,
                 "remaining": crate::project::known_keys(&ctx.conn)?,
             })))
@@ -310,10 +379,11 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ узлы
         "node_create" => {
+            let project = ctx.project(args)?;
             let kind = arg_kind(args, "kind")?;
             let created = node::create(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 node::NewNode {
                     parent: arg_str(args, "parent"),
                     title: req_str(args, "title")?,
@@ -330,18 +400,19 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&created))
         }
         "node_get" => {
-            let node = node::resolve(&ctx.conn, &ctx.project, req_str(args, "ref")?)?;
+            let project = ctx.project(args)?;
+            let node = node::resolve(&ctx.conn, &project, req_str(args, "ref")?)?;
             let parent = if node.depth > 1 {
                 node.path
                     .rsplit_once('.')
-                    .and_then(|(head, _)| node::resolve(&ctx.conn, &ctx.project, head).ok())
+                    .and_then(|(head, _)| node::resolve(&ctx.conn, &project, head).ok())
                     .map(|parent| parent.dot_id)
             } else {
                 None
             };
             let children = node::list(
                 &ctx.conn,
-                &ctx.project,
+                &project,
                 &node::Filter {
                     parent: Some(&node.dot_id),
                     ..node::Filter::default()
@@ -353,7 +424,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 json!({"dot_id": child.dot_id, "title": child.title, "status": child.effective_status})
             })
             .collect::<Vec<_>>();
-            let comments = comment::list(&ctx.conn, &ctx.project, &node.dot_id, false)?;
+            let comments = comment::list(&ctx.conn, &project, &node.dot_id, false)?;
             Ok(text(&json!({
                 "node": node,
                 "parent": parent,
@@ -362,6 +433,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             })))
         }
         "node_update" => {
+            let project = ctx.project(args)?;
             let status = arg_status(args, "status")?;
             let description_locked = match arg_str(args, "description_locked") {
                 Some("true") => Some(true),
@@ -377,12 +449,12 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             // Право аренды считается ДО захвата соединения: иначе заимствование
             // пересекается с `&mut ctx.conn`.
             let lease_node = match arg_str(args, "token") {
-                Some(token) => crate::lease::live_node(&ctx.conn, &ctx.project, token)?,
+                Some(token) => crate::lease::live_node(&ctx.conn, &project, token)?,
                 None => None,
             };
             let updated = node::update(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "ref")?,
                 node::Patch {
                     title: arg_str(args, "title"),
@@ -406,9 +478,10 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&updated))
         }
         "node_list" => {
+            let project = ctx.project(args)?;
             let nodes = node::list(
                 &ctx.conn,
-                &ctx.project,
+                &project,
                 &node::Filter {
                     parent: arg_str(args, "parent"),
                     status: arg_str(args, "status"),
@@ -422,9 +495,10 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&nodes))
         }
         "node_move" => {
+            let project = ctx.project(args)?;
             let moved = node::move_node(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "ref")?,
                 arg_str(args, "parent"),
                 arg_bool(args, "renumber"),
@@ -432,6 +506,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&moved))
         }
         "node_reorder" => {
+            let project = ctx.project(args)?;
             let refs: Vec<String> = args
                 .get("refs")
                 .and_then(Value::as_array)
@@ -447,44 +522,50 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     value: "required".to_string(),
                 });
             }
-            node::reorder(&mut ctx.conn, &ctx.project, &refs)?;
+            node::reorder(&mut ctx.conn, &project, &refs)?;
             Ok(text(&json!({"reordered": refs.len()})))
         }
         "node_archive" => {
+            let project = ctx.project(args)?;
             let affected = node::archive(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "ref")?,
                 arg_bool(args, "undo"),
             )?;
             Ok(text(&json!({"affected": affected})))
         }
         "node_delete" => {
-            node::delete(&mut ctx.conn, &ctx.project, req_str(args, "ref")?)?;
+            let project = ctx.project(args)?;
+            node::delete(&mut ctx.conn, &project, req_str(args, "ref")?)?;
             Ok(text(&json!({"deleted": true})))
         }
         "node_restore" => {
-            let restored = node::restore(&mut ctx.conn, &ctx.project, req_str(args, "ref")?)?;
+            let project = ctx.project(args)?;
+            let restored = node::restore(&mut ctx.conn, &project, req_str(args, "ref")?)?;
             Ok(text(&restored))
         }
 
         // ------------------------------------------------ дерево и рекомендации
         "tasq_context" => {
-            let chain = overview::context(&ctx.conn, &ctx.project, req_str(args, "ref")?)?;
+            let project = ctx.project(args)?;
+            let chain = overview::context(&ctx.conn, &project, req_str(args, "ref")?)?;
             Ok(text(&chain))
         }
         "tasq_next" => {
+            let project = ctx.project(args)?;
             let limit = arg_i64(args, "limit").unwrap_or(3).clamp(1, 20) as usize;
-            let candidates = edge::next_candidates(&ctx.conn, &ctx.project, limit)?;
+            let candidates = edge::next_candidates(&ctx.conn, &project, limit)?;
             Ok(text(&candidates))
         }
 
         // ------------------------------------------------ аренды
         "tasq_claim" => {
+            let project = ctx.project(args)?;
             let holder = arg_holder(args);
             let held = lease::claim(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "ref")?,
                 &lease::ClaimRequest {
                     holder: &holder,
@@ -498,15 +579,17 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&held))
         }
         "tasq_renew" => {
+            let project = ctx.project(args)?;
             let renewed = lease::renew(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "token")?,
                 arg_i64(args, "ttl").unwrap_or(lease::DEFAULT_TTL),
             )?;
             Ok(text(&renewed))
         }
         "tasq_release" => {
+            let project = ctx.project(args)?;
             let outcome = match arg_str(args, "outcome").unwrap_or("released") {
                 "released" => lease::Outcome::Released,
                 "failed" => lease::Outcome::Failed,
@@ -520,7 +603,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             };
             let released = lease::release(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "token")?,
                 outcome,
                 arg_str(args, "checkpoint"),
@@ -531,6 +614,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ ресурсы
         "tasq_reserve" => {
+            let project = ctx.project(args)?;
             let token = req_str(args, "token")?;
             // `remove` — список ресурсов. Присланное `true` раньше молча игнорировалось,
             // и вызов «снять резерв» на деле добавлял его: ошибка в типе не должна
@@ -549,30 +633,32 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     .filter_map(Value::as_str)
                     .map(parse_resource)
                     .collect();
-                let removed = lease::unreserve(&mut ctx.conn, &ctx.project, token, Some(&values))?;
+                let removed = lease::unreserve(&mut ctx.conn, &project, token, Some(&values))?;
                 let add = arg_resources(args);
                 if add.is_empty() {
                     return Ok(text(&json!({"released": removed})));
                 }
-                let held = lease::reserve(&mut ctx.conn, &ctx.project, token, &add)?;
+                let held = lease::reserve(&mut ctx.conn, &project, token, &add)?;
                 return Ok(text(&json!({"released": removed, "held": held})));
             }
             let add = arg_resources(args);
             if add.is_empty() {
                 return Ok(text(
-                    &json!({"released": lease::unreserve(&mut ctx.conn, &ctx.project, token, None)?}),
+                    &json!({"released": lease::unreserve(&mut ctx.conn, &project, token, None)?}),
                 ));
             }
-            let held = lease::reserve(&mut ctx.conn, &ctx.project, token, &add)?;
+            let held = lease::reserve(&mut ctx.conn, &project, token, &add)?;
             Ok(text(&held))
         }
         "tasq_holdings" => {
-            let live = lease::holdings(&ctx.conn, &ctx.project)?;
+            let project = ctx.project(args)?;
+            let live = lease::holdings(&ctx.conn, &project)?;
             Ok(text(&live))
         }
 
         // ------------------------------------------------ зависимости
         "tasq_link" => {
+            let project = ctx.project(args)?;
             let kind =
                 edge::Kind::parse(arg_str(args, "kind").unwrap_or("blocks")).ok_or_else(|| {
                     Error::InvalidValue {
@@ -582,7 +668,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 })?;
             let linked = edge::link(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "from")?,
                 req_str(args, "to")?,
                 kind,
@@ -591,6 +677,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&linked))
         }
         "tasq_unlink" => {
+            let project = ctx.project(args)?;
             let kind =
                 edge::Kind::parse(arg_str(args, "kind").unwrap_or("blocks")).ok_or_else(|| {
                     Error::InvalidValue {
@@ -600,7 +687,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 })?;
             let removed = edge::unlink(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "from")?,
                 req_str(args, "to")?,
                 kind,
@@ -609,9 +696,10 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&json!({"removed": removed})))
         }
         "tasq_graph" => {
+            let project = ctx.project(args)?;
             let graph = edge::graph(
                 &ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "ref")?,
                 arg_i64(args, "depth").unwrap_or(3),
             )?;
@@ -625,10 +713,11 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ комментарии
         "comment_add" => {
+            let project = ctx.project(args)?;
             let holder = arg_holder(args);
             let added = comment::add(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "ref")?,
                 req_str(args, "content")?,
                 &holder,
@@ -636,26 +725,28 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&added))
         }
         "comment_list" => {
+            let project = ctx.project(args)?;
             let comments = comment::list(
                 &ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "ref")?,
                 arg_bool(args, "include_deleted"),
             )?;
             Ok(text(&comments))
         }
         "comment_delete" => {
+            let project = ctx.project(args)?;
             let id = arg_i64(args, "id").ok_or_else(|| Error::InvalidValue {
                 field: "id".to_string(),
                 value: "required".to_string(),
             })?;
             let holder = arg_holder(args);
             let result = if arg_bool(args, "restore") {
-                comment::restore(&mut ctx.conn, &ctx.project, id, &holder)?
+                comment::restore(&mut ctx.conn, &project, id, &holder)?
             } else {
                 comment::delete(
                     &mut ctx.conn,
-                    &ctx.project,
+                    &project,
                     id,
                     &holder,
                     arg_str(args, "reason"),
@@ -666,9 +757,10 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ заметки
         "note_save" => {
+            let project = ctx.project(args)?;
             let saved = note::save(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 note::SaveNote {
                     id: arg_i64(args, "id"),
                     title: arg_str(args, "title"),
@@ -681,9 +773,10 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&saved))
         }
         "note_list" => {
+            let project = ctx.project(args)?;
             let notes = note::list(
                 &ctx.conn,
-                &ctx.project,
+                &project,
                 &note::Filter {
                     note_type: arg_str(args, "note_type"),
                     node: arg_str(args, "ref"),
@@ -693,27 +786,30 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&notes))
         }
         "note_search" => {
-            let notes = note::search(&ctx.conn, &ctx.project, req_str(args, "query")?)?;
+            let project = ctx.project(args)?;
+            let notes = note::search(&ctx.conn, &project, req_str(args, "query")?)?;
             Ok(text(&notes))
         }
         "note_delete" => {
+            let project = ctx.project(args)?;
             let id = arg_i64(args, "id").ok_or_else(|| Error::InvalidValue {
                 field: "id".to_string(),
                 value: "required".to_string(),
             })?;
-            note::delete(&mut ctx.conn, &ctx.project, id, &arg_holder(args))?;
+            note::delete(&mut ctx.conn, &project, id, &arg_holder(args))?;
             Ok(text(&json!({"removed": true})))
         }
 
         // ------------------------------------------------ шаблоны
         "template_save" => {
+            let project = ctx.project(args)?;
             let tree = args.get("tree").ok_or_else(|| Error::InvalidValue {
                 field: "tree".to_string(),
                 value: "required".to_string(),
             })?;
             let saved = template::save(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "name")?,
                 arg_str(args, "description"),
                 &serde_json::to_string(tree).unwrap_or_else(|_| "[]".to_string()),
@@ -722,10 +818,12 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&saved))
         }
         "template_list" => {
-            let templates = template::list(&ctx.conn, &ctx.project)?;
+            let project = ctx.project(args)?;
+            let templates = template::list(&ctx.conn, &project)?;
             Ok(text(&templates))
         }
         "template_apply" => {
+            let project = ctx.project(args)?;
             let values: Vec<(String, String)> = args
                 .get("values")
                 .and_then(Value::as_object)
@@ -740,7 +838,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 .unwrap_or_default();
             let applied = template::apply(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "name")?,
                 arg_str(args, "parent"),
                 &values,
@@ -748,9 +846,10 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&applied))
         }
         "template_delete" => {
+            let project = ctx.project(args)?;
             template::delete(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 req_str(args, "name")?,
                 &arg_holder(args),
             )?;
@@ -759,11 +858,13 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ активность
         "activity_log" => {
+            let project = ctx.project(args)?;
             let limit = arg_i64(args, "limit").unwrap_or(20).clamp(1, 200);
-            let records = crate::activity::recent(&ctx.conn, ctx.project.id, limit)?;
+            let records = crate::activity::recent(&ctx.conn, project.id, limit)?;
             Ok(text(&records))
         }
         "session_diff" => {
+            let project = ctx.project(args)?;
             let since = req_str(args, "since")?;
             let mut stmt = ctx.conn.prepare(
                 "SELECT action, entity_type, COUNT(*)
@@ -771,7 +872,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                  WHERE project_id = ?1 AND created_at >= ?2
                  GROUP BY action, entity_type ORDER BY COUNT(*) DESC",
             )?;
-            let rows = stmt.query_map(rusqlite::params![ctx.project.id, since], |row| {
+            let rows = stmt.query_map(rusqlite::params![project.id, since], |row| {
                 Ok(json!({
                     "action": row.get::<_, String>(0)?,
                     "entity": row.get::<_, String>(1)?,
@@ -779,7 +880,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 }))
             })?;
             let grouped: Vec<Value> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-            let records = crate::activity::recent(&ctx.conn, ctx.project.id, 50)?
+            let records = crate::activity::recent(&ctx.conn, project.id, 50)?
                 .into_iter()
                 .filter(|record| record.created_at.as_str() >= since)
                 .collect::<Vec<_>>();
@@ -788,6 +889,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             ))
         }
         "node_batch_update" => {
+            let project = ctx.project(args)?;
             let refs: Vec<String> = args
                 .get("refs")
                 .and_then(Value::as_array)
@@ -804,7 +906,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             let holder = arg_holder(args);
             let result = overview::bulk_status(
                 &mut ctx.conn,
-                &ctx.project,
+                &project,
                 &refs,
                 status,
                 arg_bool(args, "force"),
@@ -815,16 +917,18 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ поиск и обзоры
         "tasq_search" => {
-            let hits = overview::search(&ctx.conn, &ctx.project, req_str(args, "query")?)?;
+            let project = ctx.project(args)?;
+            let hits = overview::search(&ctx.conn, &project, req_str(args, "query")?)?;
             Ok(text(&hits))
         }
         "tasq_dashboard" => {
-            let board = overview::board(&ctx.conn, &ctx.project)?;
-            let live = lease::holdings(&ctx.conn, &ctx.project)?;
-            let next = edge::next_candidates(&ctx.conn, &ctx.project, 3)?;
-            let risky = crate::burnup::at_risk(&ctx.conn, &ctx.project, 0.2)?;
+            let project = ctx.project(args)?;
+            let board = overview::board(&ctx.conn, &project)?;
+            let live = lease::holdings(&ctx.conn, &project)?;
+            let next = edge::next_candidates(&ctx.conn, &project, 3)?;
+            let risky = crate::burnup::at_risk(&ctx.conn, &project, 0.2)?;
             Ok(text(&json!({
-                "project": ctx.project.key,
+                "project": project.key,
                 "board": board,
                 "leases": live,
                 "next": next,
@@ -832,6 +936,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             })))
         }
         "tasq_burnup" => {
+            let project = ctx.project(args)?;
             let metric = crate::burnup::Metric::parse(arg_str(args, "metric").unwrap_or("count"))
                 .ok_or_else(|| Error::InvalidValue {
                 field: "metric".to_string(),
@@ -839,7 +944,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             })?;
             let series = crate::burnup::series(
                 &ctx.conn,
-                &ctx.project,
+                &project,
                 metric,
                 arg_str(args, "since"),
                 arg_str(args, "until"),
@@ -853,9 +958,10 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&series))
         }
         "tasq_risk" => {
+            let project = ctx.project(args)?;
             let risky = crate::burnup::at_risk(
                 &ctx.conn,
-                &ctx.project,
+                &project,
                 arg_f64(args, "threshold").unwrap_or(0.2),
             )?;
             Ok(text(&risky))
@@ -863,11 +969,13 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ перенос данных
         "tasq_export" => {
+            let project = ctx.project(args)?;
             let document =
-                transfer::export(&ctx.conn, &ctx.project, arg_bool(args, "include_deleted"))?;
+                transfer::export(&ctx.conn, &project, arg_bool(args, "include_deleted"))?;
             Ok(text(&document))
         }
         "tasq_import" => {
+            let project = ctx.project(args)?;
             let document = args.get("document").ok_or_else(|| Error::InvalidValue {
                 field: "document".to_string(),
                 value: "required".to_string(),
@@ -879,21 +987,9 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 },
             )?;
             let imported = if arg_bool(args, "from_saga") {
-                transfer::import_saga(
-                    &mut ctx.conn,
-                    &ctx.project,
-                    document,
-                    mode,
-                    &arg_holder(args),
-                )?
+                transfer::import_saga(&mut ctx.conn, &project, document, mode, &arg_holder(args))?
             } else {
-                transfer::import(
-                    &mut ctx.conn,
-                    &ctx.project,
-                    document,
-                    mode,
-                    &arg_holder(args),
-                )?
+                transfer::import(&mut ctx.conn, &project, document, mode, &arg_holder(args))?
             };
             Ok(text(&imported))
         }
@@ -1483,8 +1579,32 @@ pub fn definition(name: &str) -> Option<Value> {
     Some(def)
 }
 
-fn tool(name: &str, description: &str, schema: Value, hints: (bool, bool, bool)) -> Value {
+/// Инструменты, которые живут вне проекта: им `project` не нужен и не должен предлагаться.
+const PROJECT_FREE: &[&str] = &[
+    "tasq_init",
+    "project_create",
+    "project_select",
+    "project_list",
+    "project_update",
+    "project_delete",
+];
+
+fn tool(name: &str, description: &str, mut schema: Value, hints: (bool, bool, bool)) -> Value {
     let (read_only, destructive, idempotent) = hints;
+    // `project` объявлен у КАЖДОГО инструмента, работающего внутри проекта: аргумент
+    // поддерживался и раньше, но не был виден в `tools/list`, то есть агент о нём не узнал
+    // бы. Одно описание вместо 39 копий — и бюджет схем растёт на одну строку по смыслу.
+    if !PROJECT_FREE.contains(&name)
+        && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "project".to_string(),
+            json!({
+                "type": "string",
+                "description": "Project key; default: the session project",
+            }),
+        );
+    }
     json!({
         "name": name,
         "description": description,
@@ -1528,10 +1648,19 @@ mod tests {
                 .as_object()
                 .cloned()
                 .unwrap_or_default();
-            assert!(
-                properties.len() <= 8,
-                "{name}: {} параметров",
-                properties.len()
+            // Предел считает СВОИ параметры инструмента; общий селектор `project`
+            // добавляется всем сразу и в этот счёт не входит.
+            let own = properties
+                .keys()
+                .filter(|key| key.as_str() != "project")
+                .count();
+            assert!(own <= 8, "{name}: {own} параметров");
+            // Контракт селектора: он объявлен у всех, кто живёт внутри проекта, и отсутствует
+            // у инструментов уровня базы. Иначе агент снова не узнает о возможности.
+            assert_eq!(
+                properties.contains_key("project"),
+                !PROJECT_FREE.contains(name),
+                "{name}: объявление project расходится с PROJECT_FREE"
             );
             for (key, value) in properties {
                 if let Some(text) = value.get("description").and_then(Value::as_str) {

@@ -26,7 +26,7 @@ fn fixture(tag: &str) -> (Connection, Project) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     (conn, project)
 }
 
@@ -75,12 +75,12 @@ fn dot_ids_follow_the_tree() {
     let epic = add(&mut conn, &project, None, "Epic");
     assert_eq!(epic.dot_id, "TASQ-1");
     assert_eq!(epic.kind, "epic");
-    assert_eq!(epic.status, "planned");
+    assert_eq!(epic.status, "idea", "воронка: новый эпик — идея");
 
     let task = add(&mut conn, &project, Some("TASQ-1"), "Task");
     assert_eq!(task.dot_id, "TASQ-1.1");
     assert_eq!(task.kind, "task");
-    assert_eq!(task.status, "todo");
+    assert_eq!(task.status, "idea", "воронка: новая задача — идея");
 
     let sub = add(&mut conn, &project, Some("1.1"), "Subtask");
     assert_eq!(sub.dot_id, "TASQ-1.1.1");
@@ -136,7 +136,7 @@ fn in_progress_needs_a_lease() {
     assert!(matches!(err, Error::LeaseRequired));
     // статус не изменился
     let reread = node::resolve(&conn, &project, &task.dot_id).expect("node");
-    assert_eq!(reread.status, "todo");
+    assert_eq!(reread.status, "idea", "статус не изменился отказом");
 }
 
 #[test]

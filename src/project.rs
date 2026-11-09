@@ -25,11 +25,13 @@ pub struct Summary {
     pub created_at: String,
 }
 
-/// Проект, к которому относится работа: первый по порядку создания.
+/// Первый проект по порядку создания.
 ///
-/// Это значение по умолчанию для базы с одним проектом; при нескольких проектах
-/// нужен явный выбор — `select` ниже.
-pub fn default_project(conn: &Connection) -> Result<Project> {
+/// **Не** значение по умолчанию: проект — самостоятельная сущность иерархии, и
+/// подставлять его молча нельзя (см. `select`). Функция нужна ровно там, где «любой
+/// проект» — часть операции: переключение после удаления проекта сеанса, регистрация
+/// проекта при `init` пустой базы, тестовые фикстуры.
+pub fn first_project(conn: &Connection) -> Result<Project> {
     conn.query_row(
         "SELECT id, key, name, status FROM projects ORDER BY id LIMIT 1",
         [],
@@ -96,17 +98,69 @@ pub fn known_keys(conn: &Connection) -> Result<String> {
 
 /// Проект, в котором идёт работа.
 ///
-/// Явный ключ важнее порядка создания: без этого второй проект был бы недостижим —
-/// все инструменты молча работали бы с первым. Значение по умолчанию сохранено,
-/// чтобы существующие базы и скрипты продолжали работать без правок.
+/// Проект — самостоятельная сущность иерархии, поэтому «первый по порядку создания» не
+/// подставляется никогда: в базе с несколькими проектами такой выбор — это чужие данные,
+/// в которые запись уходит молча (ровно так теряется работа). Правило:
+///
+/// - ключ задан (`--project`, `TASQ_PROJECT`) — работаем в нём;
+/// - ключа нет, проект в базе один — выбора нет, берём его (не дефолт среди вариантов,
+///   а единственная возможность; существующие скрипты и однопроектные базы живут как жили);
+/// - ключа нет, проектов несколько — отказ `PROJECT_REQUIRED` со списком ключей. Какой
+///   проект твой, знает только тот, кто ставит задачу.
 pub fn select(conn: &Connection, key: Option<&str>) -> Result<Project> {
     match key.map(str::trim).filter(|value| !value.is_empty()) {
         Some(key) => by_key(conn, key)?.ok_or_else(|| Error::ProjectNotFound {
             key: key.to_string(),
             known: known_keys(conn).unwrap_or_else(|_| "unknown".to_string()),
         }),
-        None => default_project(conn),
+        None => {
+            let mut stmt =
+                conn.prepare("SELECT id, key, name, status FROM projects ORDER BY id")?;
+            let projects: Vec<Project> = stmt
+                .query_map([], |row| {
+                    Ok(Project {
+                        id: row.get(0)?,
+                        key: row.get(1)?,
+                        name: row.get(2)?,
+                        status: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            match projects.len() {
+                0 => Err(Error::NoProject),
+                1 => Ok(projects.into_iter().next().expect("один проект")),
+                _ => Err(Error::ProjectRequired {
+                    known: projects
+                        .iter()
+                        .map(|project| project.key.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }),
+            }
+        }
     }
+}
+
+/// Единственный проект базы — или `None`, если их несколько.
+///
+/// Для операций, где «любой проект» возникает сам: сессия потеряла свой проект удалением,
+/// и переезд возможен только тогда, когда переезжать некуда — проект один.
+pub fn first_project_if_single(conn: &Connection) -> Result<Option<Project>> {
+    let mut stmt = conn.prepare("SELECT id, key, name, status FROM projects ORDER BY id")?;
+    let projects: Vec<Project> = stmt
+        .query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                key: row.get(1)?,
+                name: row.get(2)?,
+                status: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(match projects.len() {
+        1 => projects.into_iter().next(),
+        _ => None,
+    })
 }
 
 /// Все проекты базы, в порядке создания, с числом живых узлов.

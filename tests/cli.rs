@@ -168,7 +168,8 @@ fn json_output_is_machine_readable_for_nodes() {
     let first = &nodes[0];
     assert_eq!(first["dot_id"], "TASQ-1");
     assert_eq!(first["kind"], "epic");
-    assert_eq!(first["effective_status"], "planned");
+    // Воронка: новый узел начинается как идея, а не как запланированная работа.
+    assert_eq!(first["effective_status"], "idea");
     assert_eq!(first["weight"], 3.0);
 }
 

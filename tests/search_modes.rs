@@ -27,7 +27,7 @@ fn fixture(tag: &str) -> (Connection, Project, PathBuf) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     (conn, project, dir)
 }
 
@@ -204,6 +204,19 @@ fn next_explains_why_a_node_is_first() {
         },
     )
     .expect("dependent");
+    // Очередь «что дальше» работает по готовым к работе узлам: воронка отдаёт их в `todo`.
+    for accepted in [&overdue, &scheduled, &dependent] {
+        node::update(
+            &mut conn,
+            &project,
+            &accepted.dot_id,
+            node::Patch {
+                status: Some(tasq::status::Status::Todo),
+                ..node::Patch::default()
+            },
+        )
+        .expect("принять в очередь");
+    }
     edge::link(
         &mut conn,
         &project,

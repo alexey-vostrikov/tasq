@@ -857,6 +857,11 @@ pub fn import_saga(
             "in_progress" => "in_progress".to_string(),
             "todo" => "todo".to_string(),
             "planned" | "on_hold" => "planned".to_string(),
+            // Воронка tasq: у saga таких состояний нет, но собственный экспорт
+            // проходит через эту же таблицу, и без явных ветвей идея превращалась
+            // бы в `planned`/`todo` при каждом импорте.
+            "idea" => "idea".to_string(),
+            "backlog" => "backlog".to_string(),
             _ if epic => "planned".to_string(),
             _ => "todo".to_string(),
         }

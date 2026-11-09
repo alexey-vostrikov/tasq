@@ -226,6 +226,12 @@ fn node_lifecycle_tools() {
             ("node_delete", json!({"ref": "TASQ-1.1.2"})),
             ("node_restore", json!({"ref": "TASQ-1.1.2"})),
             ("tasq_context", json!({"ref": "TASQ-1.1"})),
+            // Воронка начинается с `idea`: чтобы очередь «что дальше» была непустой,
+            // лист надо явно принять в работу.
+            (
+                "node_update",
+                json!({"ref": "TASQ-1.1.2", "status": "todo"}),
+            ),
             ("tasq_next", json!({"limit": 3})),
         ],
     );
@@ -256,10 +262,11 @@ fn node_lifecycle_tools() {
     // Цепочка контекста: от корня до узла.
     let chain = out[12].as_array().expect("chain");
     assert_eq!(chain.first().expect("root")["dot_id"], json!("TASQ-1"));
+    assert_eq!(out[13]["status"], json!("todo"), "переход в очередь");
     assert!(
-        !out[13].as_array().map(Vec::is_empty).unwrap_or(true),
+        !out[14].as_array().map(Vec::is_empty).unwrap_or(true),
         "{:?}",
-        out[13]
+        out[14]
     );
 }
 
@@ -951,6 +958,55 @@ fn deleting_the_session_project_moves_the_session_to_another_one() {
     let projects = out[4].as_array().expect("projects");
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0]["key"], json!("ALPHA"));
+}
+
+/// В базе с двумя проектами сессия без выбора не работает ни в одном: инструмент,
+/// живущий внутри проекта, отказывает `PROJECT_REQUIRED` со списком ключей, а выбор
+/// делается `project_select` (или аргументом `project` у самого вызова).
+#[test]
+fn a_session_without_a_project_refuses_instead_of_picking_one() {
+    let dir = temp_dir("project-required");
+    cli(&dir, &["init", "--key", "ALPHA"]);
+    cli(&dir, &["create", "project", "PRJ"]);
+    cli(&dir, &["--project", "ALPHA", "add", "Узел ALPHA"]);
+    cli(&dir, &["--project", "PRJ", "add", "Узел PRJ"]);
+
+    let out = session_lenient(
+        &dir,
+        &[
+            // Проект не выбран: работа внутри проекта отвергнута с кодом и списком.
+            ("node_list", json!({})),
+            // Инструменты уровня базы работают без выбора.
+            ("project_list", json!({})),
+            // Явный выбор в сессии — и узлы своего проекта видны, чужие нет.
+            ("project_select", json!({"key": "PRJ"})),
+            ("node_list", json!({})),
+            // Аргумент вызова важнее выбранного: читаем чужой проект, не меняя сессию.
+            ("node_list", json!({"project": "ALPHA"})),
+        ],
+    );
+
+    assert_eq!(out[0]["code"], json!("PROJECT_REQUIRED"), "{}", out[0]);
+    let hint = out[0]["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("project"),
+        "подсказка называет способ: {hint}"
+    );
+
+    assert_eq!(
+        out[1].as_array().map(Vec::len),
+        Some(2),
+        "оба проекта видны"
+    );
+
+    assert_eq!(out[2]["active_project"], json!("PRJ"));
+    let own = out[3].as_array().expect("nodes");
+    assert_eq!(own.len(), 1, "{own:?}");
+    assert_eq!(own[0]["dot_id"], json!("PRJ-1"));
+
+    let foreign = out[4].as_array().expect("nodes");
+    assert_eq!(foreign.len(), 1, "{foreign:?}");
+    assert_eq!(foreign[0]["dot_id"], json!("ALPHA-1"));
 }
 
 #[test]

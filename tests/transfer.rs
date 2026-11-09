@@ -26,7 +26,7 @@ fn fixture(tag: &str) -> (Connection, Project) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     (conn, project)
 }
 
@@ -142,7 +142,7 @@ fn round_trip_into_a_clean_database_keeps_everything() {
     let dir = temp_dir("roundtrip-target");
     let outcome = db::init(&dir, "TASQ", "target").expect("init");
     let mut target = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let target_project = project::default_project(&target).expect("project");
+    let target_project = project::first_project(&target).expect("project");
 
     let result = transfer::import(&mut target, &target_project, &document, Mode::Replace, "-")
         .expect("import");
@@ -193,7 +193,7 @@ fn edited_payload_is_rejected_by_checksum() {
     let dir = temp_dir("tamper-target");
     let outcome = db::init(&dir, "TASQ", "target").expect("init");
     let mut target = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let target_project = project::default_project(&target).expect("project");
+    let target_project = project::first_project(&target).expect("project");
 
     let err =
         transfer::import(&mut target, &target_project, &document, Mode::Replace, "-").unwrap_err();
@@ -312,7 +312,7 @@ fn saga_export_is_imported_with_mapping() {
     let dir = temp_dir("saga");
     let outcome = db::init(&dir, "TASQ", "saga-target").expect("init");
     let mut conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
 
     // Реальная форма tracker_export 1.3 из saga-mcp@1.19.0 — снята с dist/tools/export-import.js.
     // Лежит отдельным файлом: у json! слишком длинный литерал упирается в recursion limit.

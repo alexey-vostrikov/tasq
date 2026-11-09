@@ -162,20 +162,31 @@ impl Server {
     ) -> Result<tools::Context> {
         let db_path = crate::db::discover(cwd, db)?;
         let conn = crate::db::open_checked(&db_path)?;
-        let project = project::select(&conn, project_key)?;
+        // Сессия может открыться БЕЗ активного проекта: он выбирается явно
+        // (`project_select` или аргумент `project` у вызова). Отказ по неверному ключу
+        // остаётся отказом — молча подставлять другой проект нельзя.
+        let active = match project::select(&conn, project_key) {
+            Ok(project) => Some(project),
+            Err(err @ (Error::ProjectRequired { .. } | Error::NoProject)) => {
+                let _ = err;
+                None
+            }
+            Err(err) => return Err(err),
+        };
         Ok(tools::Context {
             conn,
-            project,
+            active,
             db_path,
             cwd: cwd.to_path_buf(),
         })
     }
 
-    /// Ключ активного проекта сессии (если база открыта).
+    /// Ключ активного проекта сессии (если выбран).
     pub fn project_key(&self) -> Option<&str> {
         self.context
             .as_ref()
-            .map(|context| context.project.key.as_str())
+            .and_then(|context| context.active.as_ref())
+            .map(|project| project.key.as_str())
     }
 
     pub fn profile(&self) -> Profile {
@@ -274,10 +285,12 @@ impl Server {
             match crate::db::init(&self.cwd, key, project_name).and_then(|outcome| {
                 let db_path = PathBuf::from(&outcome.db_path);
                 let conn = crate::db::open_checked(&db_path)?;
-                let project = project::select(&conn, None)?;
+                // `tasq_init` только что зарегистрировал проект: «любой проект» здесь —
+                // часть операции, а не подстановка по умолчанию.
+                let project = project::first_project(&conn)?;
                 Ok(tools::Context {
                     conn,
-                    project,
+                    active: Some(project),
                     db_path,
                     cwd: self.cwd.clone(),
                 })

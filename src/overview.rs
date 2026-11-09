@@ -290,21 +290,14 @@ pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
         },
     )?;
     let today = today_days(conn)?;
-    let order = [
-        "planned",
-        "todo",
-        "in_progress",
-        "blocked",
-        "review",
-        "deferred",
-        "done",
-        "cancelled",
-    ];
+    // Порядок колонок берётся из единственного списка статусов: своя копия здесь
+    // расходится с `Status::all()` на первом же добавленном статусе.
+    let order = crate::status::Status::all();
 
     let mut columns: Vec<BoardColumn> = order
         .iter()
         .map(|status| BoardColumn {
-            status: status.to_string(),
+            status: status.as_str().to_string(),
             count: 0,
             rows: Vec::new(),
         })

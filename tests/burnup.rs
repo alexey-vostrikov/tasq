@@ -25,7 +25,7 @@ fn fixture(tag: &str) -> (Connection, Project) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     (conn, project)
 }
 

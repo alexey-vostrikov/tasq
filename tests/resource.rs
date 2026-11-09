@@ -25,7 +25,7 @@ fn fixture(tag: &str) -> (Connection, Project, node::Node) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let mut conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     let mut make = |title: &str, parent: Option<&str>| {
         node::create(
             &mut conn,
@@ -141,7 +141,7 @@ fn overlapping_path_blocks_the_claim_and_names_the_holder() {
 
     // узел не остался занятым: захват откатился целиком
     let epic = node::resolve(&conn, &project, "TASQ-2").expect("epic");
-    assert_eq!(epic.status, "planned");
+    assert_eq!(epic.status, "idea", "захват откатился, статус прежний");
     assert_eq!(epic.lease_holder, None);
 }
 
@@ -507,7 +507,7 @@ fn paths_outside_the_project_are_rejected() {
     }
     // узел не тронут отказами
     let node = node::resolve(&conn, &project, &task.dot_id).expect("node");
-    assert_eq!(node.status, "todo");
+    assert_eq!(node.status, "idea", "отказы статус не двигают");
 }
 
 #[test]

@@ -25,7 +25,7 @@ fn fixture(tag: &str) -> (Connection, Project) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     (conn, project)
 }
 
@@ -429,6 +429,17 @@ fn board_groups_by_status_and_flags_overdue_and_leases() {
         },
     )
     .expect("overdue");
+    // Просроченная работа стоит в очереди, а не в идеях: иначе доска не покажет её колонку.
+    node::update(
+        &mut conn,
+        &project,
+        &overdue.dot_id,
+        node::Patch {
+            status: Some(Status::Todo),
+            ..node::Patch::default()
+        },
+    )
+    .expect("принять в очередь");
     let leased = add(&mut conn, &project, Some(&epic.dot_id), "В работе");
     let _lease = lease::claim(
         &mut conn,
@@ -553,24 +564,97 @@ fn bulk_status_reports_each_failure() {
 }
 
 #[test]
-fn schema_v2_is_applied_on_existing_database() {
+fn schema_v2_database_migrates_to_v3_without_losing_rows() {
     let dir = temp_dir("migrate");
-    // init доводит базу до текущей версии
+    let db_path = db::db_path_in(&dir);
+    fs::create_dir_all(db_path.parent().expect("db dir")).expect("create db dir");
+
+    // База «как у пользователя до обновления»: схема v2 и живые данные во всех таблицах,
+    // которые ссылаются на узлы. Пересборка `nodes` — единственное место, где DROP TABLE
+    // мог бы каскадом снести эти строки, поэтому проверяются именно они.
+    {
+        let conn = Connection::open(&db_path).expect("create v2 db");
+        conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+            .expect("v1");
+        conn.execute_batch(include_str!("../migrations/0002_search_and_time.sql"))
+            .expect("v2");
+        conn.execute_batch(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+             INSERT INTO projects (id, key, name, status, timezone, tags, metadata, created_at, updated_at)
+               VALUES (1, 'TASQ', 'demo', 'active', 'UTC', '[]', '{}', '2026-01-01T00:00:00.000Z',
+                       '2026-01-01T00:00:00.000Z');
+             INSERT INTO nodes (id, project_id, parent_id, depth, seq, path, kind, title, status,
+                                weight, created_at, updated_at)
+               VALUES (1, 1, NULL, 1, 1, '1', 'epic', 'Старый эпик', 'planned', 2,
+                       '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'),
+                      (2, 1, 1, 2, 1, '1.1', 'task', 'Старая задача', 'todo', 1,
+                       '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+             INSERT INTO attempts (node_id, attempt_no, holder, token, ttl_seconds, started_at, expires_at)
+               VALUES (2, 1, 'agent', 'tok-old', 900, '2026-01-01T00:00:00.000Z',
+                       '2999-01-01T00:00:00.000Z');
+             INSERT INTO edges (from_node, to_node, kind, created_at)
+               VALUES (2, 1, 'blocks', '2026-01-01T00:00:00.000Z');
+             INSERT INTO comments (node_id, author, content, created_at)
+               VALUES (2, 'agent', 'живой комментарий', '2026-01-01T00:00:00.000Z');
+             INSERT INTO notes (project_id, node_id, title, content, created_at, updated_at)
+               VALUES (1, 2, 'Заметка', 'текст', '2026-01-01T00:00:00.000Z',
+                       '2026-01-01T00:00:00.000Z');",
+        )
+        .expect("seed v2 data");
+    }
+
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     assert_eq!(outcome.schema_version, db::SUPPORTED_SCHEMA_VERSION);
     let conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
 
-    let version: String = conn
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).expect("count") };
+    assert_eq!(count("SELECT COUNT(*) FROM nodes"), 2, "узлы на месте");
+    assert_eq!(count("SELECT COUNT(*) FROM attempts"), 1, "аренда на месте");
+    assert_eq!(count("SELECT COUNT(*) FROM edges"), 1, "ребро на месте");
+    assert_eq!(
+        count("SELECT COUNT(*) FROM comments"),
+        1,
+        "комментарий на месте"
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM notes"), 1, "заметка на месте");
+
+    // Идентификаторы и родитель сохранены: пересборка не перенумеровала строки.
+    let (id, parent): (i64, Option<i64>) = conn
         .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
+            "SELECT id, parent_id FROM nodes WHERE path = '1.1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("row");
+    assert_eq!(id, 2);
+    assert_eq!(parent, Some(1));
+
+    // FTS перестроен из новой таблицы и находит старую строку.
+    let hits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'старая'",
             [],
             |row| row.get(0),
         )
-        .expect("version");
-    assert_eq!(version, "2");
+        .expect("fts");
+    assert_eq!(hits, 1, "внешний контент FTS перечитан");
 
-    // повторный init ничего не ломает
+    // Новый CHECK принимает статусы воронки, а целостность ссылок не пострадала.
+    conn.execute("UPDATE nodes SET status = 'idea' WHERE id = 2", [])
+        .expect("idea passes the new CHECK");
+    let violations: i64 = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check").expect("pragma");
+        stmt.query_map([], |_| Ok(()))
+            .expect("rows")
+            .count()
+            .try_into()
+            .expect("count")
+    };
+    assert_eq!(violations, 0, "внешние ключи целы после пересборки");
+
+    // Повторный init ничего не ломает и не мигрирует второй раз.
     let second = db::init(&dir, "TASQ", "demo").expect("re-init");
-    assert_eq!(second.schema_version, 2);
+    assert_eq!(second.schema_version, db::SUPPORTED_SCHEMA_VERSION);
     assert!(!second.project_created);
+    assert!(!second.migrated, "миграции уже применены");
 }

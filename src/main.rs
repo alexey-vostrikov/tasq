@@ -35,7 +35,7 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Project key to work in (default: the first project by creation order)
+    /// Project key to work in; required when the database holds more than one project
     #[arg(long, global = true, value_name = "KEY", env = "TASQ_PROJECT")]
     project: Option<String>,
 

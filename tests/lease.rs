@@ -30,7 +30,7 @@ fn fixture(tag: &str) -> (PathBuf, Connection, Project, node::Node) {
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let db_path = PathBuf::from(outcome.db_path);
     let mut conn = db::open(&db_path).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     let epic = node::create(
         &mut conn,
         &project,
@@ -368,7 +368,7 @@ fn concurrent_claims_let_exactly_one_win() {
     let db_path = PathBuf::from(outcome.db_path);
 
     let mut setup = db::open(&db_path).expect("open");
-    let project = project::default_project(&setup).expect("project");
+    let project = project::first_project(&setup).expect("project");
 
     // Каждый круг — свой узел: освобождать его внутри круга нельзя,
     // иначе второй поток законно захватит уже свободный узел.
@@ -403,7 +403,7 @@ fn concurrent_claims_let_exactly_one_win() {
                 let mut conn = Connection::open(&path).expect("open");
                 conn.busy_timeout(std::time::Duration::from_secs(10))
                     .expect("busy timeout");
-                let project = project::default_project(&conn).expect("project");
+                let project = project::first_project(&conn).expect("project");
                 barrier.wait();
                 let holder = format!("agent-{worker}");
                 let mut request = ClaimRequest::new(&holder);

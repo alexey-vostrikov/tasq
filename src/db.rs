@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 3;
 pub const DB_DIR: &str = ".tasq";
 pub const DB_FILE: &str = "tasq.db";
 
@@ -17,6 +17,7 @@ pub const DB_FILE: &str = "tasq.db";
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_search_and_time.sql")),
+    (3, include_str!("../migrations/0003_status_funnel.sql")),
 ];
 
 /// Время в UTC, ровно в том виде, в каком его печатает `strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
@@ -276,6 +277,22 @@ pub fn init_at(db_path: &Path, key: &str, name: &str) -> Result<InitOutcome> {
 /// Применяет неприменённые миграции; возвращает `true`, если что-то применилось.
 fn apply_migrations(conn: &mut Connection) -> Result<bool> {
     let current = schema_version(conn)?;
+    if MIGRATIONS.iter().all(|(version, _)| *version <= current) {
+        return Ok(false);
+    }
+    // Внешние ключи выключаются ДО транзакции: внутри транзакции `PRAGMA foreign_keys`
+    // молча игнорируется. Пересборка таблицы (v3) удаляет `nodes`, а с включёнными
+    // ключами `DROP TABLE` выполняет неявное удаление строк и каскадом сносит
+    // attempts, edges, comments и notes. Целостность проверяется до коммита.
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = run_migrations(conn, current);
+    // Восстанавливать режим обязательно и при ошибке: соединение остаётся живым,
+    // и молча выключенные ключи исказили бы всю дальнейшую работу.
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result
+}
+
+fn run_migrations(conn: &mut Connection, current: i64) -> Result<bool> {
     let mut applied = false;
     for (version, sql) in MIGRATIONS {
         if *version <= current {
@@ -283,6 +300,13 @@ fn apply_migrations(conn: &mut Connection) -> Result<bool> {
         }
         let tx = write_tx(conn)?;
         tx.execute_batch(sql)?;
+        let violations = foreign_key_violations(&tx)?;
+        if violations > 0 {
+            return Err(Error::MigrationBroken {
+                version: *version,
+                violations,
+            });
+        }
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -293,6 +317,17 @@ fn apply_migrations(conn: &mut Connection) -> Result<bool> {
         applied = true;
     }
     Ok(applied)
+}
+
+/// Число нарушений внешних ключей в текущем состоянии соединения (внутри транзакции).
+fn foreign_key_violations(conn: &Connection) -> Result<i64> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = stmt.query([])?;
+    let mut count = 0;
+    while rows.next()?.is_some() {
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Итог `tasq doctor`.

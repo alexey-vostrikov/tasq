@@ -120,10 +120,23 @@ fn work_goes_to_the_project_named_by_the_selector() {
     assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
     assert_eq!(run(&dir, &["create", "project", "PRJ"]).0, 0);
 
-    // Без выбора — первый проект, как раньше: совместимость не ломается.
-    assert_eq!(run(&dir, &["add", "Узел по умолчанию"]).0, 0);
-    let (_, stdout, _) = run(&dir, &["ls"]);
-    assert!(stdout.contains("ALPHA-1"), "{stdout}");
+    // Проектов два и селектора нет — это не «первый по порядку», а отказ со списком:
+    // куда писать, знает только тот, кто ставит задачу.
+    let (code, stdout, stderr) = run(&dir, &["add", "Узел без проекта"]);
+    assert_eq!(code, 1, "stdout: {stdout}");
+    assert!(stderr.contains("PROJECT_REQUIRED"), "{stderr}");
+    assert!(
+        stderr.contains("ALPHA") && stderr.contains("PRJ"),
+        "отказ перечисляет доступные ключи: {stderr}"
+    );
+    // И ничего не создалось ни в одном из проектов.
+    for key in ["ALPHA", "PRJ"] {
+        let (_, listed, _) = run(&dir, &["--project", key, "ls"]);
+        assert!(
+            !listed.contains("-1"),
+            "в {key} ничего не появилось: {listed}"
+        );
+    }
 
     // С выбором — второй проект, и dot-ID отличается.
     assert_eq!(run(&dir, &["--project", "PRJ", "add", "Узел в PRJ"]).0, 0);
@@ -133,9 +146,21 @@ fn work_goes_to_the_project_named_by_the_selector() {
         !stdout.contains("ALPHA-1"),
         "чужие узлы не видны:\n{stdout}"
     );
+    // Селектор переменной окружения работает так же, как флаг.
+    assert_eq!(
+        run_env(&dir, &[("TASQ_PROJECT", "ALPHA")], &["add", "Узел в ALPHA"]).0,
+        0
+    );
+    let (_, stdout, _) = run(&dir, &["--project", "ALPHA", "ls"]);
+    assert!(stdout.contains("ALPHA-1"), "{stdout}");
 
-    // Изоляция в обе стороны.
-    let (_, stdout, _) = run(&dir, &["ls"]);
+    // Изоляция в обе стороны: без селектора `ls` в базе с двумя проектами — тот же
+    // отказ PROJECT_REQUIRED, а не «первый попавшийся список».
+    let (code, _, stderr) = run(&dir, &["ls"]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("PROJECT_REQUIRED"), "{stderr}");
+
+    let (_, stdout, _) = run(&dir, &["--project", "ALPHA", "ls"]);
     assert!(stdout.contains("ALPHA-1"), "{stdout}");
     assert!(!stdout.contains("PRJ-1"), "{stdout}");
 }

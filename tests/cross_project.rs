@@ -29,7 +29,7 @@ fn two_projects(tag: &str) -> (Connection, Project, Project) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "ALFA", "первый").expect("init");
     let mut conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let alfa = project::default_project(&conn).expect("alfa");
+    let alfa = project::first_project(&conn).expect("alfa");
     let beta = project::create(&mut conn, "BETA", Some("второй")).expect("beta");
     (conn, alfa, beta)
 }

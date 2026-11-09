@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v2**.
+Версия схемы: **v3**.
 
 ## Таблицы
 
@@ -104,7 +104,7 @@ CREATE TABLE meta (
 ### `nodes`
 
 ```sql
-CREATE TABLE nodes (
+CREATE TABLE "nodes" (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id         INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   parent_id          INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
@@ -117,8 +117,8 @@ CREATE TABLE nodes (
   description        TEXT,
   description_locked INTEGER NOT NULL DEFAULT 0,
   status             TEXT NOT NULL
-                       CHECK (status IN ('planned','todo','in_progress','blocked','review',
-                                         'done','cancelled','deferred')),
+                       CHECK (status IN ('idea','backlog','planned','todo','in_progress',
+                                         'blocked','review','done','cancelled','deferred')),
   priority           TEXT NOT NULL DEFAULT 'medium'
                        CHECK (priority IN ('low','medium','high','critical')),
   assigned_to        TEXT,

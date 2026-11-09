@@ -25,7 +25,7 @@ fn fixture(tag: &str) -> (Connection, Project) {
     let dir = temp_dir(tag);
     let outcome = db::init(&dir, "TASQ", "demo").expect("init");
     let conn = db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-    let project = project::default_project(&conn).expect("project");
+    let project = project::first_project(&conn).expect("project");
     (conn, project)
 }
 
@@ -423,6 +423,21 @@ fn next_prefers_priority_due_date_and_unblocking() {
         },
     )
     .expect("blocked");
+
+    // Воронка начинается с `idea`, а очередь «что дальше» смотрит только на готовые
+    // к работе узлы: без явного перехода все трое были бы невидимы для `next`.
+    for accepted in [&low, &high, &blocked] {
+        node::update(
+            &mut conn,
+            &project,
+            &accepted.dot_id,
+            node::Patch {
+                status: Some(Status::Todo),
+                ..node::Patch::default()
+            },
+        )
+        .expect("принять в очередь");
+    }
 
     // «ждёт» идёт от blocked к high: критика ждёт, пока сделают высокий приоритет
     edge::link(
