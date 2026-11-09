@@ -120,6 +120,15 @@ pub fn open_light(path: &Path) -> Result<Connection> {
 /// Возвращаемое значение — размер окна потерь после вызова: `0` значит «всё в базе».
 /// Успешный TRUNCATE рапортует о себе нулями (журнал уже усечён), поэтому судить по числу
 /// скопированных кадров нельзя — только по остатку.
+/// Размер окна потерь: сколько кадров журнала осталось неперелитыми в базу.
+///
+/// Отдельная функция, потому что это единственное арифметическое место в сбросе: тест на
+/// паре чисел проверяет его точно, тогда как проверка «остаток больше нуля» не отличает
+/// вычитание от сложения — на реальных значениях обе дают положительное число.
+fn loss_window(log: i64, copied: i64) -> i64 {
+    log - copied
+}
+
 pub fn checkpoint(conn: &Connection) -> Result<i64> {
     // TRUNCATE переливает кадры и, когда читателей нет, обнуляет журнал. При занятом
     // читателе он переливает ровно столько же, сколько PASSIVE (замер: обе — 3 из 7
@@ -129,7 +138,7 @@ pub fn checkpoint(conn: &Connection) -> Result<i64> {
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
-    Ok(log - copied)
+    Ok(loss_window(log, copied))
 }
 
 /// Регистрирует Unicode-осведомлённые `uni_lower` и `UNICODE_NOCASE`.
@@ -339,9 +348,10 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
         live_attempts: scalar("SELECT COUNT(*) FROM attempts WHERE ended_at IS NULL")?,
         expired_attempts,
         orphan_reservations,
-        ok: integrity == "ok"
-            && foreign_key_violations == 0
-            && schema_version <= SUPPORTED_SCHEMA_VERSION,
+        // Условия «схема не новее поддерживаемой» здесь нет намеренно: `doctor` открывает
+        // базу через `open_checked`, который на новой схеме уже отказал, поэтому такое
+        // слагаемое было бы всегда истинным (мёртвым), и его подмена не меняла бы отчёт.
+        ok: integrity == "ok" && foreign_key_violations == 0,
     };
     Ok(report)
 }
@@ -396,6 +406,207 @@ mod tests {
             )
             .expect("count");
         assert_eq!(count, 1);
+    }
+
+    /// Арифметика окна потерь проверяется ТОЧНЫМ значением: на реальных числах и
+    /// вычитание, и сложение дают положительный остаток, поэтому «больше нуля» их не различает.
+    #[test]
+    fn loss_window_is_the_difference_of_frames() {
+        assert_eq!(loss_window(7, 3), 4);
+        assert_eq!(
+            loss_window(11, 0),
+            11,
+            "ничего не перелито — окно на все кадры"
+        );
+        assert_eq!(loss_window(5, 5), 0, "перелито всё — окна нет");
+        assert_eq!(loss_window(0, 0), 0);
+    }
+
+    /// Свежая база: версия схемы читается как ноль, а не падает на отсутствии `meta`.
+    #[test]
+    fn a_fresh_database_reports_schema_version_zero() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-fresh-{nanos}"));
+        std::fs::create_dir_all(dir.join(".tasq")).expect("dir");
+        let path = db_path_in(&dir);
+        let conn = Connection::open(&path).expect("open");
+        assert_eq!(schema_version(&conn).expect("version"), 0);
+    }
+
+    /// Первый init создаёт проект и применяет миграции; второй — не делает ни того, ни другого.
+    /// Без этой пары флаги `project_created` и `migrated` можно вывернуть незаметно.
+    #[test]
+    fn init_reports_what_it_actually_did() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-init-flags-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+
+        let first = init(&dir, "FLAGS", "flags").expect("first init");
+        assert!(first.project_created, "первый init создаёт проект");
+        assert!(first.migrated, "первый init применяет миграции");
+        assert!(first.schema_version > 0, "схема накатана");
+
+        let second = init(&dir, "FLAGS", "flags").expect("second init");
+        assert!(!second.project_created, "второй init проект не создаёт");
+        assert!(!second.migrated, "второй init миграции не применяет");
+        assert_eq!(
+            second.schema_version, first.schema_version,
+            "версия схемы не сдвигается"
+        );
+    }
+
+    /// Каждое из трёх условий `ok` проверяется своим кейсом: сломанное целое и нулевые
+    /// нарушения ловят `&&` → `||` только в одном слагаемом из трёх.
+    #[test]
+    fn doctor_flags_each_broken_condition_separately() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+
+        // 1. Нарушение внешнего ключа при целой схеме: ok обязан стать ложным.
+        let dir = std::env::temp_dir().join(format!("tasq-doctor-fk-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let outcome = init(&dir, "DOCFK", "doctor").expect("init");
+        let path = std::path::PathBuf::from(&outcome.db_path);
+        {
+            // Строка, ссылающаяся на несуществующий проект: проверка внешних ключей её увидит.
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")
+                .expect("pragma");
+            conn.execute(
+                "INSERT INTO nodes (project_id, depth, seq, path, kind, title, status, priority,
+                                    weight, created_at, updated_at)
+                 VALUES (9999, 1, 1, '1', 'epic', 'висячий', 'planned', 'medium', 1.0,
+                         '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+                [],
+            )
+            .expect("insert orphan");
+        }
+        let clean = doctor(&path).expect("doctor");
+        assert!(
+            !clean.ok,
+            "висячая ссылка делает отчёт неуспешным: {clean:?}"
+        );
+        assert_eq!(clean.foreign_key_violations, 1);
+        assert_eq!(clean.integrity, "ok", "целостность при этом цела");
+        assert_eq!(
+            clean.schema_version, SUPPORTED_SCHEMA_VERSION,
+            "схема в порядке — значит судит именно нарушение ссылки"
+        );
+
+        // 2. Схема новее поддерживаемой: `doctor` не отчёт, а отказ — база открывается
+        //    через `open_checked`, и работать с незнакомой схемой он не берётся.
+        let dir2 = std::env::temp_dir().join(format!("tasq-doctor-schema-{nanos}"));
+        std::fs::create_dir_all(&dir2).expect("dir");
+        let outcome2 = init(&dir2, "DOCSC", "doctor").expect("init");
+        let path2 = std::path::PathBuf::from(&outcome2.db_path);
+        {
+            // Версия схемы живёт в `meta`, а не в `user_version`: поднимаем именно её.
+            let conn = Connection::open(&path2).expect("open");
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [&(SUPPORTED_SCHEMA_VERSION + 1).to_string()],
+            )
+            .expect("bump");
+        }
+        let error = doctor(&path2).expect_err("новая схема не открывается");
+        assert_eq!(error.code(), "SCHEMA_TOO_NEW", "{error}");
+    }
+
+    /// Миграции догоняют существующую базу: файл есть, версия в `meta` отстаёт — `init`
+    /// обязан применить недостающее и сказать об этом. Это единственный случай, где
+    /// `migrated` истинно при существующем файле, и без него флаг неотличим от «файла не было».
+    #[test]
+    fn init_finishes_pending_migrations_on_an_existing_database() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-catchup-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let first = init(&dir, "CATCH", "catchup").expect("init");
+        let path = std::path::PathBuf::from(&first.db_path);
+
+        {
+            // Откатываем отметку версии: файл на месте, миграции «недоделаны».
+            let conn = Connection::open(&path).expect("open");
+            conn.execute(
+                "UPDATE meta SET value = '1' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("downgrade");
+        }
+
+        let second = init(&dir, "CATCH", "catchup").expect("second init");
+        assert!(
+            second.migrated,
+            "недостающая миграция применена, значит migrated истинно"
+        );
+        assert!(!second.project_created, "проект уже был");
+        assert_eq!(
+            second.schema_version, SUPPORTED_SCHEMA_VERSION,
+            "версия поднята до поддерживаемой"
+        );
+    }
+
+    /// `meta` есть, а значения версии в ней нет (или оно испорчено): читается как 0,
+    /// а не как «одна миграция уже накатана».
+    #[test]
+    fn a_meta_table_without_a_version_reads_as_zero() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-meta-empty-{nanos}"));
+        std::fs::create_dir_all(dir.join(".tasq")).expect("dir");
+        let path = db_path_in(&dir);
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .expect("meta");
+        assert_eq!(schema_version(&conn).expect("version"), 0);
+
+        // Испорченное значение — тоже ноль: разбирать его как версию нельзя.
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', 'not-a-number')",
+            [],
+        )
+        .expect("insert");
+        assert_eq!(schema_version(&conn).expect("version"), 0);
+    }
+
+    /// Поиск базы идёт ВВЕРХ от текущего каталога: из вложенного каталога база находится,
+    /// а когда её нет нигде — отказ с названным стартовым каталогом.
+    #[test]
+    fn discovery_walks_up_and_reports_a_missing_database() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tasq-discover-{nanos}"));
+        let nested = root.join("a/b/c");
+        std::fs::create_dir_all(&nested).expect("dirs");
+        let outcome = init(&root, "WALK", "walk").expect("init");
+        let expected = std::path::PathBuf::from(&outcome.db_path);
+
+        assert_eq!(discover(&nested, None).expect("up"), expected);
+        assert_eq!(discover(&root, None).expect("root"), expected);
+
+        // Каталог без базы: подъём до корня файловой системы и внятный отказ.
+        let empty = std::env::temp_dir().join(format!("tasq-discover-empty-{nanos}"));
+        std::fs::create_dir_all(&empty).expect("dir");
+        let error = discover(&empty, None).expect_err("базы нет");
+        assert_eq!(error.code(), "DB_NOT_FOUND");
+        assert!(
+            error.to_string().contains(&empty.display().to_string()),
+            "отказ называет стартовый каталог: {error}"
+        );
     }
 
     /// Читатель, удержавший транзакцию, не даёт усечь журнал: TRUNCATE возвращает busy,
