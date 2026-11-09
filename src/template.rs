@@ -116,7 +116,9 @@ pub fn render(text: &str, values: &[(String, String)]) -> Result<String> {
         out.push_str(&rest[..start]);
         let after = &rest[start + 1..];
         let Some(end) = after.find('}') else {
-            out.push_str(rest);
+            // Хвост без закрывающей скобки — обычный текст. Дописываем остаток от самой
+            // скобки: `rest` уже включает напечатанный префикс, и он попал бы дважды.
+            out.push_str(&rest[start..]);
             return Ok(out);
         };
         let name = &after[..end];
