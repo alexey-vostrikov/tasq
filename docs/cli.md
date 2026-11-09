@@ -92,6 +92,8 @@ tasq ls [ОПЦИИ]
 | `--assignee` | `ASSIGNEE` | — | Filter by assignee |
 | `--overdue` | — | — | Only overdue nodes |
 | `--archived` | — | — | Include archived nodes |
+| `-n`, `--no-done` | — | — | Hide nodes closed as done |
+| `--except-project` | `KEY` | — | Project to leave out of the listing (repeatable); unknown keys are refused |
 
 ## `set`
 

@@ -603,6 +603,16 @@ pub fn update(
 pub struct Filter<'a> {
     pub parent: Option<&'a str>,
     pub status: Option<&'a str>,
+    /// Проекты, которые не показывать (`--except-project`). Для обзора по всем проектам
+    /// исключение — второй инструмент после включения: «всё, кроме архива и стенда» пишется
+    /// короче, чем перечисление нужного.
+    pub exclude_projects: &'a [String],
+    /// Не показывать закрытую словом `done` работу (`tasq ls -n`).
+    ///
+    /// Явный `status` сильнее: «покажи готовое» — осмысленный запрос, и гасить его флагом
+    /// значило бы молча отдать пустоту. Отменённое этим флагом не скрывается: `cancelled`
+    /// отвечает на другой вопрос («что мы решили не делать»), и путать их нельзя.
+    pub exclude_done: bool,
     pub assignee: Option<&'a str>,
     pub overdue: bool,
     pub include_archived: bool,
@@ -617,6 +627,15 @@ pub fn path_sort_key(path: &str) -> Vec<u32> {
 
 /// Список узлов по фильтру, в порядке дерева.
 pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result<Vec<Node>> {
+    // Исключить проект, в котором и спрашивают, можно — ответ тогда пуст. Игнорировать флаг
+    // было бы хуже: скрипт «покажи всё, кроме X» молча получил бы X.
+    if filter
+        .exclude_projects
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case(&project.key))
+    {
+        return Ok(Vec::new());
+    }
     let mut sql = format!("{NODE_SELECT} WHERE e.project_id = ?");
     let mut values: Vec<Value> = vec![Value::Integer(project.id)];
 
@@ -635,6 +654,8 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
     if let Some(status) = filter.status {
         sql.push_str(" AND e.effective_status = ?");
         values.push(Value::Text(status.to_string()));
+    } else if filter.exclude_done {
+        sql.push_str(" AND e.effective_status <> 'done'");
     }
     if let Some(assignee) = filter.assignee {
         sql.push_str(" AND e.assigned_to = ?");
@@ -654,6 +675,87 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     nodes.sort_by_key(|node| path_sort_key(&node.path));
+    if let Some(limit) = filter.limit {
+        nodes.truncate(limit.max(0) as usize);
+    }
+    Ok(nodes)
+}
+
+/// Список узлов по всем проектам базы, в порядке «проект, путь».
+///
+/// dot-ID собирается из ключа СВОЕГО проекта (`pr.key || '-' || e.path`): адрес узла
+/// самодостаточен, поэтому список по всем проектам остаётся однозначным. Фильтр `parent`
+/// здесь не поддерживается — ссылка-родитель живёт внутри проекта, и молча игнорировать её
+/// значило бы выдать не то, что попросили.
+pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
+    if filter.parent.is_some() {
+        return Err(Error::InvalidValue {
+            field: "parent".to_string(),
+            value: "needs a project; `--parent` does not work across projects".to_string(),
+        });
+    }
+    let mut sql = String::from(
+        "SELECT e.*, pr.key AS project_key, COALESCE(p.done_weight, 0) AS progress_done,
+                COALESCE(p.total_weight, 0) AS progress_total
+           FROM v_node_effective e
+           JOIN projects pr ON pr.id = e.project_id
+           LEFT JOIN v_node_progress p ON p.node_id = e.id
+          WHERE 1 = 1",
+    );
+    let mut values: Vec<Value> = Vec::new();
+    if !filter.include_deleted {
+        sql.push_str(" AND e.deleted_at IS NULL");
+    }
+    if !filter.include_archived {
+        sql.push_str(" AND e.archived_at IS NULL");
+    }
+    if let Some(status) = filter.status {
+        sql.push_str(" AND e.effective_status = ?");
+        values.push(Value::Text(status.to_string()));
+    } else if filter.exclude_done {
+        sql.push_str(" AND e.effective_status <> 'done'");
+    }
+    if let Some(assignee) = filter.assignee {
+        sql.push_str(" AND e.assigned_to = ?");
+        values.push(Value::Text(assignee.to_string()));
+    }
+    if !filter.exclude_projects.is_empty() {
+        // Плейсхолдеры по числу ключей: подстановка строки в SQL недопустима даже здесь.
+        let marks = vec!["?"; filter.exclude_projects.len()].join(", ");
+        sql.push_str(&format!(" AND pr.key NOT IN ({marks})"));
+        for key in filter.exclude_projects {
+            values.push(Value::Text(key.to_uppercase()));
+        }
+    }
+    if filter.overdue {
+        sql.push_str(
+            " AND e.due_date IS NOT NULL AND e.due_date < date('now')
+               AND e.effective_status NOT IN ('done', 'cancelled')",
+        );
+    }
+    sql.push_str(" ORDER BY pr.key, e.depth, e.path");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut nodes = stmt
+        .query_map(params_from_iter(values.iter()), |row| {
+            let path: String = row.get("path")?;
+            let key: String = row.get("project_key")?;
+            let mut node = map_node(
+                row,
+                &Project {
+                    // map_node пишет dot_id из переданного проекта; здесь он сразу заменяется
+                    // на адрес своего проекта, поэтому заглушка не видна снаружи.
+                    id: 0,
+                    key: String::new(),
+                    name: String::new(),
+                    status: String::new(),
+                },
+            )?;
+            node.dot_id = format!("{key}-{path}");
+            Ok(node)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Порядок уже задан SQL (проект, затем путь); сортировка в коде не нужна.
     if let Some(limit) = filter.limit {
         nodes.truncate(limit.max(0) as usize);
     }

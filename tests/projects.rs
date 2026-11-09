@@ -154,9 +154,15 @@ fn work_goes_to_the_project_named_by_the_selector() {
     let (_, stdout, _) = run(&dir, &["--project", "ALPHA", "ls"]);
     assert!(stdout.contains("ALPHA-1"), "{stdout}");
 
-    // Изоляция в обе стороны: без селектора `ls` в базе с двумя проектами — тот же
-    // отказ PROJECT_REQUIRED, а не «первый попавшийся список».
-    let (code, _, stderr) = run(&dir, &["ls"]);
+    // `ls` — обзорная команда: без селектора она показывает ВСЕ проекты (адрес узла
+    // начинается с ключа своего проекта), а не отказывает и не выбирает первый.
+    let (code, stdout, stderr) = run(&dir, &["ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("ALPHA-1"), "обзор без селектора: {stdout}");
+    assert!(stdout.contains("PRJ-1"), "обзор без селектора: {stdout}");
+
+    // Запись без селектора по-прежнему требует явного выбора: там угадывать нечего.
+    let (code, _, stderr) = run(&dir, &["add", "Узел без проекта"]);
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("PROJECT_REQUIRED"), "{stderr}");
 

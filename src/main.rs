@@ -130,6 +130,12 @@ enum Command {
         /// Include archived nodes
         #[arg(long)]
         archived: bool,
+        /// Hide nodes closed as done
+        #[arg(short = 'n', long = "no-done")]
+        no_done: bool,
+        /// Project to leave out of the listing (repeatable); unknown keys are refused
+        #[arg(long = "except-project", value_name = "KEY")]
+        except_project: Vec<String>,
     },
     /// Change node fields; only the given fields are touched
     Set {
@@ -1334,26 +1340,61 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             assignee,
             overdue,
             archived,
+            no_done,
+            except_project,
         } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            // `ls` — обзорная команда: без селектора в базе с несколькими проектами
+            // показываются все (узел опознаётся по ключу в dot-ID), `--project all` — явно.
+            let cwd = std::env::current_dir()?;
+            let path = db::discover(&cwd, cli.db.as_deref())?;
+            let conn = db::open_checked(&path)?;
             // Незнакомое значение фильтра — отказ: молча выданный полный список читается
             // как «таких узлов нет» и уводит в сторону.
             if let Some(value) = status {
                 parse_status(value)?;
             }
-            let nodes = node::list(
-                &conn,
-                &project,
-                &Filter {
-                    parent: parent.as_deref(),
-                    status: status.as_deref(),
-                    assignee: assignee.as_deref(),
-                    overdue: *overdue,
-                    include_archived: *archived,
-                    include_deleted: false,
-                    limit: None,
-                },
-            )?;
+            // Опечатка в ключе исключения иначе выглядит как «проект и так не показывался»:
+            // отказ до чтения узлов.
+            for key in except_project {
+                if project::by_key(&conn, key)?.is_none() {
+                    return Err(Error::ProjectNotFound {
+                        key: key.clone(),
+                        known: project::known_keys(&conn)?,
+                    });
+                }
+            }
+            let excluded: Vec<String> = except_project.clone();
+            let nodes = match project::scope(&conn, cli.project.as_deref())? {
+                project::Scope::One(project) => node::list(
+                    &conn,
+                    &project,
+                    &Filter {
+                        parent: parent.as_deref(),
+                        status: status.as_deref(),
+                        exclude_projects: &excluded,
+                        exclude_done: *no_done,
+                        assignee: assignee.as_deref(),
+                        overdue: *overdue,
+                        include_archived: *archived,
+                        include_deleted: false,
+                        limit: None,
+                    },
+                )?,
+                project::Scope::All => node::list_all(
+                    &conn,
+                    &Filter {
+                        parent: parent.as_deref(),
+                        status: status.as_deref(),
+                        exclude_projects: &excluded,
+                        exclude_done: *no_done,
+                        assignee: assignee.as_deref(),
+                        overdue: *overdue,
+                        include_archived: *archived,
+                        include_deleted: false,
+                        limit: None,
+                    },
+                )?,
+            };
             if cli.json {
                 print_json(&nodes);
                 return Ok(ExitCode::SUCCESS);

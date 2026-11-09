@@ -96,6 +96,39 @@ pub fn known_keys(conn: &Connection) -> Result<String> {
     Ok(keys.join(", "))
 }
 
+/// Значение селектора, означающее «все проекты базы».
+pub const ALL: &str = "ALL";
+
+/// Что выбрал селектор: один проект или все сразу.
+///
+/// `--project all` (и отсутствие селектора в базе с несколькими проектами) даёт режим
+/// обзора: список показывает задачи всех проектов, а dot-ID остаются однозначными, потому
+/// что адрес узла начинается с ключа его проекта.
+pub enum Scope {
+    One(Project),
+    All,
+}
+
+/// Селектор для команд обзора: `all` — все проекты, ключ — один, пусто — единственный.
+pub fn scope(conn: &Connection, key: Option<&str>) -> Result<Scope> {
+    match key.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(key) if key.eq_ignore_ascii_case(ALL) => Ok(Scope::All),
+        Some(key) => by_key(conn, key)?
+            .map(Scope::One)
+            .ok_or_else(|| Error::ProjectNotFound {
+                key: key.to_string(),
+                known: known_keys(conn).unwrap_or_else(|_| "unknown".to_string()),
+            }),
+        None => match count(conn)? {
+            0 => Err(Error::NoProject),
+            1 => first_project(conn).map(Scope::One),
+            // Показывать по умолчанию один из нескольких проектов — это чужие данные,
+            // выданные как свои; обзорная команда по умолчанию показывает все.
+            _ => Ok(Scope::All),
+        },
+    }
+}
+
 /// Проект, в котором идёт работа.
 ///
 /// Проект — самостоятельная сущность иерархии, поэтому «первый по порядку создания» не

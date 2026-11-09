@@ -479,6 +479,17 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
         }
         "node_list" => {
             let project = ctx.project(args)?;
+            let excluded_projects: Vec<String> = args
+                .get("exclude_projects")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             let nodes = node::list(
                 &ctx.conn,
                 &project,
@@ -486,6 +497,8 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     parent: arg_str(args, "parent"),
                     status: arg_str(args, "status"),
                     assignee: arg_str(args, "assignee"),
+                    exclude_projects: &excluded_projects,
+                    exclude_done: arg_bool(args, "exclude_done"),
                     overdue: arg_bool(args, "overdue"),
                     include_archived: arg_bool(args, "include_archived"),
                     include_deleted: false,
