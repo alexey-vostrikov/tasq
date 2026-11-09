@@ -505,3 +505,74 @@ fn update_and_delete_default_to_the_selected_project() {
     assert!(stdout.contains("ALPHA"), "{stdout}");
     assert!(!stdout.contains("PRJ"), "{stdout}");
 }
+
+/// Один проект в базе — селектор не нужен, и `--parent` при этом РАБОТАЕТ.
+///
+/// Это и есть отличие «одного проекта» от «всех проектов»: список узлов в обоих случаях
+/// совпадает, а поддерево по ссылке — нет (в режиме всех проектов `--parent` отвергается,
+/// потому что родитель живёт внутри проекта). Без этого различия ветка «ровно один проект»
+/// не проверена: подмена её на «все проекты» проходит молча.
+#[test]
+fn a_single_project_keeps_the_subtree_selector_working() {
+    let dir = temp_dir("single-parent");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Эпик"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Задача", "--parent", "ALPHA-1"]).0, 0);
+
+    // Селектора нет, проект один — работаем в нём.
+    let (code, stdout, stderr) = run(&dir, &["ls", "--parent", "ALPHA-1"]);
+    assert_eq!(code, 0, "поддерево в единственном проекте: {stderr}");
+    assert!(
+        stdout.contains("ALPHA-1.1"),
+        "поддерево не показано: {stdout}"
+    );
+}
+
+/// База без проектов — предметная ошибка `NO_PROJECT`, а не паника.
+///
+/// Состояние достижимо: проект удаляют вместе с содержимым, а база остаётся (файл не
+/// удаляют). `select(None)` обязан ответить ошибкой с кодом, иначе вызывающий получает
+/// панику вместо отказа, а `doctor`/`ls` — `panicked at` в лицо пользователю.
+#[test]
+fn an_empty_database_reports_no_project_instead_of_panicking() {
+    let dir = temp_dir("no-projects");
+    let outcome = tasq::db::init(&dir, "ALPHA", "demo").expect("init");
+    let conn = tasq::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+    conn.execute("DELETE FROM projects", [])
+        .expect("wipe projects");
+
+    let err = tasq::project::select(&conn, None).expect_err("проектов нет");
+    assert_eq!(err.code(), "NO_PROJECT");
+    // Ключ задан — тоже ошибка (нет такого проекта), и это другой код: опечатка в ключе
+    // не должна выглядеть как пустая база.
+    let err = tasq::project::select(&conn, Some("ALPHA")).expect_err("нет проекта ALPHA");
+    assert_eq!(err.code(), "PROJECT_NOT_FOUND");
+}
+
+/// Пустое имя проекта означает «не задано», а не пустую строку в списке.
+///
+/// `--name ""` и `--name "   "` — обычная подстановка из скрипта с незаполненной
+/// переменной; имя проекта обязано стать ключом, иначе в `list projects` появляется
+/// строка без названия, а поиск по имени перестаёт находить проект.
+#[test]
+fn a_blank_name_falls_back_to_the_key() {
+    let dir = temp_dir("blank-name");
+    assert_eq!(run(&dir, &["init", "--key", "ALPHA"]).0, 0);
+
+    for blank in ["", "   "] {
+        let key = if blank.is_empty() { "BLANK" } else { "SPACE" };
+        let (code, _, stderr) = run(&dir, &["create", "project", key, "--name", blank]);
+        assert_eq!(code, 0, "ключ {key}: {stderr}");
+
+        let (code, stdout, stderr) = run(&dir, &["list", "projects"]);
+        assert_eq!(code, 0, "{stderr}");
+        let line = stdout
+            .lines()
+            .find(|line| line.contains(key))
+            .unwrap_or_else(|| panic!("проект {key} не найден в списке:\n{stdout}"));
+        assert!(
+            line.trim_end().ends_with(key),
+            "имя проекта не подставилось из ключа: {line}"
+        );
+    }
+}
