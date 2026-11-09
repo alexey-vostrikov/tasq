@@ -137,8 +137,8 @@ CREATE TABLE nodes (
   description        TEXT,
   description_locked INTEGER NOT NULL DEFAULT 0,
   status             TEXT NOT NULL
-                       CHECK (status IN ('planned','todo','in_progress','blocked','review',
-                                         'done','cancelled','deferred')),
+                       CHECK (status IN ('idea','backlog','planned','todo','in_progress',
+                                         'blocked','review','done','cancelled','deferred')),
   priority           TEXT NOT NULL DEFAULT 'medium'
                        CHECK (priority IN ('low','medium','high','critical')),
   assigned_to        TEXT,
@@ -304,7 +304,8 @@ CREATE TABLE burn_snapshots (
 7. Резерв живёт не дольше своей попытки: `released_at` либо при release, либо при истечении аренды.
 8. Каждая мутация пишет строку в `activity_log` в той же транзакции.
 9. `description_locked = 1` запрещает менять `description` (остальные поля — свободно), отказ `DESCRIPTION_LOCKED`.
-10. Удалять (`node_delete`) можно только узел в `todo`; дальше — есть история, её не затираем.
+10. Удалять (`node_delete`) можно только узел, ещё не начатый работой (`idea`, `backlog`, `todo`);
+    дальше — есть история, её не затираем.
 
 ## 6. Dot-notation ID
 
@@ -348,27 +349,40 @@ TASQ-12.3.1.4    её четвёртая микро-задача
 
 ## 7. Статусы и переходы
 
-Наборы по `kind` (совместимы с saga; при импорте `completed → done`, `cancelled → cancelled`):
+Воронка одна для всех уровней: **idea → backlog → todo (epic: planned) → in_progress → review →
+done**. Первые два состояния нужны, чтобы отделить «мысль» от «очереди»: в `idea` узел лежит, пока
+формулировка не созрела, в `backlog` — принят в работу, но ещё не готов к захвату.
+
+Наборы по `kind` (совместимы с saga; при импорте `completed → done`, `cancelled → cancelled`,
+`on_hold → planned`; `idea`/`backlog` — собственные состояния tasq и переносятся как есть):
 
 | kind | допустимые хранимые статусы |
 | --- | --- |
-| epic | planned, in_progress, blocked, review, done, cancelled, deferred |
-| task | todo, in_progress, blocked, review, done, cancelled, deferred |
-| subtask, micro | todo, in_progress, blocked, review, done, cancelled, deferred |
+| epic | idea, backlog, planned, in_progress, blocked, review, done, cancelled, deferred |
+| task | idea, backlog, todo, in_progress, blocked, review, done, cancelled, deferred |
+| subtask, micro | idea, backlog, todo, in_progress, blocked, review, done, cancelled, deferred |
+
+Разделение `planned`/`todo` — по уровню: планируют эпик, задачи получают `todo`. `idea` и `backlog`
+допустимы любому виду.
 
 Матрица переходов (`→` разрешено; всё прочее — `INVALID_TRANSITION`, без «мягкой» подмены):
 
 | из | в |
 | --- | --- |
-| (создание) | planned (epic), todo (остальные) |
-| planned | in_progress, blocked, cancelled, deferred |
-| todo | in_progress, blocked, cancelled, deferred |
-| in_progress | review, done, blocked, todo (снять захват), cancelled, deferred |
-| review | in_progress, done, blocked, cancelled |
-| blocked | todo, in_progress (если блокеры сняты), cancelled |
-| deferred | todo, cancelled |
+| (создание) | idea (все виды) |
+| idea | backlog, planned (epic), todo (остальные), in_progress, blocked, cancelled, deferred |
+| backlog | idea (сырая мысль), planned (epic), todo (остальные), in_progress, blocked, cancelled, deferred |
+| planned | idea, backlog, in_progress, blocked, cancelled, deferred |
+| todo | idea, backlog, in_progress, blocked, cancelled, deferred |
+| in_progress | review, done, blocked, todo (снять захват), backlog, cancelled, deferred |
+| review | in_progress, done, blocked, backlog, cancelled |
+| blocked | todo, in_progress (если блокеры сняты), backlog, cancelled |
+| deferred | todo, planned (epic), backlog, idea, cancelled |
 | done | in_progress (reopen), todo (reopen) — требует `force` |
 | cancelled | todo (restore) — требует `force` |
+
+Понижение в идею — обычный переход, а не ошибка: `todo → idea` возвращает сырую мысль в начало
+воронки, и это единственный способ держать «недодуманное» вне очереди.
 
 Флаги, меняющие строгость (а не подменяющие статус), соответствуют saga:
 
@@ -712,10 +726,18 @@ export TASQ_PROJECT=PRJ                         то же для серии ко
 
 Правила, которые важно знать:
 
-- **Проект выбирается явно: `--project KEY` или `TASQ_PROJECT`.** Без него берётся первый по порядку
-  создания — так работают существующие базы и скрипты, но второй проект в этом режиме не виден.
+- **Проект — самостоятельная сущность иерархии, а не «текущий каталог работы».** Он выбирается
+  по тому, над каким проектом идёт работа: `--project KEY`, `TASQ_PROJECT` или `project_select` в
+  сессии MCP. Молчаливого «первого по порядку создания» нет — с ним запись уходит в чужие данные и
+  ничем себя не выдаёт.
+- **Один проект в базе — выбора нет, и это не дефолт.** Если проект в базе единственный, он
+  однозначен и селектор не нужен: существующие однопроектные базы и скрипты работают как раньше.
+- **Два и больше — отказ `PROJECT_REQUIRED` со списком ключей.** Команда не угадывает: `no project
+  selected: this command works in one project (known: ALPHA, PRJ)`. Какой проект твой, знает только
+  тот, кто ставит задачу.
 - **Флаг важнее переменной окружения.** `--project` перекрывает `TASQ_PROJECT`; явное значение всегда
-  сильнее окружения и тем более значения по умолчанию.
+  сильнее окружения. В MCP аргумент `project` у вызова важнее проекта, выбранного в сессии, и не
+  меняет его — можно читать чужой проект, не переключаясь.
 - **Ключ нормализуется к верхнему регистру:** `tasq create project prj` создаёт `PRJ`. Ключ входит
   в dot-ID, а он всегда заглавный.
 - **Неизвестный ключ — `PROJECT_NOT_FOUND` с перечнем доступных:** `project NOPE not found
@@ -731,11 +753,15 @@ export TASQ_PROJECT=PRJ                         то же для серии ко
   бесполезными. Оба отказа советуют выход: архивировать (`--status archived`) или удалить сам файл базы.
 - **Удаление каскадное и необратимое:** узлы, рёбра, заметки, комментарии, попытки, резервы и лог —
   всё уходит вместе с проектом по `ON DELETE CASCADE` схемы. `doctor --check` после удаления чист.
-- **В MCP те же операции с оговорками про контекст:** `project_update` правит проект сессии (или
-  указанный `key`) и, если ключ сменился, переводит контекст сессии на новый ключ — иначе следующий
-  вызов ушёл бы в первый проект по порядку. `project_delete` при удалении проекта сессии переезжает
-  в первый оставшийся и сообщает `switched_to`; если проектов не осталось, возвращает
-  `active_project: null` и подсказку. `project_delete` входит только в профиль `full`.
+- **В MCP контекст сессии начинается без проекта**, если их в базе несколько: `project_list`,
+  `project_create` и `tasq_init` работают всегда, остальные инструменты отвечают `PROJECT_REQUIRED`.
+  Проект выбирается `project_select` (сессия) или аргументом `project` у конкретного вызова —
+  второй вариант не меняет сессию, поэтому один агент может читать несколько проектов подряд.
+- `project_update` правит проект сессии (или указанный `key`) и, если ключ сменился, переводит
+  контекст сессии на новый ключ. `project_delete` при удалении проекта сессии оставляет сессию без
+  проекта; переезд бывает только когда проект в базе остался ровно один — тогда `switched_to`
+  называет его, иначе `active_project: null` с подсказкой. `project_delete` входит только в
+  профиль `full`.
 - **В MCP то же самое, но с явным переключением сессии:** `project_create` создаёт проект и
   **не** переключает сессию (в ответе `switched: false` и подсказка), `project_select` переключает
   и возвращает `previous`/`active_project`. Молчаливый переход контекста недопустим: агент,
@@ -983,13 +1009,19 @@ COLLATE UNICODE_NOCASE`, поиск в верхнем и нижнем регис
 
 ## 22. Сборка, гейты и CI
 
-Принцип: **на хосте rust-тулчейна нет, всё собирается в контейнере на базе `rust:1.99.1-bookworm`**,
-и локальные гейты, `act` и GitHub Actions используют один и тот же образ. Расхождение возможно только
-в версии rustfmt/clippy, поэтому они ставятся явно и там, и там.
+Принцип: **на хосте rust-тулчейна нет, всё собирается в контейнере на базе Debian 11 с тулчейном
+1.99.1**, и локальные гейты, `act` и GitHub Actions используют одну и ту же базу. База задаёт порог
+glibc готового артефакта: на bookworm это 2.34, и бинарь не стартует на Astra/Debian 11 (2.31).
 
-- `Dockerfile` — `FROM rust:1.99.1-bookworm` + `rustup component add rustfmt clippy`: официальный образ
-  этих компонентов не несёт, и без шага `cargo fmt --check` падает с «cargo-fmt is not installed».
-- `make` (по умолчанию) — `fmt` + `clippy` + `deny` + `test` + `tokens`; `make build` — release-бинарь;
+- `Dockerfile` — двухступенчатая сборка: `FROM rust:1.99.1-slim-bookworm` (тулчейн + rustfmt/clippy)
+  → `FROM rust:1.90-bullseye` с деревьями rustup/cargo, скопированными из первой ступени. Тега
+  `rust:1.99.1-bullseye` не существует (официальные bullseye-варианты кончились на 1.90), поэтому
+  образ собирается из этого файла (`make image`), а не берётся готовым: «локальный образ с нужным
+  именем» — это зависимость от чужой машины. libc в бинаре приходит из базы — 2.31.
+  Bullseye в архиве: apt переключён на `archive.debian.org` с `Check-Valid-Until=false`, иначе любой
+  `apt-get install` падает кодом 100 на 404 от `deb.debian.org`.
+- `make` (по умолчанию) — `fmt` + `clippy` + `deny` + `test` + `tokens` + `docs --check` +
+  `glibc-check`; `make build` — release-бинарь;
   `make smoke` — `init` + `doctor` во временном каталоге внутри контейнера; `make act` — прогон
   workflow на хосте.
 - `cargo-deny` ставится готовым musl-бинарём (0.20.2) одним скриптом `scripts/install-cargo-deny.sh`
@@ -999,13 +1031,18 @@ COLLATE UNICODE_NOCASE`, поиск в верхнем и нижнем регис
   `[licenses]` — только реально встречающиеся в дереве лицензии (MIT, Apache-2.0, Unicode-3.0,
   Unlicense, Zlib), снятые `cargo deny list`, а не список «на будущее»: новая лицензия — повод
   посмотреть на зависимость. `[sources]` разрешает только crates.io.
-- Кэш cargo/target — в `~/.cache/tasq/{cargo,target,home}`, вне репозитория; каталоги создаются от
-  хостового uid (`cache-init`), иначе docker создаёт их root-овыми и следующий прогон падает
-  `Permission denied`.
-- `.github/workflows/ci.yml` — job `check` с `container: rust:1.99.1-bookworm`; шаги: компоненты
-  (rustfmt, clippy) → `cargo-deny` → `fmt --check` → `clippy -D warnings` → `cargo deny check` →
-  `test` → пол покрытия → `build --release` → smoke (`init` + `doctor --json` с проверкой
-  `"ok": true`) → бюджет схем. Тот же файл исполняет `act` с хоста.
+- Кэш cargo — именованный том `rrl-cargo-bullseye` (`CARGO_VOL`), общий с соседним `rust-rest-ldap`:
+  реестр качается один раз на машину, а `target` у каждого проекта свой (`/cargo/target-tasq`).
+  Том создаётся docker'ом от root, поэтому `cache-init` выставляет владельца под хостовый uid —
+  иначе первый прогон падает `failed to create directory …: Permission denied`.
+- Образ проверяется, а не собирается по ходу: `image-check` падает с подсказкой `run make image`,
+  если образа нет (иначе `pull access denied` читается как проблема реестра).
+- `.github/workflows/ci.yml` — job `check` с `container: rust:1.90-bullseye`; версия компилятора
+  ставится из `rust-toolchain.toml` (`rustup default 1.99.1`), а не берётся из тега образа: шаги:
+  тулчейн → компоненты (rustfmt, clippy) → `cargo-deny` → `fmt --check` → `clippy -D warnings` →
+  `cargo deny check` → `test` → пол покрытия → `build --release` → smoke (`init` + `doctor --json`
+  с проверкой `"ok": true`) → порог glibc → бюджет схем → актуальность `docs/`. Тот же файл
+  исполняет `act` с хоста.
 - Покрытие (`make cov`, шаг «Coverage floor»): `cargo-llvm-cov` с `--fail-under-lines 90`.
   Порог — **пол, а не цель**: он не мешает добавлять код, но не даёт выпустить «написали и не
   проверили». Сейчас 95,9 % строк (9 852 измеренных, 406 непокрытых); остаток — не ветки логики,
@@ -1018,9 +1055,10 @@ COLLATE UNICODE_NOCASE`, поиск в верхнем и нижнем регис
 - Подводный камень `act`: шаги он запускает через `sh -e` (это dash), поэтому `set -euo pipefail` падает
   `Illegal option -o pipefail`. У шага smoke явно указан `shell: bash` — на GitHub Actions поведение
   не меняется, в `act` работает.
-- Готовый бинарь требует glibc ≥ 2.34 (фактический максимум символов — `GLIBC_2.34`, база bookworm 2.36);
-  для хостов старше Debian 12 / Astra надо пересобрать на более старой базе и проверить
-  `objdump -T | grep GLIBC_`.
+- Порог glibc — часть контракта артефакта и проверяется гейтом, а не выясняется из ошибки
+  загрузчика у пользователя: `make glibc-check` (`scripts/check-glibc-floor.sh`) читает максимум
+  символов `GLIBC_*` через `objdump -T` и сравнивает версии по номеру, а не строкой. Факт на текущей
+  сборке — `GLIBC_2.30` при пределе 2.31; шаг CI повторяет ту же проверку.
 
 ## 23. Документация (`docs/`)
 

@@ -195,3 +195,81 @@ fn json_output_lists_written_files() {
     let written = value["written"].as_array().expect("written");
     assert_eq!(written.len(), 3);
 }
+
+/// Таблица переходов в README §7 и матрица в коде — одно правило в двух местах, и расходятся
+/// они молча: правку вносят в одно, второе читают как контракт. Проверка машинная: разобрать
+/// таблицу и сравнить с публичным `can_transition` (по обоим видам узла, потому что
+/// ограничения по виду описаны отдельной таблицей в том же разделе).
+#[test]
+fn readme_transition_matrix_matches_the_code() {
+    use tasq::status::{Kind, Status};
+
+    let readme = fs::read_to_string("README.md").expect("README рядом с тестами");
+    let start = readme
+        .find("Матрица переходов")
+        .expect("в README есть раздел матрицы переходов");
+    let tail = &readme[start..];
+    let end = tail
+        .find("Флаги, меняющие строгость")
+        .expect("таблица заканчивается разделом флагов");
+    let documented = parse_documented_matrix(&tail[..end]);
+
+    let mut code = std::collections::BTreeSet::new();
+    for from in Status::all() {
+        for to in Status::all() {
+            if from == to {
+                continue; // «оставить как есть» — не переход, в таблице его нет
+            }
+            // Вид узла в таблице переходов не участвует: у эпика и задачи запрещён один
+            // разный статус из десяти, и оба разрешены вторым видом.
+            if Status::can_transition(*from, *to, Kind::Epic)
+                || Status::can_transition(*from, *to, Kind::Task)
+            {
+                code.insert((from.as_str().to_string(), to.as_str().to_string()));
+            }
+        }
+    }
+
+    let missing_in_code: Vec<_> = documented.difference(&code).collect();
+    let missing_in_readme: Vec<_> = code.difference(&documented).collect();
+    assert!(
+        missing_in_code.is_empty() && missing_in_readme.is_empty(),
+        "README обещает переходы, которых нет в коде: {missing_in_code:?}; \
+         код разрешает переходы, которых нет в README: {missing_in_readme:?}"
+    );
+}
+
+/// Разбирает таблицу `| из | в |`: первая ячейка — статус-источник, вторая — список целей
+/// (пояснения в скобках отбрасываются, строка «(создание)» пропускается).
+fn parse_documented_matrix(table: &str) -> std::collections::BTreeSet<(String, String)> {
+    use tasq::status::Status;
+
+    let names: Vec<&str> = Status::all().iter().map(|status| status.as_str()).collect();
+    let mut pairs = std::collections::BTreeSet::new();
+    for line in table.lines() {
+        let line = line.trim();
+        if !line.starts_with('|') || line.starts_with("| из") || line.starts_with("| ---") {
+            continue;
+        }
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len() != 2 || !names.contains(&cells[0]) {
+            continue;
+        }
+        let mut targets = String::new();
+        let mut depth = 0;
+        for ch in cells[1].chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth == 0 => targets.push(ch),
+                _ => {}
+            }
+        }
+        for word in targets.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
+            if names.contains(&word) {
+                pairs.insert((cells[0].to_string(), word.to_string()));
+            }
+        }
+    }
+    pairs
+}
