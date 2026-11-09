@@ -129,11 +129,59 @@ fn arg_resources(args: &Value) -> Vec<crate::resource::Resource> {
 
 /// Обработчик одного инструмента.
 pub fn call(ctx: &mut Context, name: &str, args: &Value) -> Value {
-    let result = dispatch(ctx, name, args);
+    // Типы проверяются по опубликованной схеме до обработчика: иначе `weight: "много"`
+    // молча превращался в значение по умолчанию, и агент не узнавал, что ошибся.
+    let result = check_arguments(name, args).and_then(|()| dispatch(ctx, name, args));
     match result {
         Ok(value) => value,
         Err(err) => error_content(&err),
     }
+}
+
+/// Сверяет аргументы с объявленными типами схемы инструмента.
+///
+/// Проверяется только верхний уровень и элементы массивов строк: глубже начинается
+/// доменный разбор документа, у которого свои коды. `null` означает «не передано».
+fn check_arguments(name: &str, args: &Value) -> Result<()> {
+    let definition = definition(name);
+    let Some(schema) = definition.as_ref().and_then(|def| def.get("inputSchema")) else {
+        return Ok(());
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(arguments) = args.as_object() else {
+        return Err(Error::InvalidValue {
+            field: "arguments".to_string(),
+            value: format!("{args} (expected an object)"),
+        });
+    };
+
+    for (key, value) in arguments {
+        if value.is_null() {
+            continue;
+        }
+        let Some(expected) = properties.get(key).and_then(|prop| prop.get("type")) else {
+            continue; // Лишние поля игнорируются: клиенты добавляют свои.
+        };
+        let expected = expected.as_str().unwrap_or_default();
+        let ok = match expected {
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.as_i64().is_some(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if !ok {
+            return Err(Error::InvalidValue {
+                field: key.clone(),
+                value: format!("{value} (expected {expected})"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {

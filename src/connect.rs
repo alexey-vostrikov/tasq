@@ -612,17 +612,11 @@ fn apply_toml(
         toml_edit::Item::Table(table)
     });
     if !table.is_table() {
+        // Ключ занят скаляром или массивом — заменяем на таблицу: конфиг клиента ждёт
+        // именно таблицу серверов, а прежнее значение не несёт смысла для него.
         *table = toml_edit::Item::Table(toml_edit::Table::new());
     }
-    let Some(table) = table.as_table_mut() else {
-        return Ok(Outcome {
-            client: client.id.to_string(),
-            path: path.display().to_string(),
-            action: "unparsable".to_string(),
-            backup: None,
-            snippet: Some("ключ занят не таблицей".to_string()),
-        });
-    };
+    let table = table.as_table_mut().expect("после замены это таблица");
 
     let changed = if remove {
         table.remove("tasq").is_some()
@@ -793,5 +787,303 @@ mod tests {
         // zed — вложенный command
         let zed = snippet(client("zed").expect("client"), &transport);
         assert_eq!(zed["command"]["path"], serde_json::json!("tasq"));
+    }
+
+    fn temp_path(tag: &str, name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-connect-unit-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir.join(name)
+    }
+
+    fn stdio() -> Transport {
+        Transport::Stdio {
+            command: "tasq".to_string(),
+            args: vec!["mcp".to_string()],
+        }
+    }
+
+    #[test]
+    fn http_transport_renders_for_every_format() {
+        let transport = Transport::Http {
+            url: "http://127.0.0.1:8787/mcp".to_string(),
+        };
+
+        // TOML: только адрес.
+        let codex = snippet(client("codex").expect("client"), &transport);
+        assert_eq!(codex["url"], serde_json::json!("http://127.0.0.1:8787/mcp"));
+
+        // YAML: тип транспорта и `uri`.
+        let goose = snippet(client("goose").expect("client"), &transport);
+        assert_eq!(goose["type"], serde_json::json!("streamable_http"));
+        assert!(goose.get("uri").is_some(), "{goose}");
+
+        // Zed оставляет пустую команду: без неё редактор не считает сервер удалённым.
+        let zed = snippet(client("zed").expect("client"), &transport);
+        assert!(zed.get("command").is_some_and(serde_json::Value::is_null));
+        assert_eq!(zed["url"], serde_json::json!("http://127.0.0.1:8787/mcp"));
+
+        // opencode и crush называют удалённый сервер `remote`.
+        let opencode = snippet(client("opencode").expect("client"), &transport);
+        assert_eq!(opencode["type"], serde_json::json!("remote"));
+
+        // Остальные — просто адрес.
+        let claude = snippet(client("claude-code").expect("client"), &transport);
+        assert_eq!(
+            claude["url"],
+            serde_json::json!("http://127.0.0.1:8787/mcp")
+        );
+
+        // YAML-фрагмент для goose собирается руками.
+        let text = yaml_snippet(&transport);
+        assert!(text.contains("type: streamable_http"), "{text}");
+        assert!(text.contains("uri: http://127.0.0.1:8787/mcp"), "{text}");
+        let text = yaml_snippet(&stdio());
+        assert!(text.contains("type: stdio"), "{text}");
+        assert!(text.contains("- mcp"), "{text}");
+    }
+
+    #[test]
+    fn zed_key_follows_what_the_file_already_has() {
+        let zed = client("zed").expect("client");
+        assert_eq!(
+            resolve_key(zed, &serde_json::json!({ "context_servers": {} })),
+            "context_servers",
+            "старый ключ сохраняется, иначе редактор не увидит сервер"
+        );
+        assert_eq!(
+            resolve_key(zed, &serde_json::json!({})),
+            "agent_servers",
+            "в новом файле пишем актуальный ключ"
+        );
+        // У остальных ключ постоянный.
+        let codex = client("codex").expect("client");
+        assert_eq!(resolve_key(codex, &serde_json::json!({})), "mcp_servers");
+    }
+
+    #[test]
+    fn unparsable_json_is_left_alone_with_a_hint() {
+        let zed = client("zed").expect("client");
+        let path = temp_path("jsonc", "settings.json");
+        // Так выглядит настоящий settings.json у Zed: комментарии ломают strict-JSON.
+        let text = "{\n  // моя тема\n  \"theme\": \"dark\"\n}\n";
+        std::fs::write(&path, text).expect("write");
+
+        let outcome =
+            apply_json(zed, &path, text, true, &snippet(zed, &stdio()), false).expect("apply");
+
+        assert_eq!(outcome.action, "unparsable");
+        assert!(outcome.backup.is_none(), "бэкап не нужен: файл не тронут");
+        let hint = outcome.snippet.expect("подсказка");
+        assert!(hint.contains("вставьте вручную"), "{hint}");
+        // Ключ угадан по тексту: `context_servers` в файле нет, значит новый.
+        assert!(hint.contains("agent_servers"), "{hint}");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), text);
+    }
+
+    #[test]
+    fn zed_with_context_servers_gets_the_old_key_in_the_hint() {
+        let zed = client("zed").expect("client");
+        let path = temp_path("jsonc-old", "settings.json");
+        let text = "{ // старый файл\n \"context_servers\": {} }";
+        std::fs::write(&path, text).expect("write");
+
+        let outcome =
+            apply_json(zed, &path, text, true, &snippet(zed, &stdio()), false).expect("apply");
+        let hint = outcome.snippet.expect("подсказка");
+        assert!(hint.contains("context_servers"), "{hint}");
+    }
+
+    #[test]
+    fn json_that_is_not_an_object_is_reported() {
+        let claude = client("claude-code").expect("client");
+        let path = temp_path("array", "mcp.json");
+        let text = "[1, 2, 3]";
+        std::fs::write(&path, text).expect("write");
+
+        let outcome = apply_json(claude, &path, text, true, &snippet(claude, &stdio()), false)
+            .expect("apply");
+        assert_eq!(outcome.action, "unparsable");
+        assert!(
+            outcome
+                .snippet
+                .expect("hint")
+                .contains("верхний уровень не объект")
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), text);
+    }
+
+    #[test]
+    fn key_holding_a_scalar_is_replaced_with_a_table() {
+        let claude = client("claude-code").expect("client");
+        let path = temp_path("scalar", "mcp.json");
+        let text = "{\"mcpServers\": 5}";
+        std::fs::write(&path, text).expect("write");
+
+        let outcome = apply_json(claude, &path, text, true, &snippet(claude, &stdio()), false)
+            .expect("apply");
+        assert_eq!(outcome.action, "written");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert!(document["mcpServers"].is_object(), "{document}");
+        assert_eq!(document["mcpServers"]["tasq"]["command"], "tasq");
+    }
+
+    #[test]
+    fn remove_takes_the_container_away_with_the_entry() {
+        let claude = client("claude-code").expect("client");
+        let path = temp_path("remove", "mcp.json");
+        let text = "{\"mcpServers\": {\"tasq\": {\"command\": \"tasq\"}}}";
+        std::fs::write(&path, text).expect("write");
+
+        let outcome = apply_json(claude, &path, text, true, &snippet(claude, &stdio()), true)
+            .expect("remove");
+        assert_eq!(outcome.action, "removed");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert!(
+            document.get("mcpServers").is_none(),
+            "пустой контейнер, созданный нами, тоже убирается: {document}"
+        );
+    }
+
+    #[test]
+    fn broken_toml_is_left_alone_with_a_hint() {
+        let codex = client("codex").expect("client");
+        let path = temp_path("toml", "config.toml");
+        let text = "model = \"o3\"\n[broken\n";
+        std::fs::write(&path, text).expect("write");
+
+        let outcome =
+            apply_toml(codex, &path, text, true, &snippet(codex, &stdio()), false).expect("apply");
+        assert_eq!(outcome.action, "unparsable");
+        let hint = outcome.snippet.expect("подсказка");
+        assert!(hint.contains("[mcp_servers . tasq]"), "{hint}");
+        assert!(hint.contains("command = \"tasq\""), "{hint}");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), text);
+    }
+
+    #[test]
+    fn empty_file_becomes_a_fresh_document() {
+        let claude = client("claude-code").expect("client");
+        let path = temp_path("empty", "mcp.json");
+
+        let outcome =
+            apply_json(claude, &path, "", false, &snippet(claude, &stdio()), false).expect("apply");
+        assert_eq!(outcome.action, "written");
+        assert!(outcome.backup.is_none(), "нового файла нечего бэкапить");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            document["mcpServers"]["tasq"]["args"],
+            serde_json::json!(["mcp"])
+        );
+    }
+
+    #[test]
+    fn summary_counts_the_files_it_saw() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let cwd = std::env::temp_dir().join(format!("tasq-connect-summary-{nanos}"));
+        std::fs::create_dir_all(&cwd).expect("cwd");
+
+        let before = summary(&cwd);
+        assert_eq!(before["clients"], CLIENTS.len(), "все клиенты учтены");
+
+        let claude = client("claude-code").expect("client");
+        let outcome = apply(claude, Scope::Project, &cwd, &stdio(), false, false).expect("apply");
+        assert_eq!(outcome.action, "written");
+
+        let after = summary(&cwd);
+        assert!(
+            after["files_present"] > before["files_present"],
+            "файл проекта добавлен к счёту: {before:?} -> {after:?}"
+        );
+        assert!(
+            after["configured"] > before["configured"],
+            "запись засчитана как настроенная: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sees_the_change_and_its_undo() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let cwd = std::env::temp_dir().join(format!("tasq-connect-verify-{nanos}"));
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let claude = client("claude-code").expect("client");
+
+        assert!(!verify(claude, Scope::Project, &cwd).expect("до записи"));
+        apply(claude, Scope::Project, &cwd, &stdio(), false, false).expect("apply");
+        assert!(verify(claude, Scope::Project, &cwd).expect("после записи"));
+        apply(claude, Scope::Project, &cwd, &stdio(), false, true).expect("remove");
+        assert!(!verify(claude, Scope::Project, &cwd).expect("после удаления"));
+    }
+
+    #[test]
+    fn dry_run_names_what_it_would_do() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let cwd = std::env::temp_dir().join(format!("tasq-connect-dry-{nanos}"));
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let claude = client("claude-code").expect("client");
+
+        let write = apply(claude, Scope::Project, &cwd, &stdio(), true, false).expect("dry write");
+        assert_eq!(write.action, "would-write");
+        assert!(write.snippet.is_some());
+        assert!(!cwd.join(".mcp.json").exists(), "пробный прогон не пишет");
+
+        let remove = apply(claude, Scope::Project, &cwd, &stdio(), true, true).expect("dry remove");
+        assert_eq!(remove.action, "would-remove");
+    }
+
+    #[test]
+    fn yaml_is_printed_not_edited() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let cwd = std::env::temp_dir().join(format!("tasq-connect-yaml-{nanos}"));
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let goose = client("goose").expect("client");
+
+        let outcome = apply(goose, Scope::User, &cwd, &stdio(), false, false).expect("apply");
+        assert_eq!(outcome.action, "manual");
+        let snippet = outcome.snippet.expect("фрагмент");
+        assert!(snippet.contains("extensions:"), "{snippet}");
+
+        let outcome = apply(goose, Scope::User, &cwd, &stdio(), false, true).expect("remove");
+        assert_eq!(outcome.action, "manual");
+        assert!(outcome.snippet.expect("подсказка").contains("удалите"));
+    }
+
+    #[test]
+    fn missing_file_hint_depends_on_who_creates_it() {
+        let claude = client("claude-code").expect("client");
+        let message = missing_file(claude, std::path::Path::new("/nope/.mcp.json")).to_string();
+        assert!(message.contains("/nope/.mcp.json"), "{message}");
+        assert!(
+            !message.contains("start the client once"),
+            "claude-code создаёт файл сам при подключении: {message}"
+        );
+
+        let desktop = client("claude-desktop").expect("client");
+        let message = missing_file(desktop, std::path::Path::new("/nope/claude.json")).to_string();
+        assert!(
+            message.contains("start the client once"),
+            "claude-desktop создаёт файл только при первом запуске: {message}"
+        );
     }
 }
