@@ -29,6 +29,10 @@ curl -fsSL "$base.sha256" -o "$work/cargo-deny.sha256"
 echo "$(awk '{print $1}' "$work/cargo-deny.sha256")  $work/cargo-deny.tar.gz" | sha256sum -c -
 
 tar -xzf "$work/cargo-deny.tar.gz" -C "$work"
-install -m 0755 "$work/cargo-deny-${version}-${target}/cargo-deny" /usr/local/cargo/bin/cargo-deny
+# Каталог берётся из CARGO_HOME: в образе с общим томом (CARGO_HOME=/cargo) писать в
+# /usr/local/cargo нельзя — процесс идёт от хостового uid, и установка падает по правам.
+bin_dir="${CARGO_HOME:-/usr/local/cargo}/bin"
+mkdir -p "$bin_dir"
+install -m 0755 "$work/cargo-deny-${version}-${target}/cargo-deny" "$bin_dir/cargo-deny"
 
-cargo deny --version
+"$bin_dir/cargo-deny" --version

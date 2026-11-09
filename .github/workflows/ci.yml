@@ -5,22 +5,29 @@ on:
     branches: [main]
   pull_request:
 
-# Всё собирается в том же образе, что и локальная сборка (make),
-# поэтому гейты на хосте и в GitHub Actions не расходятся.
+# Всё собирается на той же базе, что и локальная сборка (make): Debian 11 + тулчейн 1.99.1.
+# База задаёт порог glibc готового бинаря (2.31) — на bookworm он 2.34, и артефакт не
+# запускается на Astra/Debian 11. Детали — в Dockerfile.
 jobs:
   check:
     # ОС раннера фиксируется: работа всё равно идёт в контейнере,
     # а ubuntu-latest уже объявлен к переезду на Ubuntu 26.
     runs-on: ubuntu-24.04
-    container: rust:1.99.1-bookworm
+    container: rust:1.90-bullseye
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
-      - name: Add rustfmt and clippy
-        run: rustup component add rustfmt clippy
+      # Версия берётся из `rust-toolchain.toml`, а не из тега образа: базовый образ
+      # несёт 1.90, а гейты должны идти на том компиляторе, что записан в проекте.
+      - name: Pin the toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup default 1.99.1
+          rustup component add rustfmt clippy
+          cargo --version && rustc --version
 
       - name: Add cargo-deny
         run: sh scripts/install-cargo-deny.sh
@@ -57,6 +64,17 @@ jobs:
           "$bin" doctor --check
           "$bin" doctor --json > doctor.json
           grep -q '"ok": true' doctor.json
+
+      - name: glibc floor of the artifact
+        # Вторая половина — негативный контроль: предел 2.9 ниже реального порога по значению,
+        # но выше при строковом сравнении, поэтому обязан быть отвергнут. Гейт, сравнивающий
+        # версии как строки, проходит эту проверку зелёным — и перестаёт что-либо значить.
+        run: |
+          sh scripts/check-glibc-floor.sh target/release/tasq 2.31
+          if sh scripts/check-glibc-floor.sh target/release/tasq 2.9; then
+            echo "the gate accepts 2.9 for a 2.3x binary: versions compare as strings" >&2
+            exit 1
+          fi
 
       - name: Tool schema budget
         run: ./target/release/tasq tokens --max 6000

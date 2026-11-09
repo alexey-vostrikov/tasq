@@ -12,12 +12,19 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    container: rust:1.99.1-bookworm
+    container: rust:1.90-bullseye
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
+
+      # Тот же тулчейн, что в CI и в `make`: версия из `rust-toolchain.toml`.
+      - name: Pin the toolchain
+        run: |
+          rustup toolchain install --no-self-update
+          rustup default 1.99.1
+          rustup component add rustfmt clippy
 
       - name: Build release binary
         run: cargo build --release --locked
@@ -83,10 +90,10 @@ jobs:
             ${{ env.CHECKSUM }}
           generate_release_notes: true
           body: |
-            Статическая сборка под x86_64 Linux в контейнере `rust:1.99.1-bookworm`.
+            Сборка под x86_64 Linux на Debian 11 (glibc 2.31), тулчейн 1.99.1.
 
             Требование к glibc и порядок установки — в `GLIBC.txt` внутри архива.
             Контрольная сумма: `sha256sum -c tasq-*.tar.gz.sha256`.
 
             Гейты, пройденные перед релизом: `fmt`, `clippy -D warnings`, `cargo deny check`,
-            все тесты, пол покрытия 78 %, бюджет схем MCP, актуальность `docs/`.
+            все тесты, пол покрытия 90 %, порог glibc 2.31, бюджет схем MCP, актуальность `docs/`.
