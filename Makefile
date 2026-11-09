@@ -25,7 +25,7 @@ DOCKER_FILE  = --rm -v $(CURDIR):/src -v $(CARGO_VOL):/cargo \
 TARGET_DIR    = /cargo/target-tasq
 RUN          = docker run $(DOCKER_FILE) $(IMAGE)
 
-.PHONY: all image image-check cache-init fmt clippy deny test cov build install smoke act clean tokens docs glibc-check
+.PHONY: all image image-check cache-init fmt clippy deny test cov build install smoke act clean tokens docs glibc-check mutants mutants-file mutants-diff
 
 all: fmt clippy deny test tokens docs glibc-check
 
@@ -104,6 +104,33 @@ smoke: build
 # Гейт бюджета схем MCP: тот же порог, что в CI.
 tokens: build
 	$(RUN) $(TARGET_DIR)/release/tasq tokens --max 6000
+
+# Мутационный замер. Отдельно от `all`: полный прогон — это минуты на файл, а не секунды.
+#
+# Настройки — в .cargo/mutants.toml (узкая команда тестов, кэш линтов, копия target);
+# `--baseline skip` потому что немутированное дерево проверяет `make test`.
+# `-j` по умолчанию 8: каждый воркер копирует каталог сборки, и при большем числе
+# воркеров копии начинают конкурировать за диск сильнее, чем выигрывают на CPU.
+MUT_JOBS ?= 8
+# Параллелизм — по деревьям (scripts/mutants-parallel.sh), а не `-j`: `-j` копирует каталог
+# сборки на каждого мутанта, а `--in-place` с `-j` несовместим. Скрипт делит набор на шарды,
+# каждому воркеру даёт своё дерево и свой кэш, связанный с базовым жёсткими ссылками.
+MUT_WORKERS ?= 8
+mutants: cache-init
+	$(RUN) bash scripts/mutants-parallel.sh $(MUT_WORKERS)
+
+# Один файл: так сайты разбираются пачками, и замер стоит секунды, а не минуты.
+# Для файла, чьи проверки живут в интеграционных наборах, команду можно сузить явно:
+#   make mutants-file FILE=src/mcp/tools.rs TEST_ARGS='--test mcp_tools'
+FILE ?= src/project.rs
+TEST_ARGS ?=
+mutants-file: cache-init
+	$(RUN) bash scripts/mutants-parallel.sh $(MUT_WORKERS) -- -f $(FILE) $(TEST_ARGS)
+
+# Только изменённое относительно базовой ветки: гейт для повседневной работы.
+BASE ?= origin/main
+mutants-diff: cache-init
+	$(RUN) sh -c 'git diff $(BASE) > /tmp/mutants.diff && bash scripts/mutants-parallel.sh $(MUT_WORKERS) -- --in-diff /tmp/mutants.diff'
 
 # Справочник в docs/ снимается с бинаря; правка руками ловится гейтом.
 docs: build
