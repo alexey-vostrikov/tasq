@@ -8,10 +8,9 @@ use serde::Serialize;
 
 use crate::activity;
 use crate::error::{Error, Result};
-use crate::lease;
 use crate::node::{self, Filter};
 use crate::project::Project;
-use crate::status::{Status, check_transition};
+use crate::status::Status;
 
 /// Найденная сущность.
 #[derive(Debug, Clone, Serialize)]
@@ -519,14 +518,4 @@ pub fn log_bulk(
         },
     )?;
     Ok(())
-}
-
-/// Живые аренды для дашборда: переиспользуется в `board` и MCP-обзоре.
-pub fn leases(conn: &Connection, project: &Project) -> Result<Vec<lease::Holding>> {
-    lease::holdings(conn, project)
-}
-
-/// Проверка, что переход вообще допустим — используется пакетными операциями заранее.
-pub fn transition_allowed(kind: node::Node, target: Status) -> bool {
-    check_transition(kind.stored_status(), target, kind.kind(), false).is_ok()
 }

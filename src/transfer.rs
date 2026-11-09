@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::activity::{self, Entry};
 use crate::db::now_iso;
 use crate::error::{Error, Result};
-use crate::project::{self, Project};
+use crate::project::Project;
 
 /// Метка формата нашего экспорта.
 pub const SCHEMA: &str = "tasq.export.v1";
@@ -1220,11 +1220,6 @@ pub fn import_saga(
         templates: 0,
         checksum_verified: false,
     })
-}
-
-/// Проект по умолчанию для импорта; при `--mode replace` данные принадлежат ему.
-pub fn target_project(conn: &Connection) -> Result<Project> {
-    project::default_project(conn)
 }
 
 /// Проверка формата документа без записи: для `--dry-run`.
