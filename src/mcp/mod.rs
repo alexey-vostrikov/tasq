@@ -40,7 +40,7 @@ impl Flusher {
         let handle = std::thread::Builder::new()
             .name("tasq-flush".to_string())
             .spawn(move || {
-                let conn = match crate::db::open(&db_path) {
+                let conn = match crate::db::open_light(&db_path) {
                     Ok(conn) => conn,
                     Err(err) => {
                         eprintln!("tasq mcp: flusher disabled ({err})");
@@ -50,6 +50,8 @@ impl Flusher {
                 // Спим короткими кусками, чтобы остановка не ждала целый интервал.
                 let slice = Duration::from_millis(200);
                 let mut waited = Duration::ZERO;
+                let mut stalled = 0;
+                let mut warned = false;
                 while !flag.load(Ordering::Relaxed) {
                     std::thread::sleep(slice);
                     waited += slice;
@@ -57,8 +59,29 @@ impl Flusher {
                         continue;
                     }
                     waited = Duration::ZERO;
-                    if let Err(err) = crate::db::checkpoint(&conn) {
-                        eprintln!("tasq mcp: checkpoint failed: {err}");
+                    match crate::db::checkpoint(&conn) {
+                        Ok(_) => {
+                            // Сброс «не прошёл», если кадры остались: значит другое соединение
+                            // держит читательскую транзакцию и журнал нельзя перелить в базу.
+                            // Молчать об этом нельзя — окно потерь растёт без предела.
+                            match crate::db::pending_frames(&conn) {
+                                Ok(0) => {
+                                    stalled = 0;
+                                    warned = false;
+                                }
+                                Ok(_) => {
+                                    stalled += 1;
+                                    if stalled >= 3 && !warned {
+                                        eprintln!(
+                                            "tasq mcp: journal is not being flushed: another connection holds a read transaction, so data stays unwritten until it finishes"
+                                        );
+                                        warned = true;
+                                    }
+                                }
+                                Err(err) => eprintln!("tasq mcp: journal state unknown: {err}"),
+                            }
+                        }
+                        Err(err) => eprintln!("tasq mcp: checkpoint failed: {err}"),
                     }
                 }
             })

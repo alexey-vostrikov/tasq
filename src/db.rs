@@ -89,6 +89,25 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Соединение для служебных задач вроде сброса журнала.
+///
+/// Отличие от `open`: здесь **не** выставляется `journal_mode`. Переключение режима требует
+/// кратковременной исключительной блокировки, и если другое соединение держит читательскую
+/// транзакцию, `PRAGMA journal_mode = WAL` ждёт `busy_timeout` и поток сброса не стартует
+/// вовсе — то есть не сбрасывает именно тогда, когда это нужнее всего.
+/// Заодно не регистрируются Unicode-функции: они нужны только запросам с текстом.
+pub fn open_light(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // Короткий `busy_timeout`: сброс — фоновая задача, и ждать блокировку пять секунд
+    // ей нельзя. Пока читатель держит транзакцию, `wal_checkpoint(TRUNCATE)` вернёт busy
+    // сразу, и поток успеет зафиксировать это предупреждением, а не зависнет на весь тик.
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 200;
+         PRAGMA journal_size_limit = 8388608;",
+    )?;
+    Ok(conn)
+}
+
 /// Число несохранённых кадров журнала: 0 — всё уже в базе.
 pub fn pending_frames(conn: &Connection) -> Result<i64> {
     let (busy, log, checkpointed): (i64, i64, i64) =

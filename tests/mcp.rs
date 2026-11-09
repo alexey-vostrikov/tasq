@@ -621,3 +621,47 @@ fn the_flush_can_be_disabled() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// Долгая читательская транзакция в другом процессе не даёт перелить журнал в базу:
+/// окно потерь растёт без предела, и сервер обязан сказать об этом, а не молчать.
+#[test]
+fn a_held_read_transaction_is_reported_as_stalled_flush() {
+    let dir = temp_dir("flush-stall");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+
+    let db_path = dir.join(".tasq/tasq.db");
+    let holder = tasq::db::open(&db_path).expect("open holder");
+    // Начинаем чтение и не заканчиваем: именно это мешает checkpoint.
+    holder
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM nodes;")
+        .expect("begin read");
+
+    let mut child = spawn_server(&dir, &["--flush", "1"]);
+    let response = write_one(&mut child, "Узел под занятым журналом");
+    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+
+    // Три интервала подряд без успеха — предупреждение должно появиться.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("journal is not being flushed"),
+        "сервер должен предупредить о застрявшем сбросе:\n{stderr}"
+    );
+    assert!(
+        wal_size(&dir) > 0,
+        "журнал не пуст, пока читатель держит транзакцию"
+    );
+
+    // Отпустили читателя — сброс проходит.
+    holder.execute_batch("COMMIT").expect("commit");
+    drop(holder);
+    let mut child = spawn_server(&dir, &["--flush", "1"]);
+    let response = write_one(&mut child, "Узел после освобождения");
+    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(wal_size(&dir), 0, "после освобождения журнал усечён");
+}
