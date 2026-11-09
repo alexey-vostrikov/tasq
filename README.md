@@ -697,6 +697,7 @@ tasq delete project [KEY] [--force]                удалить проект �
 tasq tokens [--max N] [--profile]                  бюджет схем MCP
 tasq docs [--out DIR] [--check]                    справочник из бинаря; --check ловит расхождение
 tasq connect [клиент] [--scope user|project] [--url URL] [--dry-run] [--remove] [--check]
+tasq completions bash|zsh|fish [--out PATH]        скрипт автодополнения (алиас: completion)
 tasq mcp [--profile]                               MCP-сервер stdio
 tasq doctor [--check] [--gc] [--json]             целостность БД, истёкшие аренды, осиротевшие резервы
 tasq --version | --help
@@ -710,6 +711,18 @@ tasq --version | --help
 (по умолчанию 3, `0` — выключить; см. §17.0.1).
 Человекочитаемый вывод CLI — английский (как и описания инструментов): это поверхность, которую читают
 и агент, и скрипты; README и документация — русские.
+
+Автодополнение собирается из того же описания CLI (clap), поэтому разойтись с интерфейсом не может:
+новая подкоманда или флаг появляются в скрипте сами. Базы команда не требует — дополнение настраивают
+один раз на машине, в том числе до `tasq init`:
+
+```
+tasq completions bash > ~/.local/share/bash-completion/completions/tasq   # bash
+tasq completions zsh  --out ~/.zfunc/_tasq                                # zsh (после fpath+=~/.zfunc)
+tasq completions fish --out ~/.config/fish/completions/tasq.fish          # fish
+```
+
+`--out` создаёт каталог назначения сам: пути дополнений на чистой машине ещё не существует.
 
 ### 15.1. Несколько проектов в одной базе
 

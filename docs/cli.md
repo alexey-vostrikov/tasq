@@ -731,3 +731,15 @@ tasq connect [ОПЦИИ]
 | `--remove` | — | — | Remove the entry instead of adding it |
 | `--check` | — | — | Check the recorded config and exit 1 if it is wrong |
 
+## `completions`
+
+Print a shell completion script for `tasq`
+
+```
+tasq completions [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--out` | `PATH` | — | Write the script to a file instead of stdout |
+

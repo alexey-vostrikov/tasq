@@ -445,6 +445,16 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Print a shell completion script for `tasq`
+    #[command(alias = "completion")]
+    Completions {
+        /// Shell to generate the script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+        /// Write the script to a file instead of stdout
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
 }
 
 /// Что создаётся командой `tasq create`.
@@ -855,6 +865,32 @@ fn run_connect(
     Ok(code)
 }
 
+/// Скрипт автодополнения из описания CLI.
+///
+/// Источник — `Cli::command()`, то есть те же определения, что разбирают аргументы: скрипт
+/// не может разойтись с интерфейсом, как разошёлся бы написанный руками. Каталог для `--out`
+/// создаётся сам: у bash-дополнений путь вида `~/.local/share/bash-completion/completions/tasq`
+/// на чистой машине ещё не существует, и падение на этом читалось бы как поломка команды.
+fn run_completions(shell: clap_complete::Shell, out: Option<&std::path::Path>) -> Result<ExitCode> {
+    let mut command = Cli::command();
+    let mut script: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut command, "tasq", &mut script);
+
+    match out {
+        Some(path) => {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, &script)?;
+            println!("{}", path.display());
+        }
+        None => print!("{}", String::from_utf8_lossy(&script)),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn print_json<T: serde::Serialize>(value: &T) {
     println!(
         "{}",
@@ -931,6 +967,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             println!("{}", path.display());
         }
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // `completions` тоже не нуждается в базе: дополнение настраивают один раз на машине,
+    // в том числе до `tasq init`, а скрипт собирается из описания CLI (clap), не из данных.
+    if let Command::Completions { shell, out } = &cli.command {
+        return run_completions(*shell, out.as_deref());
     }
 
     if let Command::Connect {
@@ -2379,6 +2421,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
 
         Command::Connect { .. } => unreachable!("обработан до открытия базы"),
         Command::Docs { .. } => unreachable!("обработан до открытия базы"),
+        Command::Completions { .. } => unreachable!("обработан до открытия базы"),
 
         Command::Mcp { profile } => {
             let profile =

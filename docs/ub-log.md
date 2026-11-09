@@ -59,3 +59,24 @@
   `make` и в CI, включая негативный контроль.
 - Мутационный замер (`cargo-mutants`) на этом дереве не гонялся: точки решения проверены
   ручными мутациями (таблица выше), полный прогон — отдельная работа с отдельным образом.
+
+# Шаг: автодополнение оболочки (`tasq completions`)
+
+Порядок — TDD: сначала `tests/completions.rs` (четыре теста), прогон красный по ОЖИДАЕМОЙ
+причине (`unrecognized subcommand 'completions'`), потом `clap_complete` и подкоманда.
+Скрипт собирается из `Cli::command()`, то есть из того же описания, что разбирает аргументы.
+
+| мутация (сайт решения) | тест, который обязан покраснеть | результат |
+| --- | --- | --- |
+| алиас `completion` убран | `the_singular_alias_works` | `FAILED` |
+| `--out` игнорируется (всегда stdout) | `out_writes_the_script_to_a_file` | `FAILED` |
+| команда обрабатывается ПОСЛЕ открытия базы | `every_supported_shell_gets_a_script_without_a_database` | `FAILED` (DB_NOT_FOUND) |
+
+Живая проверка на установленном бинаре (bash, `_tasq` вызывается так, как её зовёт `complete -F`):
+`tasq cl` → `claim`, `tasq claim --pro` → `--project`, `tasq completions <TAB>` → `bash elvish fish
+powershell zsh`, `tasq dep <TAB>` → `add rm ls graph`.
+
+Что осталось: вывод скрипта в `head`/`less` падает `failed printing to stdout: Broken pipe`
+(паникует `print!` в std) — это общее поведение всех команд с длинным выводом, а не только
+дополнений; лечится обработкой `EPIPE` на границе вывода отдельным изменением.
+
