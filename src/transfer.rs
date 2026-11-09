@@ -68,6 +68,15 @@ fn canonical(value: &Value) -> String {
 }
 
 /// SHA-256 строки в hex.
+/// Сумма payload в том виде, в каком она попадает в документ обмена.
+///
+/// Вынесена наружу, потому что документ собирают и правят не только здесь: тесты,
+/// скрипты миграции и внешние инструменты обязаны считать ту же сумму, иначе проверка
+/// отвергнет их документ как повреждённый.
+pub fn payload_checksum(data: &Value) -> String {
+    checksum(&canonical(data))
+}
+
 fn checksum(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
@@ -249,7 +258,7 @@ pub fn export(conn: &Connection, project: &Project, include_deleted: bool) -> Re
         "schema": SCHEMA,
         "version": env!("CARGO_PKG_VERSION"),
         "exported_at": now_iso(),
-        "sha256": checksum(&canonical(&data)),
+        "sha256": payload_checksum(&data),
         "data": data,
     });
     Ok(document)
@@ -281,7 +290,7 @@ fn verify(document: &Value) -> Result<Value> {
             field: "data".to_string(),
             value: "missing".to_string(),
         })?;
-    let actual = checksum(&canonical(&data));
+    let actual = payload_checksum(&data);
     if actual != claimed {
         return Err(Error::ExportChecksumMismatch {
             expected: claimed.to_string(),
@@ -1018,6 +1027,14 @@ pub fn import_saga(
                     continue;
                 };
                 if let Some(to_path) = task_path_by_saga.get(&id) {
+                    // Самоссылка в исходном файле — порча данных, а не повод упасть на
+                    // CHECK-ограничении схемы с честной ошибкой хранилища. Отказываем
+                    // тем же кодом, что и импорт родного формата.
+                    if to_path == &from_path {
+                        return Err(Error::SelfEdge {
+                            dot_id: from_path.clone(),
+                        });
+                    }
                     edges.push((from_path.clone(), to_path.clone()));
                 }
             }
