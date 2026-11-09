@@ -140,15 +140,22 @@ pub fn save(conn: &mut Connection, project: &Project, req: SaveNote<'_>) -> Resu
             params![title, content, note_type, node_id, now, id],
         )?;
         if old_title != title {
+            // Заметка может быть не привязана к узлу: `Entry::change` принимает обязательный
+            // node_id, а `unwrap_or_default()` дал бы 0 и нарушил внешний ключ лога.
             activity::log(
                 &tx,
-                &Entry::change(
-                    project.id,
-                    node_id.unwrap_or_default(),
-                    "title",
-                    Some(&old_title),
-                    Some(title),
-                ),
+                &Entry {
+                    project_id: project.id,
+                    node_id,
+                    entity_type: "note",
+                    entity_id: id,
+                    action: "update",
+                    field_name: Some("title"),
+                    old_value: Some(&old_title),
+                    new_value: Some(title),
+                    summary: None,
+                    actor,
+                },
             )?;
         }
         activity::log(

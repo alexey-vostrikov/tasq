@@ -696,20 +696,38 @@ pub fn move_node(
     };
 
     let tx = db::write_tx(conn)?;
-    let seq: i64 = if renumber {
-        tx.query_row(
+    // Номер сохраняется, если он свободен у нового родителя: тогда dot-ID не меняется.
+    // Если занят — берётся следующий свободный. Молча падать на `UNIQUE constraint` нельзя:
+    // перенос в уже занятую ветку — обычная операция, а не ошибка вызывающего.
+    let next_free = |tx: &rusqlite::Transaction<'_>| -> Result<i64> {
+        Ok(tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM nodes WHERE project_id = ?1 AND parent_id IS ?2",
             params![project.id, parent_id],
             |row| row.get(0),
-        )?
+        )?)
+    };
+    let candidate = |seq: i64| -> String {
+        if parent_path.is_empty() {
+            seq.to_string()
+        } else {
+            format!("{parent_path}.{seq}")
+        }
+    };
+    let taken = |tx: &rusqlite::Transaction<'_>, path: &str| -> Result<bool> {
+        Ok(tx.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE project_id = ?1 AND path = ?2",
+            params![project.id, path],
+            |row| row.get::<_, i64>(0),
+        )? > 0)
+    };
+
+    // `--renumber` и занятый номер ведут к одному и тому же: берём следующий свободный.
+    let seq: i64 = if renumber || taken(&tx, &candidate(node.seq))? {
+        next_free(&tx)?
     } else {
         node.seq
     };
-    let new_path = if parent_path.is_empty() {
-        seq.to_string()
-    } else {
-        format!("{parent_path}.{seq}")
-    };
+    let new_path = candidate(seq);
     validate_path(&new_path)?;
 
     let deepest: i64 = tx.query_row(

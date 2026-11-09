@@ -907,7 +907,13 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 }
                 return Ok(ExitCode::from(3));
             }
-            if !cli.json {
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "out": out.display().to_string(),
+                    "files": files.len(),
+                }));
+            } else {
                 println!("docs: up to date ({})", out.display());
             }
             return Ok(ExitCode::SUCCESS);
@@ -1116,9 +1122,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
             let report = db::doctor(&path)?;
-            if cli.json {
+            // С `--gc --json` отчёт и итог уборки печатаются ОДНИМ документом: два JSON
+            // подряд — не JSON, и потребитель ломается на разборе.
+            let mut gc_outcome: Option<(usize, usize)> = None;
+            if cli.json && !*gc {
                 print_json(&report);
-            } else {
+            } else if !cli.json {
                 println!("database:  {}", report.db_path);
                 println!(
                     "schema:    v{} (supported v{})",
@@ -1148,8 +1157,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 let project = project::select(&conn, cli.project.as_deref())?;
                 let closed = lease::gc(&mut conn, &project)?;
                 let unblocked = edge::clear_stale_blocked(&mut conn, &project)?;
+                gc_outcome = Some((closed, unblocked));
+            }
+            if let Some((closed, unblocked)) = gc_outcome {
                 if cli.json {
                     print_json(&serde_json::json!({
+                        "report": report,
                         "expired_attempts_closed": closed,
                         "stale_blocked_cleared": unblocked,
                     }));
@@ -1281,6 +1294,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             archived,
         } => {
             let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            // Незнакомое значение фильтра — отказ: молча выданный полный список читается
+            // как «таких узлов нет» и уводит в сторону.
+            if let Some(value) = status {
+                parse_status(value)?;
+            }
             let nodes = node::list(
                 &conn,
                 &project,
@@ -1387,7 +1405,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Rm { reference } => {
             let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
             node::delete(&mut conn, &project, reference)?;
-            if !cli.json {
+            if cli.json {
+                print_json(&serde_json::json!({ "deleted": true, "ref": reference }));
+            } else {
                 println!("removed {reference}");
             }
             Ok(ExitCode::SUCCESS)
@@ -1407,7 +1427,13 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Archive { reference, undo } => {
             let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
             let affected = node::archive(&mut conn, &project, reference, *undo)?;
-            if !cli.json {
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "affected": affected,
+                    "archived": !*undo,
+                    "ref": reference,
+                }));
+            } else {
                 println!(
                     "{} {affected} node(s)",
                     if *undo { "unarchived" } else { "archived" }
@@ -1619,12 +1645,18 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 let kind = parse_edge_kind(kind)?;
                 let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
                 let removed = edge::unlink(&mut conn, &project, from, to, kind, "-")?;
-                if !cli.json {
-                    if removed {
-                        println!("removed {} {} {}", from, kind.as_str(), to);
-                    } else {
-                        println!("no such link: {} {} {}", from, kind.as_str(), to);
-                    }
+                if cli.json {
+                    // Пустой stdout в машиночитаемом режиме неотличим от «ничего не сделано».
+                    print_json(&serde_json::json!({
+                        "removed": removed,
+                        "from": from,
+                        "to": to,
+                        "kind": kind.as_str(),
+                    }));
+                } else if removed {
+                    println!("removed {} {} {}", from, kind.as_str(), to);
+                } else {
+                    println!("no such link: {} {} {}", from, kind.as_str(), to);
                 }
                 Ok(if removed {
                     ExitCode::SUCCESS
@@ -1660,7 +1692,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
                 let graph = edge::graph(&conn, &project, reference, *depth)?;
                 if cli.json {
-                    print_json(&graph);
+                    // `--mermaid` и `--json` вместе: отдаём оба вида, иначе флаг молча
+                    // игнорируется в машиночитаемом режиме и Mermaid не получить никак.
+                    if *mermaid {
+                        print_json(&serde_json::json!({
+                            "graph": graph,
+                            "mermaid": graph.to_mermaid(),
+                        }));
+                    } else {
+                        print_json(&graph);
+                    }
                     return Ok(ExitCode::SUCCESS);
                 }
                 if *mermaid {
@@ -1824,12 +1865,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 }
                 NoteCommand::Rm { id } => {
                     let removed = note::delete(&mut conn, &project, *id, "-")?;
-                    if !cli.json {
-                        if removed {
-                            println!("removed note #{id}");
-                        } else {
-                            println!("no note #{id}");
-                        }
+                    // В машиночитаемом режиме ответ обязателен: пустой stdout неотличим
+                    // от «команда ничего не сделала».
+                    if cli.json {
+                        print_json(&serde_json::json!({ "removed": removed, "id": id }));
+                    } else if removed {
+                        println!("removed note #{id}");
+                    } else {
+                        println!("no note #{id}");
                     }
                     Ok(if removed {
                         ExitCode::SUCCESS
@@ -2485,15 +2528,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 }
                 TemplateCommand::Rm { name } => {
                     let removed = template::delete(&mut conn, &project, name, "-")?;
-                    if !cli.json {
-                        println!(
-                            "{}",
-                            if removed {
-                                format!("removed template {name}")
-                            } else {
-                                format!("no template {name}")
-                            }
-                        );
+                    if cli.json {
+                        print_json(&serde_json::json!({ "removed": removed, "name": name }));
+                    } else if removed {
+                        println!("removed template {name}");
+                    } else {
+                        println!("no template {name}");
                     }
                     Ok(if removed {
                         ExitCode::SUCCESS
