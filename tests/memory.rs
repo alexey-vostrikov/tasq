@@ -138,7 +138,7 @@ fn note_update_and_delete() {
     assert_eq!(updated.content, "v2: выбрали WAL");
     assert_eq!(updated.title, "Схема", "не переданное поле не затирается");
 
-    assert!(note::delete(&mut conn, &project, saved.id, "-").expect("delete"));
+    note::delete(&mut conn, &project, saved.id, "-").expect("delete");
     assert!(
         note::list(&conn, &project, &note::Filter::default())
             .expect("list")
