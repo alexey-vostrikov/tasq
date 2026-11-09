@@ -1,4 +1,4 @@
-"""Мутации по коду сброса журнала: каждая обязана дать красный на своём тесте.
+"""Мутации по проверяемым контрактам: каждая обязана дать красный на своём тесте.
 
 Откат — обратной правкой, а не `git checkout`: файл в индексе не лежит, и checkout
 на неотслеживаемом файле молча ничего не делает.
@@ -38,6 +38,20 @@ MUTATIONS = [
         "new": 'conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {',
         "why": "журнал не усекается (PASSIVE вместо TRUNCATE)",
         "tests": ["db::tests::checkpoint_moves_frames_into_the_database"],
+    },
+    {
+        "file": "src/error.rs",
+        "old": '            Error::LeaseRequired => "LEASE_REQUIRED",',
+        "new": '            Error::LeaseRequired => "NO_PROJECT",',
+        "why": "два разных отказа получили один код",
+        "tests": ["error::tests::every_error_has_a_unique_machine_code"],
+    },
+    {
+        "file": "src/error.rs",
+        "old": '            Error::NoProject => "run `tasq init` to register a project",',
+        "new": '            Error::NoProject => "",',
+        "why": "подсказка у варианта отключена",
+        "tests": ["error::tests::every_error_carries_a_hint"],
     },
     {
         "file": "src/mcp/mod.rs",

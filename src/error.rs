@@ -296,3 +296,176 @@ pub struct JsonError {
     pub message: String,
     pub hint: &'static str,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Каждый вариант ошибки с осмысленными полями. Список держится рядом с `code()`:
+    /// новый вариант без строки здесь — это непроверенный код ветки, а не «мелочь».
+    fn all_variants() -> Vec<Error> {
+        vec![
+            Error::DbNotFound("/tmp/x".to_string()),
+            Error::NoProject,
+            Error::SchemaTooNew {
+                found: 9,
+                supported: 2,
+            },
+            Error::DuplicateKey("TASQ".to_string()),
+            Error::ProjectNotFound {
+                key: "NOPE".to_string(),
+                known: "TASQ".to_string(),
+            },
+            Error::ProjectNotEmpty {
+                key: "TASQ".to_string(),
+                nodes: 3,
+            },
+            Error::LastProject("TASQ".to_string()),
+            Error::InvalidKey("toolongkey".to_string()),
+            Error::InvalidRef("???".to_string()),
+            Error::NodeNotFound("TASQ-9".to_string()),
+            Error::AmbiguousId("TASQ-1".to_string(), "2 and 3".to_string()),
+            Error::InvalidTransition {
+                from: "todo".to_string(),
+                to: "planned".to_string(),
+                kind: "task".to_string(),
+            },
+            Error::ForceRequired {
+                from: "done".to_string(),
+                to: "todo".to_string(),
+            },
+            Error::ChildrenUnfinished {
+                dot_id: "TASQ-1".to_string(),
+                unfinished: 2,
+            },
+            Error::UnmetPrerequisites {
+                dot_id: "TASQ-1".to_string(),
+                blockers: "TASQ-2".to_string(),
+            },
+            Error::DescriptionLocked {
+                dot_id: "TASQ-1".to_string(),
+            },
+            Error::LeaseRequired,
+            Error::NodeClosed {
+                dot_id: "TASQ-1".to_string(),
+                status: "done".to_string(),
+            },
+            Error::ActiveAttemptExists {
+                dot_id: "TASQ-1".to_string(),
+                holder: "agent-a".to_string(),
+                expires_at: "2026-01-01T00:00:00.000Z".to_string(),
+                attempt_no: 2,
+            },
+            Error::LeaseExpired { attempt_id: 7 },
+            Error::NotYourAttempt,
+            Error::ResourceReservationConflict {
+                kind: "path".to_string(),
+                value: "src/api".to_string(),
+                holder: "agent-a".to_string(),
+                dot_id: "TASQ-1".to_string(),
+                expires_at: "2026-01-01T00:00:00.000Z".to_string(),
+            },
+            Error::TooManyReservations { count: 40, max: 32 },
+            Error::PathOutsideProject("../etc".to_string()),
+            Error::ExportChecksumMismatch {
+                expected: "aa".to_string(),
+                actual: "bb".to_string(),
+            },
+            Error::SelfEdge {
+                dot_id: "TASQ-1".to_string(),
+            },
+            Error::CrossProjectEdge {
+                from: "A-1".to_string(),
+                to: "B-1".to_string(),
+            },
+            Error::AncestorBlockEdge {
+                dot_id: "TASQ-1".to_string(),
+                other: "TASQ-1.1".to_string(),
+            },
+            Error::CycleDetected {
+                from: "TASQ-1".to_string(),
+                to: "TASQ-2".to_string(),
+                path: "TASQ-1 -> TASQ-2 -> TASQ-1".to_string(),
+            },
+            Error::NotRemovable {
+                dot_id: "TASQ-1".to_string(),
+                status: "blocked".to_string(),
+            },
+            Error::AlreadyInState {
+                dot_id: "TASQ-1".to_string(),
+                state: "todo".to_string(),
+            },
+            Error::DepthLimit,
+            Error::MoveIntoSelf {
+                dot_id: "TASQ-1".to_string(),
+                target: "TASQ-1.1".to_string(),
+            },
+            Error::InvalidValue {
+                field: "priority".to_string(),
+                value: "urgent".to_string(),
+            },
+            Error::Io(std::io::Error::other("disk on fire")),
+            Error::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+        ]
+    }
+
+    /// Код ошибки — часть контракта: по нему агент и скрипт принимают решение, поэтому
+    /// он есть у каждого варианта, пишется заглавными и не повторяется. Два варианта
+    /// делят один код осознанно (`Io` и `Sqlite` — обе беды хранилища).
+    #[test]
+    fn every_error_has_a_unique_machine_code() {
+        let variants = all_variants();
+        let mut codes: Vec<&'static str> = Vec::new();
+        for error in &variants {
+            let code = error.code();
+            assert!(!code.is_empty(), "пустой код у {error}");
+            assert!(
+                code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "код {code} не в верхнем регистре с подчёркиваниями"
+            );
+            codes.push(code);
+        }
+
+        let shared_storage = codes
+            .iter()
+            .filter(|code| **code == "STORAGE_ERROR")
+            .count();
+        assert_eq!(
+            shared_storage, 2,
+            "STORAGE_ERROR делят ровно Io и Sqlite, иначе код перестал быть различителем"
+        );
+
+        // Все прочие коды различны: два разных отказа с одним кодом невозможно
+        // разобрать ни агенту, ни скрипту.
+        let mut seen: Vec<&'static str> = Vec::new();
+        let mut duplicates: Vec<&'static str> = Vec::new();
+        for code in &codes {
+            if *code == "STORAGE_ERROR" {
+                continue;
+            }
+            if seen.contains(code) {
+                duplicates.push(code);
+            }
+            seen.push(code);
+        }
+        assert!(duplicates.is_empty(), "коды повторяются: {duplicates:?}");
+    }
+
+    /// Подсказка есть у каждой ошибки: сообщение без «что делать» заставляет агента
+    /// угадывать, а CLI — печатать пустую строку.
+    #[test]
+    fn every_error_carries_a_hint() {
+        for error in all_variants() {
+            let hint = error.hint();
+            assert!(!hint.is_empty(), "нет подсказки у {error}");
+            assert!(
+                hint.len() > 8,
+                "подсказка «{hint}» слишком коротка, чтобы помочь"
+            );
+            assert!(
+                !hint.ends_with('.'),
+                "подсказка не заканчивается точкой: её печатают отдельной строкой — «{hint}»"
+            );
+        }
+    }
+}
