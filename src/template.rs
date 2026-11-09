@@ -292,32 +292,32 @@ pub fn list(conn: &Connection, project: &Project) -> Result<Vec<Template>> {
 }
 
 /// Удаляет шаблон.
-pub fn delete(conn: &mut Connection, project: &Project, name: &str, actor: &str) -> Result<bool> {
+/// Удаляет шаблон. Отсутствующий шаблон — отказ из `by_name`, поэтому
+/// «удалено ли что-то» не возвращается: строка после успешного поиска есть всегда.
+pub fn delete(conn: &mut Connection, project: &Project, name: &str, actor: &str) -> Result<()> {
     let template = by_name(conn, project, name)?;
     let tx = crate::db::write_tx(conn)?;
-    let removed = tx.execute(
+    tx.execute(
         "DELETE FROM templates WHERE id = ?1 AND project_id = ?2",
         params![template.id, project.id],
     )?;
-    if removed > 0 {
-        activity::log(
-            &tx,
-            &Entry {
-                project_id: project.id,
-                node_id: None,
-                entity_type: "template",
-                entity_id: template.id,
-                action: "delete",
-                field_name: Some("name"),
-                old_value: Some(template.name.as_str()),
-                new_value: None,
-                summary: None,
-                actor,
-            },
-        )?;
-    }
+    activity::log(
+        &tx,
+        &Entry {
+            project_id: project.id,
+            node_id: None,
+            entity_type: "template",
+            entity_id: template.id,
+            action: "delete",
+            field_name: Some("name"),
+            old_value: Some(template.name.as_str()),
+            new_value: None,
+            summary: None,
+            actor,
+        },
+    )?;
     tx.commit()?;
-    Ok(removed > 0)
+    Ok(())
 }
 
 /// Результат применения шаблона.

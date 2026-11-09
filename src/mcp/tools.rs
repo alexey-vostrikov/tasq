@@ -326,6 +326,12 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 }
                 None => None,
             };
+            // Право аренды считается ДО захвата соединения: иначе заимствование
+            // пересекается с `&mut ctx.conn`.
+            let lease_node = match arg_str(args, "token") {
+                Some(token) => crate::lease::live_node(&ctx.conn, &ctx.project, token)?,
+                None => None,
+            };
             let updated = node::update(
                 &mut ctx.conn,
                 &ctx.project,
@@ -343,7 +349,9 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     branch: arg_str(args, "branch"),
                     force: arg_bool(args, "force"),
                     description_locked,
-                    lease: arg_str(args, "token").is_some(),
+                    // Токен должен быть живым и указывать на этот же узел: иначе
+                    // любой запрос с полем `token` ставил бы в работу чужую задачу.
+                    lease: lease_node,
                     actor: Some(&arg_holder(args)),
                 },
             )?;
@@ -645,8 +653,8 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 field: "id".to_string(),
                 value: "required".to_string(),
             })?;
-            let removed = note::delete(&mut ctx.conn, &ctx.project, id, &arg_holder(args))?;
-            Ok(text(&json!({"removed": removed})))
+            note::delete(&mut ctx.conn, &ctx.project, id, &arg_holder(args))?;
+            Ok(text(&json!({"removed": true})))
         }
 
         // ------------------------------------------------ шаблоны
@@ -692,13 +700,13 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&applied))
         }
         "template_delete" => {
-            let removed = template::delete(
+            template::delete(
                 &mut ctx.conn,
                 &ctx.project,
                 req_str(args, "name")?,
                 &arg_holder(args),
             )?;
-            Ok(text(&json!({"removed": removed})))
+            Ok(text(&json!({"removed": true})))
         }
 
         // ------------------------------------------------ активность
@@ -823,7 +831,13 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 },
             )?;
             let imported = if arg_bool(args, "from_saga") {
-                transfer::import_saga(&mut ctx.conn, &ctx.project, document, &arg_holder(args))?
+                transfer::import_saga(
+                    &mut ctx.conn,
+                    &ctx.project,
+                    document,
+                    mode,
+                    &arg_holder(args),
+                )?
             } else {
                 transfer::import(
                     &mut ctx.conn,

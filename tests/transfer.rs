@@ -319,7 +319,8 @@ fn saga_export_is_imported_with_mapping() {
     let document: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/saga-export-v1.3.json")).expect("fixture");
 
-    let result = transfer::import_saga(&mut conn, &project, &document, "-").expect("import saga");
+    let result = transfer::import_saga(&mut conn, &project, &document, transfer::Mode::Merge, "-")
+        .expect("import saga");
     assert_eq!(result.nodes_created, 5, "эпик + 2 задачи + 2 подзадачи");
     assert_eq!(result.edges, 1, "вторая задача ждёт первую");
     assert_eq!(result.comments, 1);
@@ -377,7 +378,8 @@ fn saga_export_is_imported_with_mapping() {
 fn saga_version_is_checked() {
     let (mut conn, project) = fixture("sagaversion");
     let document = json!({"format_version": "9.9", "project": {"name": "x", "epics": []}});
-    let err = transfer::import_saga(&mut conn, &project, &document, "-").unwrap_err();
+    let err = transfer::import_saga(&mut conn, &project, &document, transfer::Mode::Merge, "-")
+        .unwrap_err();
     assert_eq!(err.code(), "INVALID_VALUE");
     assert!(err.to_string().contains("1.3"), "{err}");
 }
@@ -391,7 +393,8 @@ fn saga_epic_without_tasks_still_imports() {
             {"_original_id": 1, "name": "Одинокий эпик", "status": "planned", "priority": "low"}
         ]}
     });
-    let result = transfer::import_saga(&mut conn, &project, &document, "-").expect("import");
+    let result = transfer::import_saga(&mut conn, &project, &document, transfer::Mode::Merge, "-")
+        .expect("import");
     assert_eq!(result.nodes_created, 1);
     let nodes = node::list(&conn, &project, &node::Filter::default()).expect("list");
     assert_eq!(nodes[0].kind, "epic");

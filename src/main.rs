@@ -1374,7 +1374,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     branch: None,
                     force: *force,
                     description_locked,
-                    lease: false,
+                    lease: None,
                     actor: None,
                 },
             )?;
@@ -1864,21 +1864,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
                 NoteCommand::Rm { id } => {
-                    let removed = note::delete(&mut conn, &project, *id, "-")?;
+                    note::delete(&mut conn, &project, *id, "-")?;
                     // В машиночитаемом режиме ответ обязателен: пустой stdout неотличим
                     // от «команда ничего не сделала».
                     if cli.json {
-                        print_json(&serde_json::json!({ "removed": removed, "id": id }));
-                    } else if removed {
+                        print_json(&serde_json::json!({ "removed": true, "id": id }));
+                    } else {
                         println!("removed note #{id}");
-                    } else {
-                        println!("no note #{id}");
                     }
-                    Ok(if removed {
-                        ExitCode::SUCCESS
-                    } else {
-                        ExitCode::from(1)
-                    })
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         }
@@ -2296,7 +2290,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         checksum_verified: false,
                     }
                 } else {
-                    transfer::import_saga(&mut conn, &project, &document, "-")?
+                    transfer::import_saga(&mut conn, &project, &document, mode_value, "-")?
                 }
             } else if *dry_run {
                 transfer::dry_run(&conn, &project, &document)?
@@ -2527,19 +2521,13 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
                 TemplateCommand::Rm { name } => {
-                    let removed = template::delete(&mut conn, &project, name, "-")?;
+                    template::delete(&mut conn, &project, name, "-")?;
                     if cli.json {
-                        print_json(&serde_json::json!({ "removed": removed, "name": name }));
-                    } else if removed {
+                        print_json(&serde_json::json!({ "removed": true, "name": name }));
+                    } else {
                         println!("removed template {name}");
-                    } else {
-                        println!("no template {name}");
                     }
-                    Ok(if removed {
-                        ExitCode::SUCCESS
-                    } else {
-                        ExitCode::from(1)
-                    })
+                    Ok(ExitCode::SUCCESS)
                 }
             }
         }

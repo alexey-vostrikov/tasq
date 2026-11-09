@@ -159,6 +159,8 @@ fn transition_matrix_is_enforced() {
     assert_eq!(err.code(), "INVALID_TRANSITION");
 }
 
+/// Правка с правом аренды: `lease` — идентификатор узла, покрытого живой арендой.
+/// В этом тесте матрицы аренда подразумевается, настоящая проверка — в `tests/lease.rs`.
 fn set_status_leased(
     conn: &mut Connection,
     project: &Project,
@@ -166,6 +168,7 @@ fn set_status_leased(
     status: Status,
     force: bool,
 ) -> tasq::Result<node::Node> {
+    let node = node::resolve(conn, project, reference)?;
     node::update(
         conn,
         project,
@@ -173,7 +176,7 @@ fn set_status_leased(
         Patch {
             status: Some(status),
             force,
-            lease: true,
+            lease: Some(node.id),
             ..Patch::default()
         },
     )

@@ -20,57 +20,6 @@ pub struct Entry<'a> {
     pub actor: &'a str,
 }
 
-impl<'a> Entry<'a> {
-    /// Запись о создании сущности.
-    pub fn created(project_id: i64, node_id: Option<i64>, summary: &'a str) -> Self {
-        Entry {
-            project_id,
-            node_id,
-            entity_type: "node",
-            entity_id: node_id.unwrap_or_default(),
-            action: "create",
-            field_name: None,
-            old_value: None,
-            new_value: None,
-            summary: Some(summary),
-            actor: "-",
-        }
-    }
-
-    /// Запись об изменении одного поля.
-    pub fn change(
-        project_id: i64,
-        node_id: i64,
-        field: &'a str,
-        old: Option<&'a str>,
-        new: Option<&'a str>,
-    ) -> Self {
-        Entry {
-            project_id,
-            node_id: Some(node_id),
-            entity_type: "node",
-            entity_id: node_id,
-            action: "update",
-            field_name: Some(field),
-            old_value: old,
-            new_value: new,
-            summary: None,
-            actor: "-",
-        }
-    }
-
-    pub fn with_actor(mut self, actor: &'a str) -> Self {
-        self.actor = actor;
-        self
-    }
-
-    pub fn with_entity(mut self, entity_type: &'a str, entity_id: i64) -> Self {
-        self.entity_type = entity_type;
-        self.entity_id = entity_id;
-        self
-    }
-}
-
 /// Пишет строку аудита. Вызывается из той же транзакции, что и сама мутация.
 pub fn log(conn: &Connection, entry: &Entry<'_>) -> Result<i64> {
     conn.execute(

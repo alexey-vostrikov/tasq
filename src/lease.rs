@@ -454,6 +454,25 @@ struct StoredAttempt {
     dot_id: String,
 }
 
+/// Узел, на который у вызывающего есть живая аренда с этим токеном.
+///
+/// `None` — токен неизвестен, закрыт, просрочен или принадлежит другому проекту.
+/// Нужен там, где правка узла требует аренды: наличие строки `token` в запросе
+/// само по себе правом не является.
+pub fn live_node(conn: &Connection, project: &Project, token: &str) -> Result<Option<i64>> {
+    let now_text = now_iso();
+    Ok(conn
+        .query_row(
+            "SELECT a.node_id FROM attempts a
+             JOIN nodes n ON n.id = a.node_id
+             WHERE a.token = ?1 AND a.ended_at IS NULL AND a.expires_at > ?2
+               AND n.project_id = ?3 AND n.deleted_at IS NULL",
+            params![token, now_text, project.id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 fn load_attempt(conn: &Connection, token: &str) -> Result<StoredAttempt> {
     conn.query_row(
         "SELECT a.id, a.node_id, a.attempt_no, a.holder, a.token, a.started_at, a.expires_at,

@@ -140,8 +140,8 @@ pub fn save(conn: &mut Connection, project: &Project, req: SaveNote<'_>) -> Resu
             params![title, content, note_type, node_id, now, id],
         )?;
         if old_title != title {
-            // Заметка может быть не привязана к узлу: `Entry::change` принимает обязательный
-            // node_id, а `unwrap_or_default()` дал бы 0 и нарушил внешний ключ лога.
+            // Заметка может быть не привязана к узлу: в логе node_id тогда NULL.
+            // Подставлять 0 нельзя — это нарушит внешний ключ activity_log.node_id.
             activity::log(
                 &tx,
                 &Entry {
@@ -278,30 +278,33 @@ pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<Vec<N
 }
 
 /// Удаляет заметку. Возвращает `true`, если запись была.
-pub fn delete(conn: &mut Connection, project: &Project, id: i64, actor: &str) -> Result<bool> {
+/// Удаляет заметку.
+///
+/// Заметки не удаляются мягко: у них нет ни статуса, ни детей, и восстанавливать
+/// нечего. Отсутствующая заметка — отказ из `by_id`, поэтому «удалено ли что-то»
+/// здесь не возвращается: после успешного поиска строка есть всегда.
+pub fn delete(conn: &mut Connection, project: &Project, id: i64, actor: &str) -> Result<()> {
     let note = by_id(conn, project, id)?;
     let tx = crate::db::write_tx(conn)?;
-    let removed = tx.execute(
+    tx.execute(
         "DELETE FROM notes WHERE id = ?1 AND project_id = ?2",
         params![id, project.id],
     )?;
-    if removed > 0 {
-        activity::log(
-            &tx,
-            &Entry {
-                project_id: project.id,
-                node_id: note.node_id,
-                entity_type: "note",
-                entity_id: id,
-                action: "delete",
-                field_name: None,
-                old_value: Some(note.title.as_str()),
-                new_value: None,
-                summary: None,
-                actor,
-            },
-        )?;
-    }
+    activity::log(
+        &tx,
+        &Entry {
+            project_id: project.id,
+            node_id: note.node_id,
+            entity_type: "note",
+            entity_id: id,
+            action: "delete",
+            field_name: None,
+            old_value: Some(note.title.as_str()),
+            new_value: None,
+            summary: None,
+            actor,
+        },
+    )?;
     tx.commit()?;
-    Ok(removed > 0)
+    Ok(())
 }

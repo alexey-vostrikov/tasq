@@ -350,8 +350,10 @@ pub struct Patch<'a> {
     pub branch: Option<&'a str>,
     pub force: bool,
     pub description_locked: Option<bool>,
-    /// Право выставить `in_progress`: только у живой аренды (M2).
-    pub lease: bool,
+    /// Узел, на который у вызывающего есть живая аренда. Право выставить
+    /// `in_progress` есть только у неё, и только на свой узел: флаг «я с арендой»
+    /// позволял ставить чужой узел в работу по любому токену.
+    pub lease: Option<i64>,
     pub actor: Option<&'a str>,
 }
 
@@ -420,7 +422,7 @@ pub fn update(
         });
     }
     if let Some(Status::InProgress) = patch.status
-        && !patch.lease
+        && patch.lease != Some(node.id)
     {
         return Err(Error::LeaseRequired);
     }

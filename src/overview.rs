@@ -424,7 +424,8 @@ pub fn bulk_status(
             node::Patch {
                 status: Some(target),
                 force,
-                lease: target == Status::InProgress,
+                // Массовая правка аренды не держит: `in_progress` через неё запрещён.
+                lease: None,
                 actor: Some(actor),
                 ..node::Patch::default()
             },

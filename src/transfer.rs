@@ -804,6 +804,7 @@ pub fn import_saga(
     conn: &mut Connection,
     project: &Project,
     document: &Value,
+    mode: Mode,
     actor: &str,
 ) -> Result<Imported> {
     let version = document
@@ -1025,6 +1026,23 @@ pub fn import_saga(
 
     // Запись.
     let tx = crate::db::write_tx(conn)?;
+    // `replace` обязан очистить проект: без этого повторный импорт падал на
+    // `UNIQUE constraint failed: nodes.project_id, nodes.path`, то есть режим
+    // молча не работал, а вызывающий видел ошибку хранилища.
+    if mode == Mode::Replace {
+        tx.execute(
+            "DELETE FROM nodes WHERE project_id = ?1",
+            params![project.id],
+        )?;
+        tx.execute(
+            "DELETE FROM notes WHERE project_id = ?1",
+            params![project.id],
+        )?;
+        tx.execute(
+            "DELETE FROM templates WHERE project_id = ?1",
+            params![project.id],
+        )?;
+    }
     let mut id_by_path: HashMap<String, i64> = HashMap::new();
     for node in &flat {
         let parent_id = node
@@ -1176,7 +1194,7 @@ pub fn import_saga(
     tx.commit()?;
 
     Ok(Imported {
-        mode: "saga".to_string(),
+        mode: format!("saga {}", mode.as_str()),
         nodes_created: flat.len(),
         nodes_skipped: 0,
         edges: edge_count,
