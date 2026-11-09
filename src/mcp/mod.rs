@@ -27,6 +27,40 @@ use profile::Profile;
 ///
 /// Своё соединение к тому же файлу, а не общий `Connection`: rusqlite не `Sync`, и делить
 /// его между потоками пришлось бы под мьютексом, который блокировал бы обработку вызовов.
+/// Решение «пора предупреждать», отдельно от потока: его проверяет тест, а не время.
+///
+/// Сброс считается застрявшим, если кадры остаются неперелитыми несколько тиков подряд.
+/// Предупреждение печатается один раз на эпизод, иначе stderr превращается в поток
+/// одинаковых строк, и его перестают читать.
+#[derive(Default)]
+struct Stall {
+    silent_ticks: u32,
+    warned: bool,
+}
+
+impl Stall {
+    /// Порог тиков до первого предупреждения: короткая заминка на чужой транзакции —
+    /// норма, длинная означает, что окно потерь растёт.
+    const TICKS_BEFORE_WARNING: u32 = 3;
+
+    fn observe(&mut self, pending: i64) -> Option<&'static str> {
+        if pending == 0 {
+            self.silent_ticks = 0;
+            self.warned = false;
+            return None;
+        }
+        self.silent_ticks += 1;
+        if self.silent_ticks >= Self::TICKS_BEFORE_WARNING && !self.warned {
+            self.warned = true;
+            return Some(
+                "tasq mcp: journal is not being flushed: another connection holds a read \
+                 transaction, so data stays unwritten until it finishes",
+            );
+        }
+        None
+    }
+}
+
 struct Flusher {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -50,8 +84,7 @@ impl Flusher {
                 // Спим короткими кусками, чтобы остановка не ждала целый интервал.
                 let slice = Duration::from_millis(200);
                 let mut waited = Duration::ZERO;
-                let mut stalled = 0;
-                let mut warned = false;
+                let mut stall = Stall::default();
                 while !flag.load(Ordering::Relaxed) {
                     std::thread::sleep(slice);
                     waited += slice;
@@ -60,25 +93,9 @@ impl Flusher {
                     }
                     waited = Duration::ZERO;
                     match crate::db::checkpoint(&conn) {
-                        Ok(_) => {
-                            // Сброс «не прошёл», если кадры остались: значит другое соединение
-                            // держит читательскую транзакцию и журнал нельзя перелить в базу.
-                            // Молчать об этом нельзя — окно потерь растёт без предела.
-                            match crate::db::pending_frames(&conn) {
-                                Ok(0) => {
-                                    stalled = 0;
-                                    warned = false;
-                                }
-                                Ok(_) => {
-                                    stalled += 1;
-                                    if stalled >= 3 && !warned {
-                                        eprintln!(
-                                            "tasq mcp: journal is not being flushed: another connection holds a read transaction, so data stays unwritten until it finishes"
-                                        );
-                                        warned = true;
-                                    }
-                                }
-                                Err(err) => eprintln!("tasq mcp: journal state unknown: {err}"),
+                        Ok(pending) => {
+                            if let Some(warning) = stall.observe(pending) {
+                                eprintln!("{warning}");
                             }
                         }
                         Err(err) => eprintln!("tasq mcp: checkpoint failed: {err}"),
@@ -343,4 +360,50 @@ pub fn serve(
         ),
     }
     Ok(rpc::serve(&mut server)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stall;
+
+    /// Заминка на один-два тика — норма и повод молчать.
+    #[test]
+    fn short_stall_is_silent() {
+        let mut stall = Stall::default();
+        assert_eq!(stall.observe(11), None);
+        assert_eq!(stall.observe(11), None);
+    }
+
+    /// Третий тик подряд с неперелитыми кадрами — предупреждение.
+    #[test]
+    fn a_long_stall_warns_once() {
+        let mut stall = Stall::default();
+        assert_eq!(stall.observe(11), None);
+        assert_eq!(stall.observe(11), None);
+        let warning = stall.observe(11).expect("третий тик предупреждает");
+        assert!(
+            warning.contains("journal is not being flushed"),
+            "{warning}"
+        );
+        // Второй раз то же самое не печатается: иначе поток строк, который не читают.
+        assert_eq!(stall.observe(11), None);
+        assert_eq!(stall.observe(11), None);
+    }
+
+    /// Успешный сброс сбрасывает счётчик: предупреждение должно прозвучать снова,
+    /// если застревание повторится.
+    #[test]
+    fn a_successful_flush_rearms_the_warning() {
+        let mut stall = Stall::default();
+        stall.observe(11);
+        stall.observe(11);
+        assert!(stall.observe(11).is_some());
+        assert_eq!(stall.observe(0), None, "сброс прошёл");
+        assert_eq!(stall.observe(11), None, "счёт тиков начат заново");
+        assert_eq!(stall.observe(11), None);
+        assert!(
+            stall.observe(11).is_some(),
+            "новый эпизод предупреждает снова"
+        );
+    }
 }

@@ -108,17 +108,7 @@ pub fn open_light(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Число несохранённых кадров журнала: 0 — всё уже в базе.
-pub fn pending_frames(conn: &Connection) -> Result<i64> {
-    let (busy, log, checkpointed): (i64, i64, i64) =
-        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-    let _ = busy;
-    Ok(log - checkpointed)
-}
-
-/// Сбрасывает журнал на диск и усекает его.
+/// Сбрасывает журнал на диск и усекает его; возвращает число неперелитых кадров.
 ///
 /// Зачем это нужно при `synchronous = NORMAL`: в WAL-режиме коммит не делает fsync, а лишь
 /// дописывает кадры в журнал. Пока не случится checkpoint, данные живут в кэше страниц и
@@ -127,22 +117,19 @@ pub fn pending_frames(conn: &Connection) -> Result<i64> {
 /// ограничивается интервалом между вызовами этой функции, то есть временем, а не объёмом
 /// записи.
 ///
-/// README §17: допустимая потеря — несколько секунд работы.
+/// Возвращаемое значение — размер окна потерь после вызова: `0` значит «всё в базе».
+/// Успешный TRUNCATE рапортует о себе нулями (журнал уже усечён), поэтому судить по числу
+/// скопированных кадров нельзя — только по остатку.
 pub fn checkpoint(conn: &Connection) -> Result<i64> {
-    // TRUNCATE усечёт журнал, только когда нет активных читателей; иначе остаётся
-    // PASSIVE — он тоже копирует кадры и делает fsync, но журнал не обнуляет.
-    let (busy, log, checkpointed): (i64, i64, i64) =
+    // TRUNCATE переливает кадры и, когда читателей нет, обнуляет журнал. При занятом
+    // читателе он переливает ровно столько же, сколько PASSIVE (замер: обе — 3 из 7
+    // кадров), но файл не усекает; поэтому отдельная запасная ветка ничего не добавляет,
+    // и остаток считается по числам этого же вызова.
+    let (_, log, copied): (i64, i64, i64) =
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
-    if busy != 0 {
-        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            let _: (i64, i64, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
-            Ok(())
-        })?;
-    }
-    let _ = log;
-    Ok(checkpointed)
+    Ok(log - copied)
 }
 
 /// Регистрирует Unicode-осведомлённые `uni_lower` и `UNICODE_NOCASE`.
@@ -395,8 +382,9 @@ mod tests {
         };
         assert!(wal(&db_path) > 0, "после коммита кадры в журнале");
 
-        checkpoint(&conn).expect("checkpoint");
+        let pending = checkpoint(&conn).expect("checkpoint");
         assert_eq!(wal(&db_path), 0, "после checkpoint журнал усечён");
+        assert_eq!(pending, 0, "неперелитых кадров не осталось");
 
         // Данные читаются из основного файла новым соединением.
         let fresh = open(&db_path).expect("open fresh");
@@ -408,5 +396,52 @@ mod tests {
             )
             .expect("count");
         assert_eq!(count, 1);
+    }
+
+    /// Читатель, удержавший транзакцию, не даёт усечь журнал: TRUNCATE возвращает busy,
+    /// и функция обязана отрапортовать остаток кадров, а не ноль. Именно по этому числу
+    /// поток сброса решает предупредить, что окно потерь растёт.
+    #[test]
+    fn a_held_reader_leaves_pending_frames() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-checkpoint-held-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let outcome = init(&dir, "HELD", "checkpoint").expect("init");
+        let db_path = std::path::PathBuf::from(&outcome.db_path);
+
+        let flusher = open_light(&db_path).expect("flusher");
+        let mut writer = open(&db_path).expect("writer");
+
+        // Читатель начинает и не заканчивает: транзакция держится до конца теста.
+        let mut reader = open(&db_path).expect("reader");
+        let tx = reader.transaction().expect("read tx");
+        let before: i64 = tx
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .expect("count");
+
+        let txw = write_tx(&mut writer).expect("write tx");
+        txw.execute(
+            "INSERT INTO activity_log (project_id, entity_type, entity_id, action, created_at)
+             VALUES (1, 'probe', 1, 'held', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .expect("insert");
+        txw.commit().expect("commit");
+
+        let pending = checkpoint(&flusher).expect("checkpoint");
+        assert!(
+            pending > 0,
+            "при занятом читателе кадры остаются неперелитыми: {pending}"
+        );
+
+        // Отпустили читателя — тот же вызов переливает всё.
+        drop(tx);
+        drop(reader);
+        let after = checkpoint(&flusher).expect("checkpoint after release");
+        assert_eq!(after, 0, "после освобождения остатка нет");
+        assert_eq!(before, 0, "узлов не было — фикстура чистая");
     }
 }

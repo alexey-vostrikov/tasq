@@ -1,3 +1,7 @@
 /target
 /.tasq/
 *.bak-*
+
+# Отчёты замеров (crapper, покрытие): не артефакты репозитория
+/.metrics/
+/coverage/
