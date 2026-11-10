@@ -197,6 +197,10 @@ pub fn claim(
     }
 
     let node = node::resolve(conn, project, reference)?;
+    // Освобождение мёртвых аренд этого проекта — на пути записи, а не только по команде
+    // `doctor --gc`. Целевой узел исключён: ветка ниже вытесняет его сама и сообщает об этом
+    // в `superseded`, а сборка отняла бы у неё эту информацию.
+    release_expired(conn, project, Some(node.id))?;
     if matches!(
         node.stored_status(),
         crate::status::Status::Done | crate::status::Status::Cancelled
@@ -590,17 +594,40 @@ pub fn release(
 
 /// Закрывает просроченные попытки и снимает их резервы (README §8.3).
 ///
-/// Нужен только для порядка в логе и учёте времени: захват проходит и без него,
-/// потому что статус выводится из времени аренды.
+/// Явная команда `doctor --gc`. Тот же механизм работает и сам — [`release_expired`]
+/// вызывается на путях записи, поэтому аренды мёртвых сессий не накапливаются.
 pub fn gc(conn: &mut Connection, project: &Project) -> Result<usize> {
+    release_expired(conn, project, None)
+}
+
+/// Автоматическое освобождение узлов с истёкшей арендой.
+///
+/// Зачем это нужно, если представление и так считает истёкшую аренду недействительной:
+/// представление чинит ЧТЕНИЕ, а хранимый `nodes.status` остаётся `in_progress`, попытка —
+/// открытой, резервы — не снятыми. Пока их никто не закрыл, `doctor` показывает «просроченные
+/// попытки», `time` считает часы по незакрытой аренде, а `uq_attempts_live` держит строку,
+/// которую никто не обслуживает. Поэтому сборка мусора идёт на путях записи: аренды мёртвых
+/// сессий убираются тогда, когда система всё равно пишет.
+///
+/// `exclude_node` — узел, который вызывающий разбирает сам. Нужен `claim`-у: он вытесняет
+/// истёкшую попытку целевого узла отдельной веткой и сообщает об этом в `superseded`, а
+/// предварительная сборка отняла бы у него эту информацию.
+///
+/// Возвращает число закрытых попыток.
+pub fn release_expired(
+    conn: &mut Connection,
+    project: &Project,
+    exclude_node: Option<i64>,
+) -> Result<usize> {
     let now_text = now_iso();
     let expired: Vec<(i64, i64, String)> = {
         let mut stmt = conn.prepare(
             "SELECT a.id, a.node_id, a.holder FROM attempts a
              JOIN nodes n ON n.id = a.node_id
-             WHERE n.project_id = ?1 AND a.ended_at IS NULL AND a.expires_at <= ?2",
+             WHERE n.project_id = ?1 AND a.ended_at IS NULL AND a.expires_at <= ?2
+               AND (?3 IS NULL OR a.node_id <> ?3)",
         )?;
-        stmt.query_map(params![project.id, now_text], |row| {
+        stmt.query_map(params![project.id, now_text, exclude_node], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -620,9 +647,13 @@ pub fn gc(conn: &mut Connection, project: &Project) -> Result<usize> {
              WHERE attempt_id = ?2 AND released_at IS NULL",
             params![now_text, attempt_id],
         )?;
-        // Узел возвращается в todo, только если он не закрыт руками за это время.
+        // Узел возвращается в очередь, только если его не закрыли руками за это время.
+        //
+        // Статус выбирается по виду узла: у эпика `todo` не бывает (§7), его место — `planned`.
+        // То же правило, что в `status::allowed_for`; согласованность проверяется тестом.
         tx.execute(
-            "UPDATE nodes SET status = 'todo', updated_at = ?1
+            "UPDATE nodes SET status = CASE WHEN kind = 'epic' THEN 'planned' ELSE 'todo' END,
+                              updated_at = ?1
              WHERE id = ?2 AND status = 'in_progress'
                AND NOT EXISTS (SELECT 1 FROM attempts WHERE node_id = ?2 AND ended_at IS NULL)",
             params![now_text, node_id],

@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 5;
 pub const DB_DIR: &str = ".tasq";
 pub const DB_FILE: &str = "tasq.db";
 
@@ -19,6 +19,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../migrations/0002_search_and_time.sql")),
     (3, include_str!("../migrations/0003_status_funnel.sql")),
     (4, include_str!("../migrations/0004_status_registry.sql")),
+    (5, include_str!("../migrations/0005_expired_lease.sql")),
 ];
 
 /// Время в UTC, ровно в том виде, в каком его печатает `strftime('%Y-%m-%dT%H:%M:%fZ','now')`,

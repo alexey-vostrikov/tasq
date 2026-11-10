@@ -341,11 +341,23 @@ fn expired_leases_do_not_block_and_gc_tidies_them() {
     )
     .expect("simulate expiry");
 
-    // статус уже не in_progress: аренда выводится из времени
+    // Истёкшая аренда для читателя не существует: узел не в работе и никому не принадлежит.
+    //
+    // Раньше здесь ожидалось `in_progress` с пометкой «это ожидаемо»: представление брало любую
+    // открытую попытку, и узел выглядел занятым, пока кто-нибудь не запустит `doctor --gc`.
+    // Именно из-за этого узел исчезал из `next` навсегда (схема v5).
     let node = node::resolve(&conn, &project, &task.dot_id).expect("node");
     assert_eq!(
-        node.effective_status, "in_progress",
-        "хранимый статус остался in_progress — это ожидаемо"
+        node.effective_status, "todo",
+        "работа не идёт — узел должен быть в очереди"
+    );
+    assert_eq!(
+        node.lease_holder, None,
+        "мёртвый держатель не должен быть виден"
+    );
+    assert_eq!(
+        node.status, "in_progress",
+        "хранилище чистит сборка, а не чтение"
     );
 
     assert!(

@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v4**.
+Версия схемы: **v5**.
 
 ## Таблицы
 
@@ -306,11 +306,16 @@ SELECT
   n.*,
   CASE
     WHEN n.status IN ('done','cancelled') THEN n.status
+    -- Живая аренда: работа идёт прямо сейчас.
     WHEN EXISTS (
       SELECT 1 FROM attempts a
       WHERE a.node_id = n.id AND a.ended_at IS NULL
         AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
     ) THEN 'in_progress'
+    -- Аренда истекла, но попытку никто не закрыл: работа не идёт. Узел возвращается в очередь
+    -- в тот статус, который допустим для его вида.
+    WHEN n.status = 'in_progress' THEN
+      CASE WHEN n.kind = 'epic' THEN 'planned' ELSE 'todo' END
     WHEN n.status = 'blocked' OR EXISTS (
       SELECT 1 FROM edges e
       JOIN nodes b ON b.id = e.to_node
@@ -319,11 +324,14 @@ SELECT
     ) THEN 'blocked'
     ELSE n.status
   END AS effective_status,
+  -- Только живая попытка: истёкшая аренда для читателя не существует.
   (SELECT a.expires_at FROM attempts a
     WHERE a.node_id = n.id AND a.ended_at IS NULL
+      AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
     ORDER BY a.id DESC LIMIT 1) AS lease_expires_at,
   (SELECT a.holder FROM attempts a
     WHERE a.node_id = n.id AND a.ended_at IS NULL
+      AND a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
     ORDER BY a.id DESC LIMIT 1) AS lease_holder
 FROM nodes n
 ```
