@@ -11,6 +11,7 @@ use time::{Duration, OffsetDateTime};
 use crate::activity::{self, Entry};
 use crate::db::{self, iso_at, now_iso};
 use crate::error::{Error, Result};
+use crate::history;
 use crate::node;
 use crate::project::Project;
 use crate::resource;
@@ -346,6 +347,14 @@ pub fn claim(
         "UPDATE nodes SET status = 'in_progress', updated_at = ?1 WHERE id = ?2",
         params![now_text, node.id],
     )?;
+    history::record(
+        &tx,
+        node.id,
+        Some(node.status.as_str()),
+        "in_progress",
+        history::Cause::LeaseClaimed,
+        request.holder,
+    )?;
     activity::log(
         &tx,
         &Entry {
@@ -573,6 +582,19 @@ pub fn release(
         "UPDATE nodes SET status = ?1, updated_at = ?2 WHERE id = ?3",
         params![target.as_str(), now_text, node.id],
     )?;
+    // Завершение через аренду и добровольная сдача — разные причины: burn-up считает по ним
+    // работу разного смысла.
+    history::record(
+        &tx,
+        node.id,
+        Some(node.status.as_str()),
+        target.as_str(),
+        match outcome {
+            Outcome::Completed => history::Cause::LeaseCompleted,
+            Outcome::Released | Outcome::Failed => history::Cause::LeaseReleased,
+        },
+        attempt.holder.as_str(),
+    )?;
     activity::log(
         &tx,
         &Entry {
@@ -647,6 +669,26 @@ pub fn release_expired(
              WHERE attempt_id = ?2 AND released_at IS NULL",
             params![now_text, attempt_id],
         )?;
+        // Возврат в очередь после истечения — отдельный факт в истории: это не решение
+        // исполнителя, и в отчётах «не успел» должно отличаться от «сделал и отпустил».
+        //
+        // Статус читается ДО обновления: узел мог быть закрыт руками при живой аренде, и тогда
+        // перехода в очередь не было — записывать историю за него значило бы соврать.
+        let (stored, kind): (String, String) = tx.query_row(
+            "SELECT status, kind FROM nodes WHERE id = ?1",
+            params![node_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if stored == "in_progress" {
+            history::record(
+                &tx,
+                *node_id,
+                Some(&stored),
+                if kind == "epic" { "planned" } else { "todo" },
+                history::Cause::LeaseExpired,
+                holder,
+            )?;
+        }
         // Узел возвращается в очередь, только если его не закрыли руками за это время.
         //
         // Статус выбирается по виду узла: у эпика `todo` не бывает (§7), его место — `planned`.

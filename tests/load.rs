@@ -114,6 +114,29 @@ fn a_dump_restores_every_table_and_the_result_works() {
     assert_eq!(code, 0, "{found}");
     assert!(found.contains("ALPHA-1.2"), "поиск не работает: {found}");
 
+    // История переходов переехала вместе с узлами, а не осталась в источнике: иначе burn-up
+    // на восстановленной базе снова показал бы ноль закрытой работы.
+    let source_history: i64 = rusqlite::Connection::open(&source)
+        .expect("open source")
+        .query_row("SELECT COUNT(*) FROM node_status_history", [], |row| {
+            row.get(0)
+        })
+        .expect("count");
+    let restored_history: i64 = rusqlite::Connection::open(&target)
+        .expect("open target")
+        .query_row("SELECT COUNT(*) FROM node_status_history", [], |row| {
+            row.get(0)
+        })
+        .expect("count");
+    assert!(
+        source_history > 0,
+        "в источнике нет истории — тест ничего не проверяет"
+    );
+    assert_eq!(
+        source_history, restored_history,
+        "история переходов не переехала дампом"
+    );
+
     // Аренда жива: она восстановлена как состояние, а не как действие.
     let (code, shown, _) = run_in(&dir, &target, &["show", "DEV-1"]);
     assert_eq!(code, 0);

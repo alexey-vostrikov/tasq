@@ -112,6 +112,17 @@ fn the_dump_has_every_table_with_matching_counts() {
     // FTS-индексы в дамп не идут: они перестраиваются из nodes/notes.
     assert!(!tables.contains_key("nodes_fts"), "индекс попал в дамп");
     assert!(!tables.contains_key("notes_fts"), "индекс попал в дамп");
+    // Справочник статусов — часть схемы, а не данных: он создаётся миграцией и обязан
+    // совпадать с `Status::all()`. В дампе он был бы попыткой наложить данные на схему.
+    assert!(
+        !tables.contains_key("statuses"),
+        "справочник статусов попал в дамп"
+    );
+    // История переходов — данные, и она обязана ехать вместе с узлами.
+    assert!(
+        tables.contains_key("node_status_history"),
+        "история переходов не попала в дамп"
+    );
 
     for (table, expected) in db_counts(&dir) {
         let in_document = tables[&table].as_array().expect("array").len() as i64;

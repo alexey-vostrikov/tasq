@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v5**.
+Версия схемы: **v6**.
 
 ## Таблицы
 
@@ -106,13 +106,14 @@ CREATE TABLE meta (
 ### `node_status_history`
 
 ```sql
-CREATE TABLE node_status_history (
+CREATE TABLE "node_status_history" (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   node_id     INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   from_status TEXT REFERENCES statuses(name),
   to_status   TEXT NOT NULL REFERENCES statuses(name),
   cause       TEXT NOT NULL CHECK (cause IN ('manual','lease_claimed','lease_completed',
-                                             'lease_released','unblock','gc','import','restore')),
+                                             'lease_released','lease_expired','unblock',
+                                             'gc','import','restore')),
   at          TEXT NOT NULL,
   actor       TEXT
 )
@@ -474,6 +475,12 @@ CREATE INDEX idx_sessions_project ON sessions(project_key, last_seen_at)
 
 ```sql
 CREATE INDEX idx_status_history_node ON node_status_history(node_id, at)
+```
+
+### `idx_status_history_to`
+
+```sql
+CREATE INDEX idx_status_history_to ON node_status_history(to_status, at)
 ```
 
 ### `uq_attempts_live`

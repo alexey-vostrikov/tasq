@@ -316,10 +316,18 @@ CREATE TABLE node_status_history (
   from_status TEXT REFERENCES statuses(name),        -- NULL у первой записи узла
   to_status   TEXT NOT NULL REFERENCES statuses(name),
   cause TEXT NOT NULL CHECK (cause IN ('manual','lease_claimed','lease_completed',
-                                       'lease_released','unblock','gc','import','restore')),
+                                       'lease_released','lease_expired','unblock',
+                                       'gc','import','restore')),
   at TEXT NOT NULL, actor TEXT
 );
 ```
+
+Пишут историю **все** пути смены статуса, и каждый — со своей причиной: `node::update`
+(`manual`), `lease::claim` (`lease_claimed`), `lease::release` (`lease_completed` или
+`lease_released`), `lease::release_expired` (`lease_expired`), `edge::unlink` (`unblock`),
+`edge::clear_stale_blocked` (`gc`). Причина `lease_expired` отдельная намеренно: истёкшая аренда —
+не решение исполнителя, и в отчётах «не успел» должно отличаться от «сделал и отпустил».
+Переход в тот же статус не пишется: это не переход.
 
 **`sessions` — идентичность сессии, которой не было.** `attempts.holder` — имя агента: два
 параллельных процесса склеивались в одну сущность. `sessions.project_key` — привязка, которую

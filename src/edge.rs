@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::activity::{self, Entry};
 use crate::db::now_iso;
 use crate::error::{Error, Result};
+use crate::history;
 use crate::node::{self, Node};
 use crate::project::Project;
 
@@ -299,6 +300,14 @@ pub fn unlink(
                 params![now_iso(), from.id],
             )?;
             if changed > 0 {
+                history::record(
+                    &tx,
+                    from.id,
+                    Some("blocked"),
+                    "todo",
+                    history::Cause::Unblock,
+                    actor,
+                )?;
                 activity::log(
                     &tx,
                     &Entry {
@@ -663,6 +672,7 @@ pub fn clear_stale_blocked(conn: &mut Connection, project: &Project) -> Result<u
             params![now, id],
         )?;
         let dot = project.dot_id(path);
+        history::record(&tx, *id, Some("blocked"), "todo", history::Cause::Gc, "gc")?;
         activity::log(
             &tx,
             &Entry {

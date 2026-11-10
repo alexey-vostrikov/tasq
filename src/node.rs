@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::activity::{self, Entry};
 use crate::db::{self, now_iso};
 use crate::error::{Error, Result};
+use crate::history;
 use crate::project::Project;
 use crate::status::{Kind, Status, check_transition};
 
@@ -646,6 +647,18 @@ pub fn update(
     let actor = patch.actor.unwrap_or("-");
     for change in &changes {
         let is_status = change.column == "status";
+        // Факт перехода пишется здесь же: ручной переход — одна из причин, и он не должен
+        // отличаться от остальных тем, что кто-то забыл вторую таблицу.
+        if is_status {
+            history::record(
+                &tx,
+                node.id,
+                change.old.as_deref(),
+                change.new.as_deref().unwrap_or("-"),
+                history::Cause::Manual,
+                actor,
+            )?;
+        }
         let entry = Entry {
             project_id: project.id,
             node_id: Some(node.id),
