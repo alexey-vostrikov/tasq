@@ -390,6 +390,18 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Load a whole database from a dump (JSON or YAML by extension)
+    ///
+    /// Отдельное имя от `restore`: `restore` уже занято возвратом мягко удалённого узла,
+    /// и один глагол на два разных действия («верни строку» и «залей базу») — источник
+    /// дорогих опечаток.
+    Load {
+        /// Dump file: `.json` or `.yaml`/`.yml`
+        file: PathBuf,
+        /// Load into a database that already has nodes
+        #[arg(long)]
+        force: bool,
+    },
     /// Run the MCP server over stdio
     Mcp {
         /// Tool profile: full | agent | read-only | migration
@@ -2441,6 +2453,85 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 None => println!("{text}"),
             }
             Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Load { file, force } => {
+            let raw = std::fs::read_to_string(file)?;
+            // Формат чужого файла определяется расширением: дамп — состояние, и читать его
+            // «на угад» (то JSON, то YAML) значило бы принимать опечатку в имени за формат.
+            let document: serde_json::Value = match file.extension().and_then(|e| e.to_str()) {
+                Some("yaml" | "yml") => transfer::read_yaml(&raw)?,
+                _ => serde_json::from_str(&raw).map_err(|err| Error::InvalidValue {
+                    field: "file".to_string(),
+                    value: format!("not valid JSON: {err} (для YAML переименуйте файл в .yaml)"),
+                })?,
+            };
+
+            // База создаётся по явному `--db`; без него — `.tasq/tasq.db` в текущем каталоге.
+            // Поиск вверх здесь не годится: восстановление не должно молча переписать чужую
+            // базу, найденную выше по дереву.
+            let path = match cli.db.as_deref() {
+                Some(explicit) => explicit.to_path_buf(),
+                None => db::db_path_in(&std::env::current_dir()?),
+            };
+            if path.is_file() && !*force {
+                let conn = db::open_checked(&path)?;
+                let nodes: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
+                if nodes > 0 {
+                    return Err(Error::InvalidValue {
+                        field: "db".to_string(),
+                        value: format!(
+                            "{} уже содержит {nodes} узел(ов); восстановление затрёт их — \
+                             укажите другой --db или --force",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+
+            let mut conn = db::create_current(&path)?;
+            let report = transfer::restore(&mut conn, &document)?;
+            if cli.json {
+                print_json(&report);
+            } else {
+                println!(
+                    "restore v{} -> v{}: {}",
+                    report.schema_from,
+                    report.schema_to,
+                    if report.committed {
+                        "committed"
+                    } else {
+                        "rolled back"
+                    }
+                );
+                for table in &report.tables {
+                    if table.in_dump > 0 {
+                        println!(
+                            "  {:<14} {:>5} in dump  {:>5} inserted  {:>4} skipped",
+                            table.table, table.in_dump, table.inserted, table.skipped
+                        );
+                    }
+                }
+                if report.has_losses() {
+                    println!("  losses ({}):", report.losses.len());
+                    for loss in &report.losses {
+                        match &loss.address {
+                            Some(address) => {
+                                println!("    {:<14} {:<16} {}", loss.table, address, loss.reason)
+                            }
+                            None => println!("    {:<14} {:<16} {}", loss.table, "-", loss.reason),
+                        }
+                    }
+                }
+            }
+            // 3 — «данные не поместились целиком»: отличается от 1 (ошибка вызова) и от 0
+            // (всё перенесено), чтобы скрипт мог решить, продолжать ли редизайн.
+            Ok(if report.has_losses() {
+                ExitCode::from(3)
+            } else {
+                ExitCode::SUCCESS
+            })
         }
 
         Command::Import {

@@ -601,6 +601,22 @@ tasq import [ОПЦИИ]
 | `--from-saga` | — | — | Read a saga-mcp tracker_export file |
 | `--dry-run` | — | — | Validate and report without writing |
 
+## `load`
+
+Load a whole database from a dump (JSON or YAML by extension)
+
+Load a whole database from a dump (JSON or YAML by extension)
+
+Отдельное имя от `restore`: `restore` уже занято возвратом мягко удалённого узла, и один глагол на два разных действия («верни строку» и «залей базу») — источник дорогих опечаток.
+
+```
+tasq load [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--force` | — | — | Load into a database that already has nodes |
+
 ## `mcp`
 
 Run the MCP server over stdio

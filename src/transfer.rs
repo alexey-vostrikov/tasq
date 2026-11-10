@@ -15,6 +15,10 @@ use crate::db::now_iso;
 use crate::error::{Error, Result};
 use crate::project::Project;
 
+mod restore;
+
+pub use restore::{RestoreLoss, RestoreReport, TableRestore, restore};
+
 /// Метка формата нашего экспорта.
 pub const SCHEMA: &str = "tasq.export.v1";
 /// Поддерживаемые версии экспорта saga-mcp.

@@ -206,6 +206,20 @@ fn schema_version(conn: &Connection) -> Result<i64> {
     Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// Открывает (создавая при необходимости) базу и доводит её до текущей версии схемы.
+///
+/// Нужна восстановлению из дампа: там база создаётся с нуля, и проект в неё не заводится —
+/// он приходит из самого дампа. `init_at` для этого не годится: он создаёт проект, которого
+/// в дампе может не быть, и мешал бы вставке строк с их собственными ключами.
+pub fn create_current(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut conn = open(path)?;
+    apply_migrations(&mut conn)?;
+    Ok(conn)
+}
+
 /// Итог `tasq init`.
 #[derive(Debug, Serialize)]
 pub struct InitOutcome {
