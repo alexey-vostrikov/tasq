@@ -24,6 +24,11 @@ pub struct Context {
     pub active: Option<Project>,
     pub db_path: PathBuf,
     pub cwd: PathBuf,
+    /// Идентификатор этой сессии: свой у каждого MCP-процесса.
+    ///
+    /// По нему `next` знает, к какому проекту сессия привязана, а аренда — кто именно её взял.
+    /// Три параллельных сессии «hermes» различаются только этим полем: `holder` у них общий.
+    pub session: String,
 }
 
 impl Context {
@@ -583,17 +588,26 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&chain))
         }
         "tasq_next" => {
-            let project = ctx.project(args)?;
             let limit = arg_i64(args, "limit").unwrap_or(3).clamp(1, 20) as usize;
-            let candidates = edge::next_candidates(&ctx.conn, &project, limit)?;
-            Ok(text(&candidates))
+            // Явный `project` в аргументах сильнее привязки — как и в CLI.
+            if arg_str(args, "project").is_some() {
+                let project = ctx.project(args)?;
+                let candidates = edge::next_candidates(&ctx.conn, &project, limit)?;
+                return Ok(text(&candidates));
+            }
+            let affinity = crate::session::affinity(&ctx.conn, &ctx.session)?;
+            let next = edge::next_across(&ctx.conn, affinity.as_deref(), limit)?;
+            // Ответ остаётся массивом кандидатов: клиенты разбирают его как список, и смена
+            // формы сломала бы их ради сведений, которые умещаются в поле строки. Откуда взят
+            // кандидат, видно в `origin` каждого элемента (`affinity`/`fallback`/`unbound`).
+            Ok(text(&next.candidates))
         }
 
         // ------------------------------------------------ аренды
         "tasq_claim" => {
             let project = ctx.project(args)?;
             let holder = arg_holder(args);
-            let held = lease::claim(
+            let held = lease::claim_as(
                 &mut ctx.conn,
                 &project,
                 req_str(args, "ref")?,
@@ -605,6 +619,9 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     checkpoint: arg_str(args, "checkpoint"),
                     reservations: arg_resources(args),
                 },
+                // Взятие работы привязывает сессию к проекту: «работала здесь» — не то же
+                // самое, что «смотрела сюда».
+                Some(ctx.session.as_str()),
             )?;
             Ok(text(&held))
         }

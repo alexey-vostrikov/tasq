@@ -16,6 +16,7 @@ use tasq::mcp;
 use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::resource;
+use tasq::session;
 use tasq::status::{Kind, Status};
 use tasq::{activity, budget, burnup, comment, db, note, overview, template, transfer};
 
@@ -966,6 +967,39 @@ fn run_completions(shell: clap_complete::Shell, out: Option<&std::path::Path>) -
     Ok(ExitCode::SUCCESS)
 }
 
+/// Печать «что делать дальше» с указанием, откуда взялся кандидат.
+///
+/// Пометка нужна, чтобы переход «в своём проекте брать нечего, предлагаю чужой» не выглядел как
+/// обычная выдача: иначе человек не понимает, почему ему подсунули задачу из другого проекта,
+/// и решает, что фильтр сломан.
+fn print_candidates(candidates: &[edge::Candidate], origin: &[(String, edge::Origin)]) {
+    if candidates.is_empty() {
+        println!("nothing to pick up: every open node is blocked or leased");
+        return;
+    }
+    let fallback: Vec<&str> = origin
+        .iter()
+        .filter(|(_, place)| *place == edge::Origin::Fallback)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    if !fallback.is_empty() {
+        println!(
+            "nothing to pick up in your project; showing the rest: {}",
+            fallback.join(", ")
+        );
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        println!(
+            "{}. {:<18} {:<8} {}",
+            index + 1,
+            candidate.dot_id,
+            candidate.priority,
+            candidate.title
+        );
+        println!("   because {}", candidate.reason);
+    }
+}
+
 fn print_json<T: serde::Serialize>(value: &T) {
     println!(
         "{}",
@@ -1671,7 +1705,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let holder = holder.clone().unwrap_or_else(|| "cli".to_string());
             let resources = collect_resources(reserve, reserve_glob, reserve_logical, *shared);
-            let lease = lease::claim(
+            // Сессия — из `TASQ_SESSION`: CLI не имеет собственной идентичности, и придумывать
+            // её здесь значило бы делать новую сессию на каждый вызов (привязки тогда нет).
+            let session_id = session::from_env();
+            let lease = lease::claim_as(
                 &mut conn,
                 &project,
                 reference,
@@ -1683,6 +1720,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     checkpoint: checkpoint.as_deref(),
                     reservations: resources,
                 },
+                session_id.as_deref(),
             )?;
             if cli.json {
                 print_json(&lease);
@@ -1938,26 +1976,38 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         },
 
         Command::Next { limit } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
-            let candidates = edge::next_candidates(&conn, &project, *limit)?;
-            if cli.json {
-                print_json(&candidates);
-                return Ok(ExitCode::SUCCESS);
-            }
-            if candidates.is_empty() {
-                println!("nothing to pick up: every open node is blocked or leased");
-                return Ok(ExitCode::SUCCESS);
-            }
-            for (index, candidate) in candidates.iter().enumerate() {
-                println!(
-                    "{}. {:<18} {:<8} {}",
-                    index + 1,
-                    candidate.dot_id,
-                    candidate.priority,
-                    candidate.title
+            // Явный `--project` сильнее привязки: «покажи только этот проект» — осознанный
+            // запрос, и подмешивать к нему чужие задачи значило бы не выполнить его.
+            if let Some(key) = cli.project.as_deref() {
+                let (conn, project) = open(cli.db.as_deref(), Some(key))?;
+                let candidates = edge::next_candidates(&conn, &project, *limit)?;
+                if cli.json {
+                    print_json(&candidates);
+                    return Ok(ExitCode::SUCCESS);
+                }
+                print_candidates(
+                    &candidates,
+                    &[(project.key.clone(), edge::Origin::Affinity)],
                 );
-                println!("   because {}", candidate.reason);
+                return Ok(ExitCode::SUCCESS);
             }
+
+            let cwd = std::env::current_dir()?;
+            let path = db::discover(&cwd, cli.db.as_deref())?;
+            let conn = db::open_checked(&path)?;
+            // Привязка берётся из сессии; нет сессии — нет привязки, и проекты перечислены
+            // как есть (пометки «свой» тогда не существует).
+            let session_id = session::from_env();
+            let affinity = match &session_id {
+                Some(id) => session::affinity(&conn, id)?,
+                None => None,
+            };
+            let next = edge::next_across(&conn, affinity.as_deref(), *limit)?;
+            if cli.json {
+                print_json(&next.candidates);
+                return Ok(ExitCode::SUCCESS);
+            }
+            print_candidates(&next.candidates, &next.origin);
             Ok(ExitCode::SUCCESS)
         }
 

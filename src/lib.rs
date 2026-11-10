@@ -22,6 +22,7 @@ pub mod note;
 pub mod overview;
 pub mod project;
 pub mod resource;
+pub mod session;
 pub mod status;
 pub mod template;
 pub mod transfer;

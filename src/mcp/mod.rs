@@ -173,11 +173,16 @@ impl Server {
             }
             Err(err) => return Err(err),
         };
+        // Сессия заводится при открытии базы: у каждого MCP-процесса своя, и именно она
+        // различает три параллельных «hermes» с одинаковым holder.
+        let session = crate::session::new_id()?;
+        crate::session::ensure(&conn, &session, "mcp")?;
         Ok(tools::Context {
             conn,
             active,
             db_path,
             cwd: cwd.to_path_buf(),
+            session,
         })
     }
 
@@ -293,6 +298,13 @@ impl Server {
                     active: Some(project),
                     db_path,
                     cwd: self.cwd.clone(),
+                    // Идентификатор сессии переживает смену проекта: это та же сессия, просто
+                    // работает в другом месте.
+                    session: self
+                        .context
+                        .as_ref()
+                        .map(|context| context.session.clone())
+                        .unwrap_or_else(|| crate::session::new_id().unwrap_or_default()),
                 })
             }) {
                 Ok(context) => {

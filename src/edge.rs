@@ -727,6 +727,30 @@ pub struct Candidate {
     pub unblocks: i64,
     pub score: i64,
     pub reason: String,
+    /// Проект кандидата: заполняется, когда работа идёт по нескольким проектам.
+    ///
+    /// `None` при явно выбранном проекте — там он и так известен из запроса, и дублировать его
+    /// в каждой строке значило бы менять ответ ради сведений, которых вызывающий не терял.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Откуда предложен кандидат (свой проект или «дальше»): только при работе по нескольким.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+}
+
+/// Откуда взялся кандидат: свой проект сессии или чужой после исчерпания.
+///
+/// Вызывающий должен это показать — иначе переход «в своём брать нечего, дальше чужой» выглядит
+/// как обычная выдача, и человек не понимает, почему ему предлагают задачу из другого проекта.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// Проект, к которому привязана сессия.
+    Affinity,
+    /// Другой проект — предложен потому, что в своём брать нечего.
+    Fallback,
+    /// Привязки нет: проекты перечислены как есть.
+    Unbound,
 }
 
 /// Что брать дальше: узлы без живой аренды, без блокеров и незакрытые.
@@ -738,6 +762,14 @@ pub fn next_candidates(
     project: &Project,
     limit: usize,
 ) -> Result<Vec<Candidate>> {
+    let mut candidates = candidates_in(conn, project)?;
+    candidates.truncate(limit);
+    Ok(candidates)
+}
+
+/// Все кандидаты проекта, без обрезки: обрезка — дело вызывающего, потому что при работе по
+/// нескольким проектам резать надо ПОСЛЕ склейки.
+fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>> {
     let mut stmt = conn.prepare(
         "SELECT e.id, e.path, e.title, e.effective_status, e.priority, e.due_date, e.depth,
                 COALESCE((SELECT COUNT(*) FROM edges x JOIN nodes b ON b.id = x.to_node
@@ -815,11 +847,92 @@ pub fn next_candidates(
             unblocks,
             score,
             reason: reasons.join(", "),
+            // Заполняет вызывающий, который знает, идёт ли работа по нескольким проектам.
+            project: None,
+            origin: None,
         });
     }
     candidates.sort_by(|a, b| b.score.cmp(&a.score).then(a.dot_id.cmp(&b.dot_id)));
-    candidates.truncate(limit);
     Ok(candidates)
+}
+
+/// Что брать дальше с учётом привязки сессии к проекту.
+///
+/// Правило простое и повторяет то, как работает человек: пока в своём проекте есть что брать —
+/// берётся своё; когда там пусто — предлагаются остальные, и об этом говорится прямо.
+///
+/// `affinity` — ключ проекта, к которому привязана сессия (`None` — привязки нет).
+/// Порядок проектов при переборе — тот же, что в `project::list` (по id), чтобы ответ был
+/// воспроизводимым.
+pub fn next_across(conn: &Connection, affinity: Option<&str>, limit: usize) -> Result<NextAcross> {
+    let projects = crate::project::list(conn)?;
+    let mut per_project: Vec<(String, Vec<Candidate>)> = Vec::new();
+    for summary in &projects {
+        let Some(project) = crate::project::by_key(conn, &summary.key)? else {
+            continue;
+        };
+        per_project.push((summary.key.clone(), candidates_in(conn, &project)?));
+    }
+
+    // Привязка: если в своём проекте есть что брать — отдаём только его.
+    if let Some(key) = affinity
+        && let Some((_, own)) = per_project
+            .iter()
+            .find(|(name, _)| name == key)
+            .filter(|(_, candidates)| !candidates.is_empty())
+    {
+        let mut own: Vec<Candidate> = own
+            .iter()
+            .map(|candidate| Candidate {
+                project: Some(key.to_string()),
+                origin: Some(Origin::Affinity),
+                ..candidate.clone()
+            })
+            .collect();
+        own.truncate(limit);
+        return Ok(NextAcross {
+            candidates: own,
+            origin: vec![(key.to_string(), Origin::Affinity)],
+        });
+    }
+
+    // Своего либо нет, либо в нём пусто: остальные проекты, с пометкой почему.
+    let mut merged: Vec<Candidate> = Vec::new();
+    let mut origin: Vec<(String, Origin)> = Vec::new();
+    for (key, candidates) in &per_project {
+        // Сюда попадают, только если в своём проекте брать нечего (или привязки нет вовсе):
+        // любой кандидат здесь — предложение «дальше», а не своя работа.
+        let marked = if affinity.is_some() {
+            Origin::Fallback
+        } else {
+            Origin::Unbound
+        };
+        if !candidates.is_empty() {
+            origin.push((key.clone(), marked));
+        }
+        merged.extend(candidates.iter().map(|candidate| Candidate {
+            project: Some(key.clone()),
+            origin: Some(marked),
+            ..candidate.clone()
+        }));
+    }
+    merged.sort_by(|a, b| b.score.cmp(&a.score).then(a.dot_id.cmp(&b.dot_id)));
+    merged.truncate(limit);
+    Ok(NextAcross {
+        candidates: merged,
+        origin,
+    })
+}
+
+/// Ответ «что делать дальше» с указанием, откуда взялись кандидаты.
+///
+/// Отдельная структура, а не пара коллекций: кортеж из двух `Vec` в сигнатуре читается как
+/// «два списка непонятно чего», а вызывающему нужны именованные части.
+#[derive(Debug, Clone)]
+pub struct NextAcross {
+    pub candidates: Vec<Candidate>,
+    /// Проекты, из которых взяты кандидаты, и почему именно оттуда.
+    pub origin: Vec<(String, Origin)>,
 }
 
 #[cfg(test)]

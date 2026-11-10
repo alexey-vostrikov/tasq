@@ -15,6 +15,7 @@ use crate::history;
 use crate::node;
 use crate::project::Project;
 use crate::resource;
+use crate::session;
 
 /// Значение TTL по умолчанию и допустимые границы (README §8.1).
 pub const DEFAULT_TTL: i64 = 900;
@@ -158,6 +159,22 @@ fn open_attempt(conn: &Connection, node_id: i64) -> Result<Option<OpenAttempt>> 
         .optional()?)
 }
 
+/// Нарушен ли уникальный индекс живых попыток (`uq_attempts_live`), а не что-то другое.
+///
+/// SQLite не даёт отдельного кода для «нарушен этот индекс»: различать приходится по тексту
+/// расширенной ошибки. Проверять только код `SQLITE_CONSTRAINT` нельзя — под него попадают и
+/// внешние ключи, и NOT NULL, и тогда любая ошибка вставки выглядит как занятый узел.
+fn is_live_attempt_conflict(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(inner, message) => {
+            let text = message.as_deref().unwrap_or_default();
+            inner.code == rusqlite::ErrorCode::ConstraintViolation
+                && (text.contains("uq_attempts_live") || text.contains("attempts.node_id"))
+        }
+        _ => false,
+    }
+}
+
 fn is_expired(expires_at: &str, now: &str) -> bool {
     // Формат фиксированный, поэтому сравнение строк совпадает со сравнением моментов.
     expires_at <= now
@@ -187,6 +204,25 @@ pub fn claim(
     project: &Project,
     reference: &str,
     request: &ClaimRequest<'_>,
+) -> Result<Lease> {
+    claim_as(conn, project, reference, request, None)
+}
+
+/// То же, но сессия названа явно.
+///
+/// Сессия — необязательное понятие, поэтому она не поле `ClaimRequest`: иначе каждый вызов
+/// обязан был бы знать про сессии, даже когда их нет вовсе (CLI без `TASQ_SESSION`, простые
+/// скрипты). Здесь же решение принимает тот, у кого сессия есть.
+///
+/// Взятие работы — единственное место, где сессия ПРИВЯЗЫВАЕТСЯ к проекту: «работала в проекте»
+/// и «смотрела на проект» — разные вещи, и привязка по просмотру тянула бы сессию туда, куда
+/// она заглянула случайно.
+pub fn claim_as(
+    conn: &mut Connection,
+    project: &Project,
+    reference: &str,
+    request: &ClaimRequest<'_>,
+    session: Option<&str>,
 ) -> Result<Lease> {
     validate_ttl(request.ttl_seconds)?;
     validate_checkpoint(request.checkpoint)?;
@@ -225,6 +261,14 @@ pub fn claim(
 
     let tx = db::write_tx(conn)?;
 
+    // Сессию заводим ДО вставки попытки: `attempts.session_id` ссылается на `sessions`, и
+    // вставка аренды с неизвестной сессией нарушила бы внешний ключ. Ошибка при этом выходила
+    // наружу как «узел занят» — то есть как ложное объяснение вместо настоящей причины.
+    // Привязка к проекту — отдельно и в конце: она ставится взятием работы, а не попыткой взять.
+    if let Some(session) = session {
+        session::ensure(&tx, session, request.holder)?;
+    }
+
     // Предыдущая попытка: живую вытесняем только по --steal, просроченную — всегда.
     let previous = open_attempt(&tx, node.id)?;
     let mut superseded = None;
@@ -250,8 +294,8 @@ pub fn claim(
     }
 
     // Чекпойнт берётся у последней закрытой попытки — в том числе у только что вытесненной.
-    let inherited = match previous {
-        Some(attempt) => attempt.checkpoint,
+    let inherited = match &previous {
+        Some(attempt) => attempt.checkpoint.clone(),
         None => tx
             .query_row(
                 "SELECT checkpoint FROM attempts
@@ -294,8 +338,8 @@ pub fn claim(
 
     tx.execute(
         "INSERT INTO attempts (node_id, attempt_no, holder, token, ttl_seconds,
-                               started_at, expires_at, checkpoint)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                               started_at, expires_at, checkpoint, session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             node.id,
             attempt_no,
@@ -305,17 +349,29 @@ pub fn claim(
             now_text,
             expires_at,
             request.checkpoint,
+            session,
         ],
     )
-    .map_err(|err| match err {
-        // Гонка двух процессов: уникальный индекс живых попыток решает исход.
-        rusqlite::Error::SqliteFailure(_, _) => Error::ActiveAttemptExists {
-            dot_id: node.dot_id.clone(),
-            holder: "another process".to_string(),
-            expires_at: "-".to_string(),
-            attempt_no,
-        },
-        other => Error::from(other),
+    .map_err(|err| {
+        // Гонка двух процессов: уникальный индекс живых попыток решает исход. Ловится именно
+        // он, а не любая ошибка SQLite: иначе нарушение внешнего ключа или типа выходило наружу
+        // как «узел занят» с пустым сроком, и настоящая причина терялась.
+        if is_live_attempt_conflict(&err) {
+            Error::ActiveAttemptExists {
+                dot_id: node.dot_id.clone(),
+                holder: previous
+                    .as_ref()
+                    .map(|attempt| attempt.holder.clone())
+                    .unwrap_or_else(|| "another process".to_string()),
+                expires_at: previous
+                    .as_ref()
+                    .map(|attempt| attempt.expires_at.clone())
+                    .unwrap_or_else(|| "-".to_string()),
+                attempt_no,
+            }
+        } else {
+            Error::from(err)
+        }
     })?;
     let attempt_id = tx.last_insert_rowid();
 
@@ -370,6 +426,12 @@ pub fn claim(
             actor: request.holder,
         },
     )?;
+
+    // Привязка сессии — в той же транзакции, что и аренда: иначе при откате аренды осталась бы
+    // сессия, «работающая» в проекте, где ничего не взято.
+    if let Some(session) = session {
+        session::bind(&tx, session, project)?;
+    }
 
     tx.commit()?;
 
