@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v7**.
+Версия схемы: **v8**.
 
 ## Таблицы
 
@@ -352,10 +352,14 @@ WHERE n.deleted_at IS NULL
 
 ```sql
 CREATE VIEW v_node_progress AS
-WITH RECURSIVE tree(ancestor_id, node_id) AS (
-  SELECT id, id FROM nodes
+WITH RECURSIVE tree(ancestor_id, node_id, steps) AS (
+  SELECT id, id, 0 FROM nodes
   UNION ALL
-  SELECT t.ancestor_id, n.id FROM tree t JOIN nodes n ON n.parent_id = t.node_id
+  SELECT t.ancestor_id, n.id, t.steps + 1
+  FROM tree t
+  JOIN nodes n ON n.parent_id = t.node_id
+  -- Сторож: на цикле или на дереве глубже предела обход прекращается, а не идёт по кругу.
+  WHERE t.steps < 64
 )
 SELECT
   t.ancestor_id                                                       AS node_id,

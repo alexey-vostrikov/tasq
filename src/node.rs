@@ -866,6 +866,45 @@ pub fn subtree(conn: &Connection, project: &Project, reference: &str) -> Result<
     )
 }
 
+/// Сделает ли перенос `node_id` под `target` цикл в дереве.
+///
+/// Обход идёт вверх от целевого родителя к корню: если на этом пути встречается сам
+/// переносимый узел, он является предком цели — перенос замкнул бы дерево на себя.
+///
+/// Обход ограничен `MAX_DEPTH + 1` шагов, а не «пока не кончится»: в испорченной базе
+/// (цикл уже есть, база записана другой версией бинаря или руками) безусловный подъём повесил
+/// бы команду. Ограничение — страховка от чужой ошибки, а не правило.
+fn creates_cycle(conn: &Connection, node_id: i64, target: i64) -> Result<bool> {
+    let mut current = Some(target);
+    for _ in 0..=MAX_DEPTH {
+        let Some(id) = current else {
+            return Ok(false);
+        };
+        if id == node_id {
+            return Ok(true);
+        }
+        current = conn
+            .query_row(
+                "SELECT parent_id FROM nodes WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+    Ok(false)
+}
+
+/// dot-ID узла по id — для сообщения об ошибке.
+fn parent_dot_id(conn: &Connection, project: &Project, id: i64) -> Result<String> {
+    let path: Option<String> = conn
+        .query_row("SELECT path FROM nodes WHERE id = ?1", params![id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(path.map_or_else(|| format!("#{id}"), |path| project.dot_id(&path)))
+}
+
 /// Перенос узла под другого родителя; пути узла и потомков пересчитываются.
 pub fn move_node(
     conn: &mut Connection,
@@ -890,6 +929,24 @@ pub fn move_node(
     };
 
     let tx = db::write_tx(conn)?;
+    // Проверка повторяется ВНУТРИ транзакции, и уже обходом по `parent_id`, а не по префиксу
+    // пути. Причин две.
+    //
+    // 1. Гонка. Проверка выше идёт до `BEGIN IMMEDIATE`, поэтому между ней и записью другой
+    //    писатель мог успеть перенести узел — и цикл в дереве образовался бы уже после
+    //    проверки. Цикл здесь не косметика: `path` потом считается рекурсивно, и дерево
+    //    перестаёт читаться.
+    // 2. Зависимость от хранимого пути. Префикс работает, пока `path` — колонка. В v4 путь
+    //    становится вычисляемым, и проверка обязана опираться на структуру (`parent_id`),
+    //    иначе тихо исчезнет вместе с колонкой.
+    if let Some(target) = parent_id
+        && creates_cycle(&tx, node.id, target)?
+    {
+        return Err(Error::MoveIntoSelf {
+            dot_id: node.dot_id.clone(),
+            target: parent_dot_id(&tx, &project, target)?,
+        });
+    }
     // Номер сохраняется, если он свободен у нового родителя: тогда dot-ID не меняется.
     // Если занят — берётся следующий свободный. Молча падать на `UNIQUE constraint` нельзя:
     // перенос в уже занятую ветку — обычная операция, а не ошибка вызывающего.
