@@ -401,7 +401,15 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
         foreign_key_violations,
         projects: scalar("SELECT COUNT(*) FROM projects")?,
         nodes: scalar("SELECT COUNT(*) FROM nodes WHERE deleted_at IS NULL")?,
-        live_attempts: scalar("SELECT COUNT(*) FROM attempts WHERE ended_at IS NULL")?,
+        // Живая аренда — та, что ещё действует по времени, а не любая незакрытая попытка.
+        // Раньше считались все `ended_at IS NULL`, и отчёт называл живыми ровно те аренды,
+        // которые `doctor --gc` в следующей строке закрывал как просроченные: два числа
+        // одного отчёта противоречили друг другу.
+        live_attempts: conn.query_row(
+            "SELECT COUNT(*) FROM attempts WHERE ended_at IS NULL AND expires_at > ?1",
+            rusqlite::params![now],
+            |row| row.get::<_, i64>(0),
+        )?,
         expired_attempts,
         orphan_reservations,
         // Условия «схема не новее поддерживаемой» здесь нет намеренно: `doctor` открывает

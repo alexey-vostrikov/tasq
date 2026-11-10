@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 use rusqlite::Connection;
 
@@ -309,6 +310,128 @@ fn a_node_can_be_claimed_again_after_expiry() {
         node_by_ref(&conn, &project, &task.dot_id).effective_status,
         "in_progress"
     );
+}
+
+/// Отчёт `doctor` не должен называть живыми те аренды, которые сам же зовёт просроченными.
+///
+/// Раньше `live_attempts` считал все `ended_at IS NULL`: на базе с одной просроченной арендой
+/// отчёт печатал «1 live lease(s)» и следом «1 expired attempt(s)» — два числа одного отчёта
+/// противоречили друг другу.
+#[test]
+fn doctor_counts_only_unexpired_leases_as_live() {
+    let (mut conn, project, _epic, task) = fixture("doctor");
+    claim(&mut conn, &project, &task.dot_id, 600);
+    let bin = env!("CARGO_BIN_EXE_tasq");
+    let db = conn
+        .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+        .expect("db path");
+    drop(conn);
+
+    let report = |db: &str| -> serde_json::Value {
+        let out = Command::new(bin)
+            .args(["--db", db, "doctor", "--json"])
+            .output()
+            .expect("run doctor");
+        serde_json::from_slice(&out.stdout).expect("json")
+    };
+
+    let live = report(&db);
+    assert_eq!(
+        live["live_attempts"], 1,
+        "живая аренда должна считаться: {live}"
+    );
+
+    // Просрочиваем её — теперь живой не остаётся ни одной.
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "UPDATE attempts SET expires_at = '2000-01-01T00:00:00.000Z' WHERE ended_at IS NULL",
+        [],
+    )
+    .expect("expire");
+
+    let stale = report(&db);
+    assert_eq!(
+        stale["live_attempts"], 0,
+        "просроченная аренда названа живой: {stale}"
+    );
+    assert_eq!(stale["expired_attempts"], 1, "{stale}");
+}
+
+/// `doctor --gc` прибирает все проекты сразу: проверка идёт по всей базе, и требовать выбор
+/// одного проекта ради уборки — значит оставить мусор в остальных.
+#[test]
+fn doctor_gc_sweeps_every_project_without_a_selector() {
+    let dir = temp_dir("gc-all");
+    let bin = env!("CARGO_BIN_EXE_tasq");
+    let db = dir.join("multi.db").display().to_string();
+
+    let run = |args: &[&str]| -> (i32, String, String) {
+        let out = Command::new(bin)
+            .arg("--db")
+            .arg(&db)
+            .args(args)
+            .output()
+            .expect("run tasq");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    assert_eq!(run(&["init", "--key", "AAA"]).0, 0);
+    assert_eq!(run(&["create", "project", "BBB"]).0, 0);
+    for project in ["AAA", "BBB"] {
+        assert_eq!(run(&["--project", project, "add", "Эпик"]).0, 0);
+        assert_eq!(
+            run(&[
+                "--project",
+                project,
+                "add",
+                "Задача",
+                "--parent",
+                &format!("{project}-1")
+            ])
+            .0,
+            0
+        );
+        let claimed = run(&[
+            "--project",
+            project,
+            "claim",
+            &format!("{project}-1.1"),
+            "--holder",
+            "dead",
+            "--json",
+        ]);
+        assert_eq!(claimed.0, 0, "{project}: {}", claimed.2);
+    }
+
+    // Просрочиваем обе аренды и убираем без селектора проекта.
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "UPDATE attempts SET expires_at = '2000-01-01T00:00:00.000Z' WHERE ended_at IS NULL",
+        [],
+    )
+    .expect("expire");
+    drop(conn);
+
+    let (code, stdout, stderr) = run(&["doctor", "--gc"]);
+    assert_eq!(code, 0, "уборка без селектора отказала: {stdout}{stderr}");
+    assert!(
+        stdout.contains("closed 2 expired attempt(s)"),
+        "убраны не все проекты: {stdout}"
+    );
+
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    let open: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM attempts WHERE ended_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(open, 0, "открытые попытки остались");
 }
 
 /// Узел, по которому вызывающий разбирается сам (`claim`), сборкой не трогается: иначе

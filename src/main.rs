@@ -1271,9 +1271,37 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 let cwd = std::env::current_dir()?;
                 let path = db::discover(&cwd, cli.db.as_deref())?;
                 let mut conn = db::open_checked(&path)?;
-                let project = project::select(&conn, cli.project.as_deref())?;
-                let closed = lease::gc(&mut conn, &project)?;
-                let unblocked = edge::clear_stale_blocked(&mut conn, &project)?;
+                // `doctor` смотрит базу целиком, поэтому и уборка идёт по всем проектам.
+                //
+                // Раньше здесь стоял `project::select`, и в базе с двумя проектами
+                // `doctor --gc` без `--project` отказывал PROJECT_REQUIRED — то есть
+                // глобальная проверка требовала выбрать один проект, чтобы прибрать мусор
+                // во всех. Явный `--project` по-прежнему сужает уборку до одного.
+                let projects = match cli.project.as_deref() {
+                    Some(key) => vec![project::select(&conn, Some(key))?],
+                    None => {
+                        let listed = project::list(&conn)?;
+                        let mut projects = Vec::with_capacity(listed.len());
+                        for summary in &listed {
+                            projects.push(project::by_key(&conn, &summary.key)?.ok_or_else(
+                                || {
+                                    Error::ProjectNotFound {
+                                        key: summary.key.clone(),
+                                        known: project::known_keys(&conn)
+                                            .unwrap_or_else(|_| "unknown".to_string()),
+                                    }
+                                },
+                            )?);
+                        }
+                        projects
+                    }
+                };
+                let mut closed = 0;
+                let mut unblocked = 0;
+                for project in &projects {
+                    closed += lease::gc(&mut conn, project)?;
+                    unblocked += edge::clear_stale_blocked(&mut conn, project)?;
+                }
                 gc_outcome = Some((closed, unblocked));
             }
             if let Some((closed, unblocked)) = gc_outcome {
