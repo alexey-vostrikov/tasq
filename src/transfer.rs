@@ -87,6 +87,110 @@ fn checksum(text: &str) -> String {
         .collect()
 }
 
+/// Таблицы дампа базы — в порядке вставки (родители раньше детей).
+///
+/// `meta` идёт первой: в ней версия схемы, по ней восстановление понимает, чего ожидать.
+/// FTS-таблицы (`nodes_fts`, `notes_fts`) сюда не входят: это индексы с внешним контентом,
+/// они перестраиваются из `nodes`/`notes` при восстановлении, и тащить их в дамп значило бы
+/// хранить два источника правды.
+pub const DUMP_TABLES: &[&str] = &[
+    "meta",
+    "projects",
+    "nodes",
+    "attempts",
+    "reservations",
+    "edges",
+    "comments",
+    "notes",
+    "templates",
+    "activity_log",
+    "burn_snapshots",
+];
+
+/// Дамп ВСЕЙ базы: все проекты и все таблицы, с версией схемы и контрольной суммой.
+///
+/// Отличие от [`export`] (документ одного проекта): здесь нет выбора — берётся всё, что есть
+/// в файле, включая аренды, резервы и журнал. Без этого редизайн схемы не начать: экспорт
+/// проекта не восстанавливает базу (нет `attempts`, `reservations`, `activity_log` и остальных
+/// проектов), а `burnup`/`time` на восстановленной базе остаются пустыми.
+///
+/// Строки читаются универсально — по `SELECT *` и типам значений, а не по списку колонок:
+/// дамп должен переживать правку схемы, иначе под каждый новый столбец нужен новый код.
+/// Порядок строк — по первичному ключу (для `meta` он текстовый), поэтому две выгрузки одного
+/// состояния дают одинаковую контрольную сумму.
+pub fn dump(conn: &Connection) -> Result<Value> {
+    let schema_version = crate::db::schema_version_of(conn).unwrap_or(0);
+
+    let mut tables = serde_json::Map::new();
+    for table in DUMP_TABLES {
+        // Имя таблицы — из константы, а не из входа: подстановка пользовательских строк в SQL
+        // здесь недопустима даже при том, что список закрыт.
+        let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
+        // `column_names()` возвращает ИТЕРАТОР `&str`, а не срез: `.iter()` у него нет, а
+        // `.into_iter()` clippy с `-D warnings` отбивает как лишнее преобразование.
+        let columns: Vec<String> = stmt.column_names().map(str::to_string).collect();
+        let mut rows_out: Vec<Value> = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let mut object = serde_json::Map::new();
+            for (index, name) in columns.iter().enumerate() {
+                let value = match row.get_ref(index)? {
+                    rusqlite::types::ValueRef::Null => Value::Null,
+                    rusqlite::types::ValueRef::Integer(number) => Value::from(number),
+                    rusqlite::types::ValueRef::Real(number) => Value::from(number),
+                    rusqlite::types::ValueRef::Text(text) => {
+                        Value::from(String::from_utf8_lossy(text).to_string())
+                    }
+                    // BLOB в схеме нет; если появится — отказ громче, чем повреждённый дамп.
+                    rusqlite::types::ValueRef::Blob(bytes) => {
+                        return Err(Error::InvalidValue {
+                            field: format!("{table}.{name}"),
+                            value: format!("blob of {} byte(s) is not dumpable", bytes.len()),
+                        });
+                    }
+                };
+                object.insert(name.clone(), value);
+            }
+            rows_out.push(Value::Object(object));
+        }
+        tables.insert(table.to_string(), Value::Array(rows_out));
+    }
+
+    let counts: serde_json::Map<String, Value> = tables
+        .iter()
+        .map(|(name, rows)| {
+            (
+                name.clone(),
+                Value::from(rows.as_array().map(Vec::len).unwrap_or(0)),
+            )
+        })
+        .collect();
+
+    // Сумма считается по тому же набору, что и в экспорте проекта: формат, версия схемы и
+    // таблицы. Момент выгрузки и версия бинаря — снаружи, иначе две выгрузки одного состояния
+    // дают разные суммы.
+    let payload = json!({
+        "kind": DUMP_KIND,
+        "format": DUMP_FORMAT,
+        "schema_version": schema_version,
+        "tables": Value::Object(tables.clone()),
+    });
+    Ok(json!({
+        "kind": DUMP_KIND,
+        "format": DUMP_FORMAT,
+        "schema_version": schema_version,
+        "version": crate::VERSION,
+        "exported_at": crate::db::now_iso(),
+        "counts": Value::Object(counts),
+        "tables": Value::Object(tables),
+        "sha256": payload_checksum(&payload),
+    }))
+}
+
+/// Вид и версия документа дампа: по ним восстановление отказывает на чужом файле.
+pub const DUMP_KIND: &str = "tasq-dump";
+pub const DUMP_FORMAT: i64 = 1;
+
 /// Собирает документ экспорта.
 pub fn export(conn: &Connection, project: &Project, include_deleted: bool) -> Result<Value> {
     let mut nodes: Vec<Value> = Vec::new();

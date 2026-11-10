@@ -181,6 +181,11 @@ pub fn open_checked(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Версия схемы в соединении: публичная обёртка для дампа и внешних проверок.
+pub fn schema_version_of(conn: &Connection) -> Result<i64> {
+    schema_version(conn)
+}
+
 fn schema_version(conn: &Connection) -> Result<i64> {
     // Свежая база: таблицы `meta` ещё нет — значит миграций не было.
     let has_meta: bool = conn.query_row(

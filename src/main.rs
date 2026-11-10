@@ -369,6 +369,9 @@ enum Command {
         /// Include soft-deleted nodes
         #[arg(long)]
         include_deleted: bool,
+        /// Dump the whole database: every project and every table, with the schema version
+        #[arg(long)]
+        all: bool,
     },
     /// Import a project from JSON
     Import {
@@ -2332,7 +2335,42 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Export {
             out,
             include_deleted,
+            all,
         } => {
+            // Дамп всей базы не требует проекта: он берёт все, что есть в файле.
+            if *all {
+                let cwd = std::env::current_dir()?;
+                let path = db::discover(&cwd, cli.db.as_deref())?;
+                let conn = db::open_checked(&path)?;
+                let document = transfer::dump(&conn)?;
+                let text = serde_json::to_string_pretty(&document).expect("serialisable");
+                match out {
+                    Some(target) => {
+                        std::fs::write(target, &text)?;
+                        if !cli.json {
+                            println!(
+                                "dumped to {}: {} project(s), {} node(s), {} attempt(s), \
+                                 {} activity record(s), schema v{}",
+                                target.display(),
+                                document["counts"]["projects"],
+                                document["counts"]["nodes"],
+                                document["counts"]["attempts"],
+                                document["counts"]["activity_log"],
+                                document["schema_version"]
+                            );
+                            println!(
+                                "sha256 {}",
+                                document
+                                    .get("sha256")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("-")
+                            );
+                        }
+                    }
+                    None => println!("{text}"),
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
             let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
             let document = transfer::export(&conn, &project, *include_deleted)?;
             let text = serde_json::to_string_pretty(&document).expect("serialisable");
