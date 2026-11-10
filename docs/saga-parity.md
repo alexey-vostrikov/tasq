@@ -54,7 +54,7 @@
 
 | функция saga | где в tasq |
 | --- | --- |
-| иерархия project → epic → task → subtask | `nodes` с `depth`/`kind`, без ограничения глубины |
+| иерархия project → epic → task → subtask | `nodes` с `depth`/`kind`, предел 16 уровней |
 | статусы по уровням (project/epic/task/subtask) | единый набор + матрица переходов по `kind` |
 | приоритеты low…critical | `nodes.priority` |
 | `tags` и `metadata` (JSON) на всех уровнях | те же колонки |

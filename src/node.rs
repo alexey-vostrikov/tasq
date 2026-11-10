@@ -12,9 +12,17 @@ use crate::error::{Error, Result};
 use crate::project::Project;
 use crate::status::{Kind, Status, check_transition};
 
-/// Пределы пути (README §5.3, инвариант 2).
-const MAX_PATH_BYTES: usize = 200;
-const MAX_PATH_SEGMENTS: usize = 64;
+/// Предел глубины дерева (README §5.3, инвариант 2).
+///
+/// Предел нужен не для аккуратности иерархии, а потому что адрес узла — это путь: он едет в
+/// dot-ID, в аргументы CLI и в текст задач. Шестнадцать уровней — это эпик → задача →
+/// подзадача → микро-задача и ещё двенадцать уровней сверху; глубже осмысленных иерархий не
+/// встречается, а адрес остаётся коротким и произносимым.
+///
+/// Отдельного предела на длину пути нет намеренно: при 16 сегментах и номерах до семи цифр
+/// путь занимает не больше 112 байт, то есть dot-ID вместе с ключом проекта укладывается в
+/// 255 байт с запасом. Одно правило вместо двух, и его нельзя обойти по частям.
+pub const MAX_DEPTH: i64 = 16;
 
 /// Узел в выдаче: поля дерева плюс производные статус и прогресс.
 #[derive(Debug, Clone, Serialize)]
@@ -265,7 +273,7 @@ pub struct NewNode<'a> {
 }
 
 fn validate_path(path: &str) -> Result<()> {
-    if path.len() > MAX_PATH_BYTES || path.split('.').count() > MAX_PATH_SEGMENTS {
+    if path.split('.').count() > MAX_DEPTH as usize {
         return Err(Error::DepthLimit);
     }
     Ok(())
@@ -904,7 +912,7 @@ pub fn move_node(
         |row| row.get(0),
     )?;
     let delta = new_depth - node.depth;
-    if deepest + delta > MAX_PATH_SEGMENTS as i64 {
+    if deepest + delta > MAX_DEPTH {
         return Err(Error::DepthLimit);
     }
 

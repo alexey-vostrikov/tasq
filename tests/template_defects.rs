@@ -120,9 +120,10 @@ fn invalid_trees_are_refused_before_writing() {
 fn deep_template_is_bounded() {
     let (mut conn, project) = fixture("deep");
 
-    // Собираем вложенность 34 уровня: предел — 32.
+    // Вложенность на два уровня глубже предела: шаблон, который нельзя применить, не должен
+    // и сохраняться. Число берётся из константы — предел один на шаблон и на живое дерево.
     let mut node = String::from(r#"{"title": "лист"}"#);
-    for _ in 0..34 {
+    for _ in 0..(tasq::node::MAX_DEPTH + 2) {
         node = format!(r#"{{"title": "уровень", "children": [{node}]}}"#);
     }
     let raw = format!("[{node}]");

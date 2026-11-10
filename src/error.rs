@@ -162,8 +162,11 @@ pub enum Error {
     #[error("node {dot_id} is already {state}")]
     AlreadyInState { dot_id: String, state: String },
 
-    /// Глубина или длина пути за пределом (64 сегмента, 200 байт).
-    #[error("node path would exceed the depth limit (64 segments, 200 bytes)")]
+    /// Глубина за пределом (`node::MAX_DEPTH`).
+    ///
+    /// Число берётся из константы, а не повторяется в тексте: иначе сообщение переживёт
+    /// смену предела и будет называть старое значение — так и случилось при переходе с 64 на 16.
+    #[error("node would sit deeper than {} levels", crate::node::MAX_DEPTH)]
     DepthLimit,
 
     /// Родитель не может быть потомком перемещаемого узла.

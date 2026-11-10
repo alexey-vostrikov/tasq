@@ -244,7 +244,10 @@ fn validate(tree: &TemplateTree) -> Result<()> {
                 value: priority.clone(),
             });
         }
-        if depth > 32 {
+        // Тот же предел, что и у живой иерархии: шаблон, который нельзя применить, не
+        // должен и сохраняться. Раньше здесь стояло 32 — второе число на то же правило,
+        // и оно расходилось с настоящим пределом молча.
+        if depth > crate::node::MAX_DEPTH {
             return Err(Error::DepthLimit);
         }
         for child in &node.children {

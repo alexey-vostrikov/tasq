@@ -53,7 +53,9 @@ fn add(conn: &mut Connection, project: &Project, parent: Option<&str>, title: &s
     .expect("create node")
 }
 
-/// Предел глубины — 64 сегмента: шестьдесят пятый узел отбивается, дерево остаётся целым.
+/// Предел глубины — 16 сегментов (`node::MAX_DEPTH`): семнадцатый узел отбивается, дерево
+/// остаётся целым. Число берётся из константы, а не повторяется в тесте: иначе предел меняют
+/// в одном месте, а проверяют в другом.
 #[test]
 fn depth_limit_stops_the_chain() {
     let (mut conn, project) = fixture("depth");
@@ -80,22 +82,35 @@ fn depth_limit_stops_the_chain() {
             Ok(node) => {
                 last = node;
                 depth += 1;
-                assert!(depth <= 64, "предел глубины не сработал");
+                assert!(depth <= tasq::node::MAX_DEPTH, "предел глубины не сработал");
             }
             Err(error) => {
                 assert_eq!(error.code(), "DEPTH_LIMIT", "на глубине {depth}");
+                // Текст обязан называть текущий предел: при переходе с 64 на 16 сообщение
+                // осталось со старым числом, и поймать это можно только проверкой.
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&tasq::node::MAX_DEPTH.to_string()),
+                    "в тексте отказа нет предела: {error}"
+                );
                 break;
             }
         }
     }
 
-    assert_eq!(depth, 64, "предел наступает на 65-м узле");
+    assert_eq!(
+        depth,
+        tasq::node::MAX_DEPTH,
+        "предел наступает на {}-м узле",
+        tasq::node::MAX_DEPTH + 1
+    );
     // Отказ не испортил дерево: последний узел на месте.
     assert_eq!(
         node::resolve(&conn, &project, &last.dot_id)
             .expect("last")
             .depth,
-        64
+        tasq::node::MAX_DEPTH
     );
 }
 
