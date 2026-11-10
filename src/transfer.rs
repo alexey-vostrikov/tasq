@@ -187,6 +187,27 @@ pub fn dump(conn: &Connection) -> Result<Value> {
     }))
 }
 
+/// Дамп в YAML: тот же документ, но человекочитаемый и правимый руками.
+///
+/// Формат выбирает ВЫЗЫВАЮЩИЙ (по расширению `--out` или явному флагу), а не догадка по
+/// содержимому: дамп — состояние, и молчаливое переключение формата на файле без расширения
+/// было бы сюрпризом. Парсер — `serde-saphyr`: чистый Rust без C под капотом и без `unsafe`
+/// в своей коде, чего `unsafe-libyaml` (зависимость `serde_yaml_ng`) дать не может.
+pub fn dump_yaml(document: &Value) -> Result<String> {
+    serde_saphyr::to_string(document).map_err(|err| Error::InvalidValue {
+        field: "yaml".to_string(),
+        value: err.to_string(),
+    })
+}
+
+/// Чтение документа из YAML — обратная операция, нужна импорту и тестам на круговой путь.
+pub fn read_yaml(text: &str) -> Result<Value> {
+    serde_saphyr::from_str(text).map_err(|err| Error::InvalidValue {
+        field: "yaml".to_string(),
+        value: err.to_string(),
+    })
+}
+
 /// Вид и версия документа дампа: по ним восстановление отказывает на чужом файле.
 pub const DUMP_KIND: &str = "tasq-dump";
 pub const DUMP_FORMAT: i64 = 1;

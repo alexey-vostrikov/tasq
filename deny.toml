@@ -20,14 +20,20 @@ ignore = []
 [licenses]
 version = 2
 # Только те лицензии, которые реально есть в дереве (снято `cargo deny list`):
-# Apache-2.0, MIT, Unicode-3.0, Unlicense, Zlib. Список намеренно не «на будущее»:
-# новая лицензия — повод посмотреть на зависимость, а не молча её принять.
+# Apache-2.0, MIT, Unicode-3.0, Unlicense, Zlib, BSD-3-Clause.
+#
+# BSD-3-Clause появилась вместе с `serde-saphyr` (YAML для дампа) и приходит от одного
+# крейта — `encoding_rs` (Mozilla, кодировки при чтении YAML). Лицензия разрешительная,
+# OSI- и FSF-одобренная, совместима с MIT; проверено `cargo deny check licenses` перед
+# добавлением. Список по-прежнему не «на будущее»: новая лицензия — повод посмотреть на
+# зависимость, а не молча её принять.
 allow = [
     "MIT",
     "Apache-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+    "BSD-3-Clause",
 ]
 confidence-threshold = 0.9
 exceptions = []

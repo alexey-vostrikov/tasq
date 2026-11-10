@@ -585,6 +585,7 @@ tasq export [ОПЦИИ]
 | `--out` | `PATH` | — | Write to a file instead of stdout |
 | `--include-deleted` | — | — | Include soft-deleted nodes |
 | `--all` | — | — | Dump the whole database: every project and every table, with the schema version |
+| `--format` | `FORMAT` | — | Document format: json (default) or yaml; defaults to the format of `--out` by extension |
 
 ## `import`
 

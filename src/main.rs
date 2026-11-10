@@ -372,6 +372,9 @@ enum Command {
         /// Dump the whole database: every project and every table, with the schema version
         #[arg(long)]
         all: bool,
+        /// Document format: json (default) or yaml; defaults to the format of `--out` by extension
+        #[arg(long, value_name = "FORMAT")]
+        format: Option<String>,
     },
     /// Import a project from JSON
     Import {
@@ -692,6 +695,40 @@ fn open(
     let conn = db::open_checked(&path)?;
     let project = project::select(&conn, project_key)?;
     Ok((conn, project))
+}
+
+/// Формат выходного документа: флаг → расширение `--out` → JSON.
+///
+/// Явный флаг важнее расширения (файл без расширения — обычное дело), расширение важнее
+/// умолчания: `--out dump.yaml` без флага должен дать YAML, иначе расширение врёт. Неизвестное
+/// значение — отказ, а не молчаливый JSON: пользователь просил конкретный формат.
+fn export_format(flag: Option<&str>, out: Option<&std::path::Path>) -> Result<&'static str> {
+    if let Some(value) = flag {
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "json" => Ok("json"),
+            "yaml" | "yml" => Ok("yaml"),
+            other => Err(Error::InvalidValue {
+                field: "format".to_string(),
+                value: other.to_string(),
+            }),
+        };
+    }
+    let by_extension = out
+        .and_then(|path| path.extension())
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    Ok(match by_extension.as_deref() {
+        Some("yaml" | "yml") => "yaml",
+        _ => "json",
+    })
+}
+
+/// Текст документа в выбранном формате.
+fn render_document(document: &serde_json::Value, format: &str) -> Result<String> {
+    match format {
+        "yaml" => transfer::dump_yaml(document),
+        _ => Ok(serde_json::to_string_pretty(document).expect("serialisable")),
+    }
 }
 
 /// Соединение и проект для команды, работающей со ссылкой на узел.
@@ -2336,14 +2373,18 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             out,
             include_deleted,
             all,
+            format,
         } => {
+            // Формат — из флага, иначе из расширения `--out`, иначе JSON. Догадываться по
+            // СОДЕРЖИМОМУ файла нельзя: дамп — состояние, а не конфиг.
+            let format = export_format(format.as_deref(), out.as_deref())?;
             // Дамп всей базы не требует проекта: он берёт все, что есть в файле.
             if *all {
                 let cwd = std::env::current_dir()?;
                 let path = db::discover(&cwd, cli.db.as_deref())?;
                 let conn = db::open_checked(&path)?;
                 let document = transfer::dump(&conn)?;
-                let text = serde_json::to_string_pretty(&document).expect("serialisable");
+                let text = render_document(&document, format)?;
                 match out {
                     Some(target) => {
                         std::fs::write(target, &text)?;
@@ -2373,7 +2414,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
             let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
             let document = transfer::export(&conn, &project, *include_deleted)?;
-            let text = serde_json::to_string_pretty(&document).expect("serialisable");
+            let text = render_document(&document, format)?;
             match out {
                 Some(path) => {
                     std::fs::write(path, &text)?;
