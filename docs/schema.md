@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v6**.
+Версия схемы: **v7**.
 
 ## Таблицы
 
@@ -111,7 +111,7 @@ CREATE TABLE "node_status_history" (
   node_id     INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
   from_status TEXT REFERENCES statuses(name),
   to_status   TEXT NOT NULL REFERENCES statuses(name),
-  cause       TEXT NOT NULL CHECK (cause IN ('manual','lease_claimed','lease_completed',
+  cause       TEXT NOT NULL CHECK (cause IN ('created','manual','lease_claimed','lease_completed',
                                              'lease_released','lease_expired','unblock',
                                              'gc','import','restore')),
   at          TEXT NOT NULL,

@@ -22,6 +22,11 @@ use crate::error::Result;
 /// отпустил» и «не успел», и склеивать их значило бы врать в обе стороны.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cause {
+    /// Узел появился: первый факт, `from_status` пуст.
+    ///
+    /// Создание — не переход, но без него у нового узла истории нет вовсе, и отчёт не может
+    /// отличить «ничего не происходило» от «мы ничего не знаем».
+    Created,
     /// Ручной переход (`tasq set`, MCP `node_update`).
     Manual,
     /// Взятие в работу: узел стал `in_progress` по аренде.
@@ -43,8 +48,27 @@ pub enum Cause {
 }
 
 impl Cause {
+    /// Разбор причины из файла: чужая или испорченная причина — отказ, а не «manual» по
+    /// умолчанию. Молчаливая подмена исказила бы отчёты, ради которых таблица и заведена.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "created" => Cause::Created,
+            "manual" => Cause::Manual,
+            "lease_claimed" => Cause::LeaseClaimed,
+            "lease_completed" => Cause::LeaseCompleted,
+            "lease_released" => Cause::LeaseReleased,
+            "lease_expired" => Cause::LeaseExpired,
+            "unblock" => Cause::Unblock,
+            "gc" => Cause::Gc,
+            "import" => Cause::Import,
+            "restore" => Cause::Restore,
+            _ => return None,
+        })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
+            Cause::Created => "created",
             Cause::Manual => "manual",
             Cause::LeaseClaimed => "lease_claimed",
             Cause::LeaseCompleted => "lease_completed",
@@ -70,13 +94,27 @@ pub fn record(
     cause: Cause,
     actor: &str,
 ) -> Result<()> {
+    record_at(conn, node_id, from, to, cause, &now_iso(), actor)
+}
+
+/// То же, но с моментом из файла: импорт переносит историю с её собственными временами, а не
+/// переписывает всё на «сейчас» — иначе ряд burn-up съехал бы на день импорта.
+pub fn record_at(
+    conn: &Connection,
+    node_id: i64,
+    from: Option<&str>,
+    to: &str,
+    cause: Cause,
+    at: &str,
+    actor: &str,
+) -> Result<()> {
     if from == Some(to) {
         return Ok(());
     }
     conn.execute(
         "INSERT INTO node_status_history (node_id, from_status, to_status, cause, at, actor)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![node_id, from, to, cause.as_str(), now_iso(), actor],
+        rusqlite::params![node_id, from, to, cause.as_str(), at, actor],
     )?;
     Ok(())
 }

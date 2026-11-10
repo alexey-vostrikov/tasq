@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::activity::{self, Entry};
 use crate::db::now_iso;
 use crate::error::{Error, Result};
+use crate::history;
 use crate::project::Project;
 
 mod restore;
@@ -60,6 +61,12 @@ pub struct Imported {
     pub comments: usize,
     pub notes: usize,
     pub templates: usize,
+    /// Строк истории перенесено, и откуда они взяты.
+    ///
+    /// `None` — в файле истории нет, и по одному факту на узел не писалось (импорт saga:
+    /// истории там не было и быть не могло). `Some(0)` при `history: present` означает, что
+    /// переходов у узлов действительно не было.
+    pub history: Option<usize>,
     pub checksum_verified: bool,
 }
 
@@ -377,6 +384,30 @@ pub fn export(conn: &Connection, project: &Project, include_deleted: bool) -> Re
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
+    // История переходов едет вместе с узлами: без неё импорт обнуляет burn-up, потому что
+    // дата закрытия живёт только здесь (это измерено: export → import давал `done 0` при
+    // закрытом узле на месте). Узлы адресуются путём, а не id: путь переносим между базами.
+    let status_history: Vec<Value> = {
+        let mut stmt = conn.prepare(
+            "SELECT n.path, h.from_status, h.to_status, h.cause, h.at, h.actor
+             FROM node_status_history h
+             JOIN nodes n ON n.id = h.node_id
+             WHERE n.project_id = ?1
+             ORDER BY n.path, h.at, h.id",
+        )?;
+        stmt.query_map(params![project.id], |row| {
+            Ok(json!({
+                "node": row.get::<_, String>(0)?,
+                "from": row.get::<_, Option<String>>(1)?,
+                "to": row.get::<_, String>(2)?,
+                "cause": row.get::<_, String>(3)?,
+                "at": row.get::<_, String>(4)?,
+                "actor": row.get::<_, Option<String>>(5)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
     // Сумма считается по `data`, а не по документу целиком: `exported_at` и версия бинаря
     // меняются от запуска к запуску, и сумма обязана зависеть только от содержимого.
     let data = json!({
@@ -385,6 +416,10 @@ pub fn export(conn: &Connection, project: &Project, include_deleted: bool) -> Re
             "name": project.name,
             "status": project.status,
         },
+        // Маркер, а не догадка по пустому массиву: «в файле истории нет» и «у узлов не было
+        // переходов» — разные факты, и импорт обязан их различать.
+        "history": "present",
+        "status_history": status_history,
         "nodes": nodes,
         "edges": edges,
         "comments": comments,
@@ -736,6 +771,8 @@ pub fn import(
     };
     let mut created = 0usize;
     let mut skipped = 0usize;
+    // Созданные узлы: нужны для синтетической истории, когда файл её не несёт.
+    let mut created_nodes: Vec<(i64, String, String)> = Vec::new();
 
     for node in &plan {
         if mode == Mode::Merge
@@ -789,8 +826,65 @@ pub fn import(
                 node.updated_at,
             ],
         )?;
-        id_by_path.insert(node.path.clone(), tx.last_insert_rowid());
+        let node_id = tx.last_insert_rowid();
+        id_by_path.insert(node.path.clone(), node_id);
+        created_nodes.push((node_id, node.status.clone(), node.created_at.clone()));
         created += 1;
+    }
+
+    // История переходов: переносим, если файл её несёт; иначе пишем по одному факту на узел.
+    //
+    // Различие принципиальное. Файл нашего формата несёт историю, и она — наша: переносим как
+    // есть, с её временами, иначе burn-up съедет на день импорта. Файл saga истории не несёт и
+    // не может: там нет такого понятия, поэтому единственный честный факт — «узел доехал»,
+    // с причиной `import` и временем создания узла, а не моментом импорта.
+    let history_present = payload.get("history").and_then(Value::as_str) == Some("present");
+    let mut history_rows = 0usize;
+    if history_present {
+        let rows = payload
+            .get("status_history")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for row in &rows {
+            let Some(path) = text(row, "node") else {
+                continue;
+            };
+            let Some(node_id) = id_by_path.get(&path).copied() else {
+                // Узел не перенесён (вырезан из файла или не легёл) — история без него не нужна
+                // и не может ссылаться в пустоту.
+                continue;
+            };
+            let cause_text = text(row, "cause").unwrap_or_default();
+            let cause = history::Cause::parse(&cause_text).ok_or_else(|| Error::InvalidValue {
+                field: "status_history[].cause".to_string(),
+                value: format!("{cause_text} (unknown cause)"),
+            })?;
+            let to = text(row, "to").unwrap_or_default();
+            history::record_at(
+                &tx,
+                node_id,
+                text(row, "from").as_deref(),
+                &to,
+                cause,
+                &text(row, "at").unwrap_or_else(now_iso),
+                text(row, "actor").as_deref().unwrap_or(actor),
+            )?;
+            history_rows += 1;
+        }
+    } else {
+        for (node_id, status, created_at) in &created_nodes {
+            history::record_at(
+                &tx,
+                *node_id,
+                None,
+                status,
+                history::Cause::Import,
+                created_at,
+                actor,
+            )?;
+            history_rows += 1;
+        }
     }
 
     let mut edge_count = 0usize;
@@ -938,6 +1032,7 @@ pub fn import(
         comments: comment_count,
         notes: note_count,
         templates: template_count,
+        history: Some(history_rows),
         checksum_verified: true,
     })
 }
@@ -1205,6 +1300,8 @@ pub fn import_saga(
         )?;
     }
     let mut id_by_path: HashMap<String, i64> = HashMap::new();
+    // Сколько фактов истории написано синтетически (по одному на узел).
+    let mut history_rows = 0usize;
     for node in &flat {
         let parent_id = node
             .parent
@@ -1247,7 +1344,20 @@ pub fn import_saga(
                 node.updated_at,
             ],
         )?;
-        id_by_path.insert(node.path.clone(), tx.last_insert_rowid());
+        let node_id = tx.last_insert_rowid();
+        id_by_path.insert(node.path.clone(), node_id);
+        // Saga не несёт истории: честный факт — «узел доехал», с временем его создания, а не
+        // моментом импорта. Узел не появился сейчас, он сейчас доехал.
+        history::record_at(
+            &tx,
+            node_id,
+            None,
+            &node.status,
+            history::Cause::Import,
+            &node.created_at,
+            actor,
+        )?;
+        history_rows += 1;
     }
 
     let mut edge_count = 0usize;
@@ -1362,6 +1472,8 @@ pub fn import_saga(
         comments: comment_count,
         notes: note_count,
         templates: 0,
+        // Saga истории не несёт: ниже на каждый узел пишется одна запись `import`.
+        history: Some(history_rows),
         checksum_verified: false,
     })
 }
@@ -1402,6 +1514,15 @@ pub fn dry_run(conn: &Connection, project: &Project, document: &Value) -> Result
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or(0),
+        // Пробный прогон не пишет: история будет перенесена (или синтезирована) столько же
+        // раз, сколько узлов, — столько и называем.
+        history: Some(
+            payload
+                .get("status_history")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(plan.len()),
+        ),
         checksum_verified: true,
     })
 }

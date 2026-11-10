@@ -2335,6 +2335,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 series.scope_done,
                 series.scope_added
             );
+            // Узлы без истории называются словами, а не нулём: «неизвестно» и «не закрыто» —
+            // разные факты, и молчаливый ноль в `done` выдавал одно за другое.
+            if series.scope_unknown > 0.0 {
+                println!(
+                    "history:   unknown for {:.1} of {:.1} (imported without history or older than v4)",
+                    series.scope_unknown, series.scope_total
+                );
+            }
             if let Some(days) = series.days_left {
                 if days < 0 {
                     println!("deadline passed {} day(s) ago", -days);
@@ -2596,6 +2604,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         comments: 0,
                         notes: 0,
                         templates: 0,
+                        // Saga истории не несёт — будет по одной записи `import` на узел.
+                        history: Some(nodes),
                         checksum_verified: false,
                     }
                 } else {

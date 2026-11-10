@@ -117,9 +117,13 @@ fn a_manual_transition_is_recorded() {
     .expect("todo");
 
     let rows = history_of(&conn, task.id);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].1, "todo");
-    assert_eq!(rows[0].2, Cause::Manual.as_str());
+    // Две записи: создание и переход. Первая — факт существования, без неё у нового узла
+    // истории нет вовсе.
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].1, "idea");
+    assert_eq!(rows[0].2, Cause::Created.as_str());
+    assert_eq!(rows[1].1, "todo");
+    assert_eq!(rows[1].2, Cause::Manual.as_str());
 }
 
 /// Взятие в работу и завершение через аренду: две строки, разные причины.
@@ -311,18 +315,15 @@ fn unblocking_is_recorded_and_gc_is_distinguished() {
 #[test]
 fn the_writer_itself_skips_a_no_op_transition() {
     let (conn, _project, _epic, task) = fixture("noop");
+    let created = history_of(&conn, task.id).len();
+    assert_eq!(created, 1, "у нового узла должна быть запись о создании");
+
     tasq::history::record(&conn, task.id, Some("todo"), "todo", Cause::Manual, "agent")
         .expect("record");
-    assert!(
-        history_of(&conn, task.id).is_empty(),
-        "записана пустая смена статуса"
-    );
-
-    tasq::history::record(&conn, task.id, None, "idea", Cause::Manual, "agent").expect("record");
     assert_eq!(
         history_of(&conn, task.id).len(),
-        1,
-        "первая запись узла потеряна"
+        created,
+        "записана пустая смена статуса"
     );
 }
 

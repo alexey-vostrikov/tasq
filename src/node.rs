@@ -381,6 +381,17 @@ pub fn create(conn: &mut Connection, project: &Project, req: NewNode<'_>) -> Res
     )?;
     let id = tx.last_insert_rowid();
     let dot_id = project.dot_id(&path);
+    // Первый факт истории: узел появился в начальном статусе. Без него новый узел выглядел бы
+    // «неизвестным» — история пишется на переходы, а создание переходом не является.
+    history::record_at(
+        &tx,
+        id,
+        None,
+        kind.initial_status().as_str(),
+        history::Cause::Created,
+        &now,
+        "-",
+    )?;
     let summary = format!("created {dot_id}");
     activity::log(
         &tx,

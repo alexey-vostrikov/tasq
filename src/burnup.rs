@@ -77,6 +77,12 @@ pub struct Series {
     pub scope_done: f64,
     /// Добавлено за период (расползание объёма).
     pub scope_added: f64,
+    /// Объём узлов, по которым истории нет: про них неизвестно, закрыты они или нет.
+    ///
+    /// Без этого поля отчёт печатал `done 0` там, где правильный ответ — «не знаю». Импорт
+    /// проекта из файла без истории давал именно такой ноль, и заметить его можно было только
+    /// сравнив с другой базой.
+    pub scope_unknown: f64,
     /// Сколько дней осталось до срока; `None`, если срок не задан.
     pub days_left: Option<i64>,
     /// Прогноз завершения по последним дням; `None`, если движения нет.
@@ -94,6 +100,16 @@ pub struct Forecast {
     pub days_late: Option<i64>,
     /// Окно, по которому считалась скорость.
     pub window_days: i64,
+}
+
+/// Сумма с нормализованным нулём.
+///
+/// `Iterator::sum::<f64>()` на пустом итераторе даёт `-0.0`: это верная единица сложения для
+/// float (`-0.0 + x == x` при любом `x`), а не ошибка реализации. Но в отчёте `-0.0` читается
+/// как значащее число — «минус ноль готовой работы», — поэтому ноль приводится к обычному:
+/// `-0.0 + 0.0 == 0.0`. Выглядит как пустая операция, и именно поэтому нужен комментарий.
+fn sum_of(values: impl Iterator<Item = f64>) -> f64 {
+    values.sum::<f64>() + 0.0
 }
 
 fn today(conn: &Connection) -> Result<Date> {
@@ -156,6 +172,9 @@ pub fn series(
     let mut done_at: BTreeMap<i64, (Date, f64)> = BTreeMap::new();
     // Отмена: первая запись перехода в cancelled.
     let mut cancelled_at: BTreeMap<i64, (Date, f64)> = BTreeMap::new();
+    // Объём узлов, про которые истории нет вовсе: их состояние неизвестно, и в «готово»
+    // они не попадают — иначе отчёт сочинял бы данные.
+    let mut unknown = 0.0_f64;
 
     let mut stmt = conn.prepare(&format!(
         "SELECT n.id, n.path, n.created_at, n.status, {weight} AS w
@@ -181,10 +200,16 @@ pub fn series(
         let day = day_key(created_at).unwrap_or(today);
         created.insert(*id, (day, *w));
 
-        if let Some(day) = transition_day(conn, *id, "done")? {
-            done_at.insert(*id, (day, *w));
+        // Узел без истории не считается ни закрытым, ни открытым: он попадает в отдельный
+        // счётчик, и отчёт говорит об этом словами.
+        match transition(conn, *id, "done")? {
+            Transition::Day(day) => {
+                done_at.insert(*id, (day, *w));
+            }
+            Transition::NotYet => {}
+            Transition::Unknown => unknown += *w,
         }
-        if let Some(day) = transition_day(conn, *id, "cancelled")? {
+        if let Transition::Day(day) = transition(conn, *id, "cancelled")? {
             cancelled_at.insert(*id, (day, *w));
         }
     }
@@ -222,26 +247,29 @@ pub fn series(
     let mut last_done = 0.0;
 
     while day <= end {
-        let total: f64 = created
-            .values()
-            .filter(|(created_day, _)| *created_day <= day)
-            .map(|(_, w)| *w)
-            .sum::<f64>()
-            - cancelled_at
+        let total: f64 = sum_of(
+            created
+                .values()
+                .filter(|(created_day, _)| *created_day <= day)
+                .map(|(_, w)| *w),
+        ) - sum_of(
+            cancelled_at
                 .values()
                 .filter(|(cancelled_day, _)| *cancelled_day <= day)
-                .map(|(_, w)| *w)
-                .sum::<f64>();
-        let done: f64 = done_at
-            .values()
-            .filter(|(done_day, _)| *done_day <= day)
-            .map(|(_, w)| *w)
-            .sum();
-        let added: f64 = created
-            .values()
-            .filter(|(created_day, _)| *created_day == day)
-            .map(|(_, w)| *w)
-            .sum();
+                .map(|(_, w)| *w),
+        );
+        let done: f64 = sum_of(
+            done_at
+                .values()
+                .filter(|(done_day, _)| *done_day <= day)
+                .map(|(_, w)| *w),
+        );
+        let added: f64 = sum_of(
+            created
+                .values()
+                .filter(|(created_day, _)| *created_day == day)
+                .map(|(_, w)| *w),
+        );
 
         let ideal = match deadline {
             Some((due, _)) if due >= start && due > start => {
@@ -275,27 +303,56 @@ pub fn series(
         scope_total: last_total,
         scope_done: last_done,
         scope_added: (scope_added * 100.0).round() / 100.0,
+        scope_unknown: (unknown * 100.0).round() / 100.0,
         days_left,
         forecast,
         points,
     })
 }
 
-/// Дата первого перехода узла в указанный статус.
+/// Что известно о переходе узла в статус.
 ///
-/// Пишутся два вида записей: `action='transition'` из `node::update` и `action='completed'`
-/// из завершения аренды — поэтому фильтр идёт по новому значению статуса, а не по действию.
-fn transition_day(conn: &Connection, node_id: i64, status: &str) -> Result<Option<Date>> {
+/// Различие `NotYet` и `Unknown` — не педантизм. «Переходов не было» значит, что работа не
+/// закрыта; «истории нет» значит, что мы про этот узел ничего не знаем (база пришла из файла
+/// без истории, или узел старше таблицы). Показывать второе как первое — это тот самый
+/// молчаливый ноль, из-за которого импорт проекта обнулял burn-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    /// Первый переход в статус состоялся в этот день.
+    Day(Date),
+    /// История есть, перехода в этот статус в ней нет.
+    NotYet,
+    /// Истории по узлу нет вовсе.
+    Unknown,
+}
+
+/// Когда узел впервые перешёл в указанный статус.
+///
+/// Источник — `node_status_history`, а не журнал: журнал отвечает на «что произошло» и пишется
+/// всеми путями мутации, поэтому дата закрытия в нём держалась на совпадении текста в шести
+/// местах записи. История — факт перехода, и её пишет каждый путь смены статуса.
+fn transition(conn: &Connection, node_id: i64, status: &str) -> Result<Transition> {
+    let recorded: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_status_history WHERE node_id = ?1",
+        params![node_id],
+        |row| row.get(0),
+    )?;
+    if recorded == 0 {
+        return Ok(Transition::Unknown);
+    }
     let text: Option<String> = conn
         .query_row(
-            "SELECT created_at FROM activity_log
-             WHERE node_id = ?1 AND field_name = 'status' AND new_value = ?2
-             ORDER BY created_at, id LIMIT 1",
+            "SELECT at FROM node_status_history
+             WHERE node_id = ?1 AND to_status = ?2
+             ORDER BY at, id LIMIT 1",
             params![node_id, status],
             |row| row.get(0),
         )
         .optional()?;
-    Ok(text.as_deref().and_then(day_key))
+    Ok(match text.as_deref().and_then(day_key) {
+        Some(day) => Transition::Day(day),
+        None => Transition::NotYet,
+    })
 }
 
 /// Прогноз по средней скорости за последние `window` дней.
