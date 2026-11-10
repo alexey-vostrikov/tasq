@@ -2,18 +2,20 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v3**.
+Версия схемы: **v4**.
 
 ## Таблицы
 
 ### `activity_log`
 
 ```sql
-CREATE TABLE activity_log (
+CREATE TABLE "activity_log" (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   node_id     INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
-  entity_type TEXT NOT NULL,
+  entity_type TEXT NOT NULL
+                CHECK (entity_type IN ('node','comment','note','edge','project','template',
+                                       'batch','import')),
   entity_id   INTEGER NOT NULL,
   action      TEXT NOT NULL,
   field_name  TEXT,
@@ -41,7 +43,7 @@ CREATE TABLE attempts (
   renewed_at  TEXT,
   ended_at    TEXT,
   end_reason  TEXT CHECK (end_reason IN ('released','expired','failed','completed','superseded')),
-  checkpoint  TEXT,
+  checkpoint  TEXT, session_id TEXT REFERENCES sessions(id),
   UNIQUE (node_id, attempt_no)
 )
 ```
@@ -101,6 +103,21 @@ CREATE TABLE meta (
 )
 ```
 
+### `node_status_history`
+
+```sql
+CREATE TABLE node_status_history (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id     INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  from_status TEXT REFERENCES statuses(name),
+  to_status   TEXT NOT NULL REFERENCES statuses(name),
+  cause       TEXT NOT NULL CHECK (cause IN ('manual','lease_claimed','lease_completed',
+                                             'lease_released','unblock','gc','import','restore')),
+  at          TEXT NOT NULL,
+  actor       TEXT
+)
+```
+
 ### `nodes`
 
 ```sql
@@ -116,9 +133,8 @@ CREATE TABLE "nodes" (
   title              TEXT NOT NULL,
   description        TEXT,
   description_locked INTEGER NOT NULL DEFAULT 0,
-  status             TEXT NOT NULL
-                       CHECK (status IN ('idea','backlog','planned','todo','in_progress',
-                                         'blocked','review','done','cancelled','deferred')),
+  -- Единственное изменение против v3: вместо списка в CHECK — ссылка на справочник.
+  status             TEXT NOT NULL REFERENCES statuses(name),
   priority           TEXT NOT NULL DEFAULT 'medium'
                        CHECK (priority IN ('low','medium','high','critical')),
   assigned_to        TEXT,
@@ -212,6 +228,28 @@ CREATE TABLE reservations (
   mode        TEXT NOT NULL DEFAULT 'exclusive' CHECK (mode IN ('exclusive','shared')),
   created_at  TEXT NOT NULL,
   released_at TEXT
+)
+```
+
+### `sessions`
+
+```sql
+CREATE TABLE sessions (
+  id           TEXT PRIMARY KEY,
+  holder       TEXT NOT NULL,
+  project_key  TEXT REFERENCES projects(key) ON DELETE SET NULL,
+  created_at   TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
+)
+```
+
+### `statuses`
+
+```sql
+CREATE TABLE statuses (
+  name     TEXT PRIMARY KEY,
+  rank     INTEGER NOT NULL UNIQUE,
+  terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))
 )
 ```
 
@@ -340,6 +378,12 @@ WHERE n.due_date IS NOT NULL
 
 ## Индексы
 
+### `idx_activity_attempt`
+
+```sql
+CREATE INDEX idx_activity_attempt ON activity_log(attempt_id) WHERE attempt_id IS NOT NULL
+```
+
 ### `idx_activity_node`
 
 ```sql
@@ -356,6 +400,12 @@ CREATE INDEX idx_activity_project ON activity_log(project_id, created_at)
 
 ```sql
 CREATE INDEX idx_attempts_exp ON attempts(expires_at) WHERE ended_at IS NULL
+```
+
+### `idx_attempts_session`
+
+```sql
+CREATE INDEX idx_attempts_session ON attempts(session_id) WHERE session_id IS NOT NULL
 ```
 
 ### `idx_comments_node`
@@ -404,6 +454,18 @@ CREATE INDEX idx_notes_entity ON notes(project_id, node_id)
 
 ```sql
 CREATE INDEX idx_reserv_active ON reservations(kind, value) WHERE released_at IS NULL
+```
+
+### `idx_sessions_project`
+
+```sql
+CREATE INDEX idx_sessions_project ON sessions(project_key, last_seen_at)
+```
+
+### `idx_status_history_node`
+
+```sql
+CREATE INDEX idx_status_history_node ON node_status_history(node_id, at)
 ```
 
 ### `uq_attempts_live`

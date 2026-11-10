@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 3;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
 pub const DB_DIR: &str = ".tasq";
 pub const DB_FILE: &str = "tasq.db";
 
@@ -18,6 +18,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_search_and_time.sql")),
     (3, include_str!("../migrations/0003_status_funnel.sql")),
+    (4, include_str!("../migrations/0004_status_registry.sql")),
 ];
 
 /// Время в UTC, ровно в том виде, в каком его печатает `strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
@@ -433,7 +434,7 @@ mod tests {
         let tx = write_tx(&mut writer).expect("tx");
         tx.execute(
             "INSERT INTO activity_log (project_id, entity_type, entity_id, action, created_at)
-             VALUES (1, 'probe', 1, 'test', '2026-01-01T00:00:00.000Z')",
+             VALUES (1, 'project', 1, 'test', '2026-01-01T00:00:00.000Z')",
             [],
         )
         .expect("insert");
@@ -585,17 +586,27 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("tasq-catchup-{nanos}"));
         std::fs::create_dir_all(&dir).expect("dir");
-        let first = init(&dir, "CATCH", "catchup").expect("init");
-        let path = std::path::PathBuf::from(&first.db_path);
 
+        // Настоящая старая база: схема v1, отметка версии v1 и существующий проект.
+        //
+        // Раньше здесь база создавалась текущей и версия откатывалась в `meta` вручную. Такой
+        // сценарий не соответствует ни одному реальному состоянию, и миграция v4 его вскрыла:
+        // на уже пересобранной таблице `CREATE TABLE statuses` падает. Догон миграций нужно
+        // проверять на базе, где их действительно ещё нет.
+        let path = db_path_in(&dir);
+        std::fs::create_dir_all(path.parent().expect("db dir")).expect("db dir");
         {
-            // Откатываем отметку версии: файл на месте, миграции «недоделаны».
-            let conn = Connection::open(&path).expect("open");
-            conn.execute(
-                "UPDATE meta SET value = '1' WHERE key = 'schema_version'",
-                [],
+            let conn = Connection::open(&path).expect("v1 db");
+            conn.execute_batch(include_str!("../migrations/0001_init.sql"))
+                .expect("схема v1");
+            conn.execute_batch(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+                 INSERT INTO projects (id, key, name, status, timezone, tags, metadata,
+                                       created_at, updated_at)
+                   VALUES (1, 'CATCH', 'catchup', 'active', 'UTC', '[]', '{}',
+                           '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');",
             )
-            .expect("downgrade");
+            .expect("данные v1");
         }
 
         let second = init(&dir, "CATCH", "catchup").expect("second init");
@@ -690,7 +701,7 @@ mod tests {
         let txw = write_tx(&mut writer).expect("write tx");
         txw.execute(
             "INSERT INTO activity_log (project_id, entity_type, entity_id, action, created_at)
-             VALUES (1, 'probe', 1, 'held', '2026-01-01T00:00:00.000Z')",
+             VALUES (1, 'project', 1, 'held', '2026-01-01T00:00:00.000Z')",
             [],
         )
         .expect("insert");

@@ -169,7 +169,7 @@ fn out_writes_a_file_and_reports_what_it_contains() {
     );
     assert_eq!(code, 0, "{stderr}");
     assert!(
-        stdout.contains("schema v3"),
+        stdout.contains(&format!("schema v{}", tasq::db::SUPPORTED_SCHEMA_VERSION)),
         "сводка без версии схемы: {stdout}"
     );
     assert!(stdout.contains("2 project(s)"), "{stdout}");

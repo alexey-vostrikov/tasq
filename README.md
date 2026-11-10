@@ -101,9 +101,13 @@ SQLite-файле, MCP-сервер поверх stdio и CLI для челов�
 `nodes_fts`/`notes_fts` (FTS5, внешнее содержимое, наполняются триггерами) и представление
 `v_node_hours` для учёта времени. Базы v1 достраиваются автоматически при открытии.
 
-Колонка `status` в `CHECK` перечисляет **объединение** статусов всех уровней; какие из них допустимы для
-конкретного `kind` и какие переходы разрешены — решает код по матрице §7 и проверяется тестами (CHECK —
-страховка от мусора, а не замена правилам).
+Колонка `status` ссылается на справочник `statuses`; какие из статусов допустимы для конкретного
+`kind` и какие переходы разрешены — решает код по матрице §7 и проверяется тестами. Справочник —
+страховка от мусора, а не замена правилам.
+
+**Версия схемы 3** (`0003_status_funnel.sql`) добавила воронку `idea → backlog → todo/planned`.
+**Версия схемы 4** (`0004_status_registry.sql`) выносит набор статусов в справочник, добавляет
+историю переходов и сессии — см. §5.1.1.
 
 ```sql
 -- Служебное
@@ -136,9 +140,9 @@ CREATE TABLE nodes (
   title              TEXT NOT NULL,
   description        TEXT,
   description_locked INTEGER NOT NULL DEFAULT 0,
-  status             TEXT NOT NULL
-                       CHECK (status IN ('idea','backlog','planned','todo','in_progress',
-                                         'blocked','review','done','cancelled','deferred')),
+  -- С v4 статус — ссылка на справочник, а не список в CHECK: набор статусов меняется
+  -- INSERT-ом, без пересборки таблицы (см. §5.1.1).
+  status             TEXT NOT NULL REFERENCES statuses(name),
   priority           TEXT NOT NULL DEFAULT 'medium'
                        CHECK (priority IN ('low','medium','high','critical')),
   assigned_to        TEXT,
@@ -280,6 +284,52 @@ CREATE TABLE burn_snapshots (
   PRIMARY KEY (project_id, day, metric)
 );
 ```
+
+### 5.1.1. Справочник статусов, история переходов, сессии (v4)
+
+Три изменения, у каждого — своя причина, и все три про одно: убрать из схемы места, где правило
+живёт в двух экземплярах и расходится молча.
+
+**`statuses` — справочник вместо `CHECK`.** `CHECK` неизменяем: добавление `idea`/`backlog`
+потребовало пересборки `nodes` (120 строк SQL, выключение внешних ключей вне транзакции,
+`legacy_alter_table`, перестройка FTS — четыре места, где ошибка рвёт данные молча). Теперь новый
+статус — `INSERT` в справочник. Матрица переходов при этом **остаётся в коде**
+(`status::can_transition`): это правило проверки, а данные не тестируются — они лежат. В
+справочнике живёт только то, что читают запросы: порядок воронки `rank` и признак закрытости
+`terminal`. Совпадение справочника с `Status::all()` проверяется тестом.
+
+```sql
+CREATE TABLE statuses (name TEXT PRIMARY KEY, rank INTEGER NOT NULL UNIQUE,
+                       terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0,1)));
+```
+
+**`node_status_history` — факт перехода отдельно от журнала.** `burnup` вынимал дату закрытия из
+`activity_log` по паре `(field_name='status', new_value='done')`, и ряд держался на совпадении
+текста в пяти местах записи. Шестой путь (`import`) молча выпал — импорт проекта обнулял burn-up,
+это измерено. `cause` отличает ручной переход от закрытия через аренду; история переносится
+дампом как данные.
+
+```sql
+CREATE TABLE node_status_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+  from_status TEXT REFERENCES statuses(name),        -- NULL у первой записи узла
+  to_status   TEXT NOT NULL REFERENCES statuses(name),
+  cause TEXT NOT NULL CHECK (cause IN ('manual','lease_claimed','lease_completed',
+                                       'lease_released','unblock','gc','import','restore')),
+  at TEXT NOT NULL, actor TEXT
+);
+```
+
+**`sessions` — идентичность сессии, которой не было.** `attempts.holder` — имя агента: два
+параллельных процесса склеивались в одну сущность. `sessions.project_key` — привязка, которую
+выставляет первый успешный `claim`; по ней `next` сначала предлагает свой проект. У аренд,
+созданных до v4, `session_id` пуст: придумывать сессию задним числом — значит выдать догадку за
+факт.
+
+Кроме этого `activity_log.entity_type` получил `CHECK` на восемь значений, которые реально пишет
+код (`node`, `comment`, `note`, `edge`, `project`, `template`, `batch`, `import`): опечатка вроде
+`coment` раньше жила в базе годами.
 
 ### 5.2. Представления
 

@@ -99,6 +99,11 @@ pub fn restore(conn: &mut Connection, document: &Value) -> Result<RestoreReport>
             value: "нет объекта tables — это не дамп".to_string(),
         })?;
 
+    // Справочник статусов текущей схемы: с v4 `nodes.status` — ссылка на него, а не список в
+    // CHECK. Поэтому статус из чужого или старого дампа отбивается не общим «FOREIGN KEY
+    // constraint failed», а названным статусом — иначе в отчёте не видно, что именно не так.
+    let known_statuses = known_statuses(conn)?;
+
     let mut report = RestoreReport {
         schema_from,
         schema_to: SUPPORTED_SCHEMA_VERSION,
@@ -179,6 +184,24 @@ pub fn restore(conn: &mut Connection, document: &Value) -> Result<RestoreReport>
                 continue;
             }
             let address = row_address(table, row, &project_keys, &node_addresses);
+            if *table == "nodes" {
+                let status = row
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !known_statuses.contains(status) {
+                    table_losses += 1;
+                    report.losses.push(RestoreLoss {
+                        table: (*table).to_string(),
+                        address,
+                        reason: format!(
+                            "статус `{status}` не зарегистрирован в справочнике схемы \
+                             v{SUPPORTED_SCHEMA_VERSION}"
+                        ),
+                    });
+                    continue;
+                }
+            }
             if !missing_required.is_empty() {
                 // Без обязательного поля строку не вставить; сообщаем один раз на таблицу,
                 // иначе отчёт на большой базе превращается в список одинаковых строк.
@@ -273,6 +296,17 @@ pub fn restore(conn: &mut Connection, document: &Value) -> Result<RestoreReport>
     tx.commit()?;
     report.committed = true;
     Ok(report)
+}
+
+/// Имена статусов из справочника текущей схемы.
+fn known_statuses(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM statuses")?;
+    let mut rows = stmt.query([])?;
+    let mut names = std::collections::HashSet::new();
+    while let Some(row) = rows.next()? {
+        names.insert(row.get::<_, String>(0)?);
+    }
+    Ok(names)
 }
 
 /// Колонки таблицы в текущей схеме; пусто — таблицы нет.
