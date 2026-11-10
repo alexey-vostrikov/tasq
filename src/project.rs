@@ -12,6 +12,38 @@ pub struct Project {
     pub key: String,
     pub name: String,
     pub status: String,
+    /// Политика реоткрытия закрытых узлов (`metadata.reopen`).
+    ///
+    /// Читается один раз при выборе проекта и едет вместе с ним: иначе `check_transition`
+    /// пришлось бы на каждом переходе ходить в базу за настройкой, а это лишний запрос в
+    /// самой горячей точке записи.
+    pub reopen: crate::status::Reopen,
+}
+
+/// Строка `projects` → `Project`. Один конструктор на все запросы: четыре копии одного
+/// `SELECT id, key, name, status` уже разошлись однажды, и новое поле пришлось бы добавлять в
+/// каждую.
+fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    let metadata: String = row.get("metadata")?;
+    let reopen = serde_json::from_str::<serde_json::Value>(&metadata)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("reopen")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .and_then(|value| crate::status::Reopen::parse(&value))
+        // Неизвестное значение политики читается как строгий режим: молча ослаблять правило
+        // безопасности из-за опечатки в JSON нельзя, а `doctor` покажет метаданные рядом.
+        .unwrap_or_default();
+    Ok(Project {
+        id: row.get("id")?,
+        key: row.get("key")?,
+        name: row.get("name")?,
+        status: row.get("status")?,
+        reopen,
+    })
 }
 
 /// Проект для списка: к нему добавлено число живых узлов.
@@ -33,16 +65,9 @@ pub struct Summary {
 /// проекта при `init` пустой базы, тестовые фикстуры.
 pub fn first_project(conn: &Connection) -> Result<Project> {
     conn.query_row(
-        "SELECT id, key, name, status FROM projects ORDER BY id LIMIT 1",
+        "SELECT id, key, name, status, metadata FROM projects ORDER BY id LIMIT 1",
         [],
-        |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                key: row.get(1)?,
-                name: row.get(2)?,
-                status: row.get(3)?,
-            })
-        },
+        from_row,
     )
     .optional()?
     .ok_or(Error::NoProject)
@@ -52,16 +77,9 @@ pub fn first_project(conn: &Connection) -> Result<Project> {
 pub fn by_key(conn: &Connection, key: &str) -> Result<Option<Project>> {
     Ok(conn
         .query_row(
-            "SELECT id, key, name, status FROM projects WHERE key = ?1",
+            "SELECT id, key, name, status, metadata FROM projects WHERE key = ?1",
             params![key],
-            |row| {
-                Ok(Project {
-                    id: row.get(0)?,
-                    key: row.get(1)?,
-                    name: row.get(2)?,
-                    status: row.get(3)?,
-                })
-            },
+            from_row,
         )
         .optional()?)
 }
@@ -69,16 +87,9 @@ pub fn by_key(conn: &Connection, key: &str) -> Result<Option<Project>> {
 /// Проект по внутреннему id.
 pub fn by_id(conn: &Connection, id: i64) -> Result<Project> {
     conn.query_row(
-        "SELECT id, key, name, status FROM projects WHERE id = ?1",
+        "SELECT id, key, name, status, metadata FROM projects WHERE id = ?1",
         params![id],
-        |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                key: row.get(1)?,
-                name: row.get(2)?,
-                status: row.get(3)?,
-            })
-        },
+        from_row,
     )
     .optional()?
     .ok_or(Error::NoProject)
@@ -170,16 +181,9 @@ pub fn select(conn: &Connection, key: Option<&str>) -> Result<Project> {
         }),
         None => {
             let mut stmt =
-                conn.prepare("SELECT id, key, name, status FROM projects ORDER BY id")?;
+                conn.prepare("SELECT id, key, name, status, metadata FROM projects ORDER BY id")?;
             let projects: Vec<Project> = stmt
-                .query_map([], |row| {
-                    Ok(Project {
-                        id: row.get(0)?,
-                        key: row.get(1)?,
-                        name: row.get(2)?,
-                        status: row.get(3)?,
-                    })
-                })?
+                .query_map([], from_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             match projects.len() {
                 0 => Err(Error::NoProject),
@@ -201,16 +205,10 @@ pub fn select(conn: &Connection, key: Option<&str>) -> Result<Project> {
 /// Для операций, где «любой проект» возникает сам: сессия потеряла свой проект удалением,
 /// и переезд возможен только тогда, когда переезжать некуда — проект один.
 pub fn first_project_if_single(conn: &Connection) -> Result<Option<Project>> {
-    let mut stmt = conn.prepare("SELECT id, key, name, status FROM projects ORDER BY id")?;
+    let mut stmt =
+        conn.prepare("SELECT id, key, name, status, metadata FROM projects ORDER BY id")?;
     let projects: Vec<Project> = stmt
-        .query_map([], |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                key: row.get(1)?,
-                name: row.get(2)?,
-                status: row.get(3)?,
-            })
-        })?
+        .query_map([], from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(match projects.len() {
         1 => projects.into_iter().next(),
@@ -269,6 +267,8 @@ pub fn create(conn: &mut Connection, key: &str, name: Option<&str>) -> Result<Pr
         key,
         name,
         status: "active".to_string(),
+        // Новый проект создаётся с пустыми метаданными, значит политика — по умолчанию.
+        reopen: crate::status::Reopen::default(),
     })
 }
 

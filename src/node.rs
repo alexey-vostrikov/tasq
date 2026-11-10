@@ -11,7 +11,7 @@ use crate::db::{self, now_iso};
 use crate::error::{Error, Result};
 use crate::history;
 use crate::project::Project;
-use crate::status::{Kind, Status, check_transition};
+use crate::status::{Kind, Status, check_with_policy};
 
 /// Предел глубины дерева (README §5.3, инвариант 2).
 ///
@@ -506,7 +506,15 @@ pub fn update(
     }
 
     if let Some(target) = patch.status {
-        check_transition(node.stored_status(), target, node.kind(), patch.force)?;
+        // Политика реоткрытия — из проекта, а не из кода: где-то `--force` обязателен,
+        // где-то мешает. Матрица (куда можно) остаётся общей.
+        check_with_policy(
+            node.stored_status(),
+            target,
+            node.kind(),
+            patch.force,
+            project.reopen,
+        )?;
         if target == Status::Done {
             let unfinished = unfinished_children(conn, node.id)?;
             if unfinished > 0 && !patch.force {
@@ -839,6 +847,9 @@ pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
                     key: String::new(),
                     name: String::new(),
                     status: String::new(),
+                    // Политика тут не нужна: заглушка живёт только внутри `map_node`, который
+                    // строит dot-ID и не проверяет переходы.
+                    reopen: crate::status::Reopen::default(),
                 },
             )?;
             node.dot_id = format!("{key}-{path}");

@@ -66,9 +66,15 @@ pub enum Error {
         kind: String,
     },
 
-    /// Переход из закрытого состояния требует `force`.
+    /// Переход из закрытого состояния требует `force` (политика проекта `force_required`).
     #[error("moving from {from} to {to} requires force")]
-    ForceRequired { from: String, to: String },
+    ForceRequired {
+        from: String,
+        to: String,
+        /// Действующая политика реоткрытия: нужна подсказке, чтобы она говорила про этот
+        /// проект, а не про код вообще.
+        reopen: String,
+    },
 
     /// У узла есть незавершённые дети.
     #[error("node {dot_id} has {unfinished} unfinished child(ren)")]
@@ -264,7 +270,9 @@ impl Error {
             // Недостижимо через `hint`: переход перехватывается выше и получает список из
             // матрицы. Оставлено как защита на случай прямого вызова изнутри модуля.
             Error::InvalidTransition { .. } => "see the transition matrix in the README, §7",
-            Error::ForceRequired { .. } => "add --force to reopen a closed node",
+            Error::ForceRequired { .. } => {
+                "add --force to reopen a closed node, or set metadata.reopen to allow in the project"
+            }
             Error::ChildrenUnfinished { .. } => {
                 "finish or cancel the children first, or add --force"
             }
@@ -398,6 +406,7 @@ mod tests {
             Error::ForceRequired {
                 from: "done".to_string(),
                 to: "todo".to_string(),
+                reopen: "force_required".to_string(),
             },
             Error::ChildrenUnfinished {
                 dot_id: "TASQ-1".to_string(),

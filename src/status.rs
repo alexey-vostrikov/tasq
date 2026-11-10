@@ -1,5 +1,7 @@
 //! Статусы, виды узлов и матрица переходов (README §7).
 
+use serde::Serialize;
+
 use crate::error::{Error, Result};
 
 /// Вид узла. Определяет допустимый набор статусов и стартовое значение.
@@ -150,6 +152,12 @@ impl Status {
     }
 
     /// Переход требует явного `force`: возврат из закрытого состояния.
+    /// Нужен ли `--force`, чтобы вернуть закрытый узел в работу.
+    ///
+    /// Само правило — структура (какие пары «закрытый → в работу» существуют), но его
+    /// СТРОГОСТЬ — политика проекта: у одного проекта реоткрытие требует явного подтверждения,
+    /// у другого (где закрывают по ошибке часто) — нет. Поэтому функция отвечает только на
+    /// «есть ли пара», а нужен ли флаг — решает [`Reopen`].
     pub fn requires_force(from: Status, to: Status) -> bool {
         matches!(
             (from, to),
@@ -176,6 +184,53 @@ impl Status {
     }
 }
 
+/// Политика реоткрытия закрытого узла — свойство проекта, а не кода.
+///
+/// Это первое, что действительно хочется менять без релиза: в проекте, где задачи закрывают
+/// по ошибке, `--force` на каждое реоткрытие только мешает; в проекте с аудитом — наоборот,
+/// обязателен. К матрице переходов политика не относится: она не меняет, КУДА можно, она
+/// меняет, нужен ли явный флаг.
+// `Default` выводится, а не пишется руками: значение по умолчанию — часть описания типа, и
+// держать его отдельным блоком значит давать повод разойтись.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reopen {
+    /// По умолчанию: вернуть `done`/`cancelled` в работу можно только с `--force`.
+    #[default]
+    ForceRequired,
+    /// Реоткрытие разрешено без флага (проект сам так решил).
+    Allowed,
+}
+
+impl Reopen {
+    /// Разбор значения из `projects.metadata.reopen`.
+    ///
+    /// Неизвестное значение — ошибка, а не «по умолчанию»: опечатка в настройке политики
+    /// молча вернула бы строгий режим, и человек не понял бы, почему флаг всё ещё нужен.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "force_required" | "force" => Some(Reopen::ForceRequired),
+            "allow" | "allowed" => Some(Reopen::Allowed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reopen::ForceRequired => "force_required",
+            Reopen::Allowed => "allow",
+        }
+    }
+
+    /// Нужен ли флаг для этой пары при этой политике.
+    fn needs_force(self, from: Status, to: Status) -> bool {
+        match self {
+            Reopen::ForceRequired => Status::requires_force(from, to),
+            Reopen::Allowed => false,
+        }
+    }
+}
+
 /// Куда можно перейти из этого статуса у узла этого вида.
 ///
 /// Нужен подсказке об отказе: «см. матрицу в README» для человека — лишний шаг, а для
@@ -191,6 +246,21 @@ pub fn allowed_next(from: Status, kind: Kind) -> Vec<Status> {
 
 /// Проверка перехода с выдачей предметной ошибки.
 pub fn check_transition(from: Status, to: Status, kind: Kind, force: bool) -> Result<()> {
+    check_with_policy(from, to, kind, force, Reopen::default())
+}
+
+/// То же, но с политикой реоткрытия проекта.
+///
+/// Отдельная функция, а не лишний параметр у `check_transition`: матрица переходов — правило
+/// кода, политика реоткрытия — настройка проекта, и склеивать их в одной сигнатуре значило бы
+/// заставлять каждого вызывающего знать про политику, даже когда он её не спрашивает.
+pub fn check_with_policy(
+    from: Status,
+    to: Status,
+    kind: Kind,
+    force: bool,
+    policy: Reopen,
+) -> Result<()> {
     if from == to {
         return Ok(());
     }
@@ -201,10 +271,11 @@ pub fn check_transition(from: Status, to: Status, kind: Kind, force: bool) -> Re
             kind: kind.as_str().to_string(),
         });
     }
-    if Status::requires_force(from, to) && !force {
+    if policy.needs_force(from, to) && !force {
         return Err(Error::ForceRequired {
             from: from.as_str().to_string(),
             to: to.as_str().to_string(),
+            reopen: policy.as_str().to_string(),
         });
     }
     Ok(())
