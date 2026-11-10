@@ -602,18 +602,15 @@ fn unwritten_data_does_not_outlive_the_flush_interval() {
     let after_write = wal_size(&dir);
     assert!(after_write > 0, "сразу после записи журнал не пуст");
 
-    // Интервал 1 с: ждём с запасом, журнал обязан обнулиться.
-    let mut flushed = 0;
-    for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        flushed = wal_size(&dir);
-        if flushed == 0 {
-            break;
-        }
-    }
+    // Интервал 1 с, но проверяемое свойство — «журнал усекается», а не «ровно через секунду».
+    //
+    // Потолок — 30 с: весь набор тестов идёт параллельно (42 бинарника, каждый со своими
+    // дочерними процессами), и поток сброса на загруженной машине получает квант заметно
+    // позже. Фиксированные 6 с в таком режиме уже давали ложное падение на исправном коде.
+    let flushed = wait_for_wal_truncated(&dir, std::time::Duration::from_secs(30));
     assert_eq!(
         flushed, 0,
-        "через интервал сброса журнал должен быть усечён (было {after_write} байт)"
+        "журнал так и не усечён, хотя интервал сброса 1 с (было {after_write} байт)"
     );
 
     let _ = child.kill();
@@ -679,7 +676,7 @@ fn a_held_read_transaction_is_reported_as_stalled_flush() {
     assert_eq!(response["result"]["isError"], json!(false), "{response}");
     // Сброс идёт по своему тику (`--flush 1`), поэтому ждём наступления, а не фиксированные
     // три секунды: под нагрузкой тик опаздывает, и тест падал бы на исправном коде.
-    let left = wait_for_wal_truncated(&dir, std::time::Duration::from_secs(20));
+    let left = wait_for_wal_truncated(&dir, std::time::Duration::from_secs(30));
     let _ = child.kill();
     let _ = child.wait();
     assert_eq!(left, 0, "после освобождения журнал так и не усечён");

@@ -99,16 +99,39 @@ pub fn link(
         });
     }
 
+    // Проверки на цикл идут ВНУТРИ транзакции, а не до неё. Причина одна и та же у всех
+    // подобных проверок в проекте: между проверкой и записью другой писатель мог успеть
+    // добавить встречное ребро, и оба прошли бы проверку на старом графе.
+    //
+    // Сценарий не теоретический: две задачи `A блокирует B` и `B блокирует A`, добавленные
+    // одновременно двумя сессиями, дают замкнутую пару — ровно то, что README §5.3 запрещает.
+    // Внутри `BEGIN IMMEDIATE` второй писатель видит уже вставленное первое ребро.
+    let tx = crate::db::write_tx(conn)?;
+
     if kind.is_blocking() {
-        let same_branch = to.path.starts_with(&format!("{}.", from.path))
-            || from.path.starts_with(&format!("{}.", to.path));
+        // Пути перечитываются из соединения уже под блокировкой: узел могли перенести.
+        let from_path: String = tx.query_row(
+            "SELECT path FROM nodes WHERE id = ?1",
+            params![from.id],
+            |row| row.get(0),
+        )?;
+        let to_path: String = tx.query_row(
+            "SELECT path FROM nodes WHERE id = ?1",
+            params![to.id],
+            |row| row.get(0),
+        )?;
+        let same_branch = to_path.starts_with(&format!("{from_path}."))
+            || from_path.starts_with(&format!("{to_path}."));
         if same_branch {
             return Err(Error::AncestorBlockEdge {
                 dot_id: from.dot_id.clone(),
                 other: to.dot_id.clone(),
             });
         }
-        if let Some(chain) = find_path(conn, project, to.id, from.id)? {
+        // Цепочка ищется от `to` к `from`: если она есть, новое ребро замкнёт круг.
+        // Поиск транзитивный, поэтому ловится любая длина — и пара из двух задач, и цепочка
+        // из пяти, и круг, замкнутый через третью ветку.
+        if let Some(chain) = find_path(&tx, project, to.id, from.id)? {
             // Цепочка восстановлена от `to` до `from`; круг читается как from -> to -> … -> from.
             let mut path: Vec<String> = chain.into_iter().map(|(_, dot)| dot).collect();
             path.insert(0, from.dot_id.clone());
@@ -120,7 +143,6 @@ pub fn link(
         }
     }
 
-    let tx = crate::db::write_tx(conn)?;
     let now = now_iso();
     // Дубликат — не ошибка: повторная заявка того же ребра идемпотентна.
     tx.execute(
