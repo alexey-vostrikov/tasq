@@ -745,9 +745,12 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
     }
     if let Some(parent) = filter.parent {
         let root = resolve(conn, project, parent)?;
-        sql.push_str(" AND (e.path = ? OR e.path GLOB ?)");
-        values.push(Value::Text(root.path.clone()));
-        values.push(Value::Text(format!("{}.*", root.path)));
+        // Поддерево — обходом по структуре: `path GLOB` сканирует все узлы проекта (замер и
+        // объяснение — в `crate::tree`).
+        sql.push_str(" AND e.id IN (");
+        sql.push_str(&crate::tree::subtree_sql());
+        sql.push(')');
+        values.push(Value::Integer(root.id));
     }
     if let Some(status) = filter.status {
         sql.push_str(" AND e.effective_status = ?");
@@ -992,28 +995,28 @@ pub fn move_node(
     let new_path = candidate(seq);
     validate_path(&new_path)?;
 
-    let deepest: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(depth), ?1) FROM nodes
-         WHERE project_id = ?2 AND (path = ?3 OR path GLOB ?4)",
-        params![
-            node.depth,
-            project.id,
-            node.path,
-            format!("{}.*", node.path)
-        ],
-        |row| row.get(0),
-    )?;
+    // Глубина считается по структуре: `depth` узла плюс самый длинный путь вниз от него.
+    // Два запроса, а не один с подзапросом: у внешнего и внутреннего `?` общий счётчик, и
+    // смешивать их в одном тексте — способ перепутать параметры при правке.
+    let relative_deepest: i64 = tx
+        .query_row(
+            &crate::tree::subtree_max_depth_sql(),
+            params![node.id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .unwrap_or(0);
+    let deepest = node.depth + relative_deepest;
     let delta = new_depth - node.depth;
     if deepest + delta > MAX_DEPTH {
         return Err(Error::DepthLimit);
     }
 
     let descendants: Vec<(i64, String, i64)> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, path, depth FROM nodes
-             WHERE project_id = ?1 AND path GLOB ?2 ORDER BY path",
-        )?;
-        stmt.query_map(params![project.id, format!("{}.*", node.path)], |row| {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, path, depth FROM nodes WHERE id IN ({}) ORDER BY path",
+            crate::tree::descendants_sql()
+        ))?;
+        stmt.query_map(params![node.id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1025,18 +1028,15 @@ pub fn move_node(
          WHERE id = ?6",
         params![parent_id, new_depth, seq, new_path, now, node.id],
     )?;
+    // Потомки переезжают по структуре: `substr(path, …)` остаётся, потому что `path` хранится,
+    // но ОТБОР идёт обходом, а не сравнением строк.
     tx.execute(
-        "UPDATE nodes SET path = ?1 || substr(path, ?2), depth = depth + ?3, updated_at = ?4
-         WHERE project_id = ?5 AND (path = ?6 OR path GLOB ?7)",
-        params![
-            new_path,
-            node.path.len() as i64 + 1,
-            delta,
-            now,
-            project.id,
-            node.path,
-            format!("{}.*", node.path)
-        ],
+        &format!(
+            "UPDATE nodes SET path = ? || substr(path, ?), depth = depth + ?, updated_at = ?
+             WHERE id IN ({})",
+            crate::tree::descendants_sql()
+        ),
+        params![new_path, node.path.len() as i64 + 1, delta, now, node.id],
     )?;
 
     let new_dot = project.dot_id(&new_path);
@@ -1137,15 +1137,11 @@ pub fn archive(
     let now = now_iso();
     let tx = db::write_tx(conn)?;
     let affected = tx.execute(
-        "UPDATE nodes SET archived_at = ?1, updated_at = ?2
-         WHERE project_id = ?3 AND (path = ?4 OR path GLOB ?5)",
-        params![
-            if undo { None } else { Some(now.clone()) },
-            now,
-            project.id,
-            node.path,
-            format!("{}.*", node.path)
-        ],
+        &format!(
+            "UPDATE nodes SET archived_at = ?, updated_at = ? WHERE id IN ({})",
+            crate::tree::subtree_sql()
+        ),
+        params![if undo { None } else { Some(now.clone()) }, now, node.id],
     )?;
     activity::log(
         &tx,

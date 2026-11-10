@@ -25,6 +25,7 @@ pub mod resource;
 pub mod status;
 pub mod template;
 pub mod transfer;
+pub mod tree;
 
 pub use error::{Error, Result};
 

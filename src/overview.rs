@@ -450,10 +450,11 @@ pub fn time_report(
     project: &Project,
     reference: Option<&str>,
 ) -> Result<Vec<TimeRow>> {
-    let subtree = match reference {
+    // Отбор поддерева — по id: обход структуры вместо скана по `path GLOB` (см. `crate::tree`).
+    let subtree_id = match reference {
         Some(reference) => {
             let node = node::resolve(conn, project, reference)?;
-            Some(node.path)
+            Some(node.id)
         }
         None => None,
     };
@@ -466,10 +467,11 @@ pub fn time_report(
          WHERE n.project_id = ?1 AND n.deleted_at IS NULL",
     );
     let mut values: Vec<Value> = vec![Value::Integer(project.id)];
-    if let Some(path) = &subtree {
-        sql.push_str(" AND (n.path = ? OR n.path GLOB ?)");
-        values.push(Value::Text(path.clone()));
-        values.push(Value::Text(format!("{path}.*")));
+    if let Some(id) = subtree_id {
+        sql.push_str(" AND n.id IN (");
+        sql.push_str(&crate::tree::subtree_sql());
+        sql.push(')');
+        values.push(Value::Integer(id));
     }
     sql.push_str(" ORDER BY n.path");
 

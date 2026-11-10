@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v8**.
+Версия схемы: **v9**.
 
 ## Таблицы
 
@@ -491,5 +491,12 @@ CREATE INDEX idx_status_history_to ON node_status_history(to_status, at)
 
 ```sql
 CREATE UNIQUE INDEX uq_attempts_live ON attempts(node_id) WHERE ended_at IS NULL
+```
+
+### `uq_nodes_sibling_seq`
+
+```sql
+CREATE UNIQUE INDEX uq_nodes_sibling_seq
+  ON nodes(project_id, COALESCE(parent_id, 0), seq)
 ```
 

@@ -293,10 +293,13 @@ fn foreign_and_future_documents_are_refused_before_writing() {
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("INVALID_VALUE"), "{stderr}");
 
-    let future = dir.join("v9.json");
+    // Версия «из будущего» вычисляется, а не пишется числом: литерал устаревает в тот же день,
+    // когда выходит следующая миграция, и тест начинает проверять не то.
+    let future = dir.join("future.json");
+    let beyond = tasq::db::SUPPORTED_SCHEMA_VERSION + 1;
     fs::write(
         &future,
-        r#"{"kind":"tasq-dump","format":1,"schema_version":9,"tables":{}}"#,
+        format!(r#"{{"kind":"tasq-dump","format":1,"schema_version":{beyond},"tables":{{}}}}"#),
     )
     .expect("write");
     let (code, _, stderr) = run_in(&dir, &target, &["load", future.to_str().expect("p")]);
