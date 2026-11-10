@@ -176,6 +176,19 @@ impl Status {
     }
 }
 
+/// Куда можно перейти из этого статуса у узла этого вида.
+///
+/// Нужен подсказке об отказе: «см. матрицу в README» для человека — лишний шаг, а для
+/// MCP-агента — тупик, потому что README он не читает. Список строится из той же матрицы,
+/// поэтому не может с ней разойтись.
+pub fn allowed_next(from: Status, kind: Kind) -> Vec<Status> {
+    Status::all()
+        .iter()
+        .copied()
+        .filter(|to| *to != from && Status::can_transition(from, *to, kind))
+        .collect()
+}
+
 /// Проверка перехода с выдачей предметной ошибки.
 pub fn check_transition(from: Status, to: Status, kind: Kind, force: bool) -> Result<()> {
     if from == to {

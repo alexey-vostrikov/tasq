@@ -534,6 +534,23 @@ fn wal_size(dir: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
+/// Ждёт, пока журнал усечётся, вместо фиксированной паузы.
+///
+/// Фиксированный `sleep` — это гонка с чужим таймером: сброс идёт по своему тику, а под
+/// параллельной нагрузкой (весь набор тестов в одном прогоне) тик легко опаздывает, и тест
+/// падает на исправном коде. Проверяемое свойство — «журнал в конце концов усечён», а не
+/// «усечён ровно через три секунды», поэтому и ждать надо до наступления, с потолком.
+fn wait_for_wal_truncated(dir: &std::path::Path, limit: std::time::Duration) -> u64 {
+    let started = std::time::Instant::now();
+    loop {
+        let size = wal_size(dir);
+        if size == 0 || started.elapsed() >= limit {
+            return size;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn spawn_server(dir: &std::path::Path, extra: &[&str]) -> std::process::Child {
     Command::new(bin())
         .current_dir(dir)
@@ -660,8 +677,10 @@ fn a_held_read_transaction_is_reported_as_stalled_flush() {
     let mut child = spawn_server(&dir, &["--flush", "1"]);
     let response = write_one(&mut child, "Узел после освобождения");
     assert_eq!(response["result"]["isError"], json!(false), "{response}");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Сброс идёт по своему тику (`--flush 1`), поэтому ждём наступления, а не фиксированные
+    // три секунды: под нагрузкой тик опаздывает, и тест падал бы на исправном коде.
+    let left = wait_for_wal_truncated(&dir, std::time::Duration::from_secs(20));
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(wal_size(&dir), 0, "после освобождения журнал усечён");
+    assert_eq!(left, 0, "после освобождения журнал так и не усечён");
 }

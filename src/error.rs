@@ -231,7 +231,18 @@ impl Error {
         }
     }
 
-    pub fn hint(&self) -> &'static str {
+    /// Подсказка «что делать». `String`, а не `&'static str`: часть подсказок зависит от
+    /// состояния ошибки (например, `INVALID_TRANSITION` называет допустимые статусы из матрицы),
+    /// и держать их константой значило бы отправлять читателя в README за ответом, который у
+    /// нас уже есть.
+    pub fn hint(&self) -> String {
+        if let Error::InvalidTransition { from, kind, .. } = self {
+            return transition_hint(from, kind);
+        }
+        self.static_hint().to_string()
+    }
+
+    fn static_hint(&self) -> &'static str {
         match self {
             Error::DbNotFound(_) => "run `tasq init` in the project root",
             Error::NoProject => "run `tasq init` to register a project",
@@ -250,6 +261,8 @@ impl Error {
             Error::InvalidRef(_) => "run `tasq ls` to see the available dot-notation IDs",
             Error::NodeNotFound(_) => "run `tasq ls` to see the available nodes",
             Error::AmbiguousId(_, _) => "prefix the reference with the project key",
+            // Недостижимо через `hint`: переход перехватывается выше и получает список из
+            // матрицы. Оставлено как защита на случай прямого вызова изнутри модуля.
             Error::InvalidTransition { .. } => "see the transition matrix in the README, §7",
             Error::ForceRequired { .. } => "add --force to reopen a closed node",
             Error::ChildrenUnfinished { .. } => {
@@ -307,6 +320,35 @@ impl Error {
             }
         })
     }
+}
+
+/// Подсказка к `INVALID_TRANSITION`: перечисляет, куда действительно можно.
+///
+/// Список берётся из матрицы (`status::allowed_next`), а не пишется в тексте: так он не может
+/// разойтись с правилом, и новый статус появляется в подсказке сам. Если допустимых переходов
+/// нет вовсе (тупиковый статус), об этом говорится прямо — иначе пустой список читался бы как
+/// сбой.
+fn transition_hint(from: &str, kind: &str) -> String {
+    use crate::status::{Kind, Status, allowed_next};
+
+    let (Some(from), Some(kind)) = (Status::parse(from), Kind::parse(kind)) else {
+        return "see the transition matrix in the README, §7".to_string();
+    };
+    let allowed = allowed_next(from, kind);
+    if allowed.is_empty() {
+        return format!(
+            "nothing follows `{}` for a {}: try --force or pick another target",
+            from.as_str(),
+            kind.as_str()
+        );
+    }
+    let names: Vec<&str> = allowed.iter().map(|status| status.as_str()).collect();
+    format!(
+        "from `{}` a {} can go to: {} (or --force to override)",
+        from.as_str(),
+        kind.as_str(),
+        names.join(", ")
+    )
 }
 
 /// Форма ошибки в `--json` для потребителей, которым нужен тип.
