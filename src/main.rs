@@ -691,6 +691,23 @@ fn open(
     Ok((conn, project))
 }
 
+/// Соединение и проект для команды, работающей со ссылкой на узел.
+///
+/// Отличие от `open`: селектора может не быть вовсе — тогда проект берётся из ключа в самой
+/// ссылке (`DEV-1.1` ведёт в DEV). Без этого адреса, которые выдаёт обзор по всем проектам,
+/// нельзя было бы открыть: `show DEV-1.1` отвечал бы PROJECT_REQUIRED.
+fn open_ref(
+    db_path: Option<&std::path::Path>,
+    project_key: Option<&str>,
+    reference: &str,
+) -> Result<(Connection, Project)> {
+    let cwd = std::env::current_dir()?;
+    let path = db::discover(&cwd, db_path)?;
+    let conn = db::open_checked(&path)?;
+    let project = project::for_reference(&conn, project_key, reference)?;
+    Ok((conn, project))
+}
+
 fn parse_status(value: &str) -> Result<Status> {
     Status::parse(value).ok_or_else(|| Error::InvalidValue {
         field: "status".to_string(),
@@ -1270,7 +1287,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Show { reference, tree } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (conn, project) = open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             if *tree {
                 let nodes = node::subtree(&conn, &project, reference)?;
                 let root_depth = nodes.first().map(|n| n.depth).unwrap_or(0);
@@ -1428,7 +1445,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             lock_desc,
             unlock_desc,
         } => {
-            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (mut conn, project) =
+                open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let status = match status {
                 Some(value) => Some(parse_status(value)?),
                 None => None,
@@ -1474,7 +1492,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             parent,
             renumber,
         } => {
-            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (mut conn, project) =
+                open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let moved =
                 node::move_node(&mut conn, &project, reference, parent.as_deref(), *renumber)?;
             if cli.json {
@@ -1486,7 +1505,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Rm { reference } => {
-            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (mut conn, project) =
+                open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             node::delete(&mut conn, &project, reference)?;
             if cli.json {
                 print_json(&serde_json::json!({ "deleted": true, "ref": reference }));
@@ -1497,7 +1517,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Restore { reference } => {
-            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (mut conn, project) =
+                open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let restored = node::restore(&mut conn, &project, reference)?;
             if cli.json {
                 print_json(&restored);
@@ -1508,7 +1529,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Archive { reference, undo } => {
-            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (mut conn, project) =
+                open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let affected = node::archive(&mut conn, &project, reference, *undo)?;
             if cli.json {
                 print_json(&serde_json::json!({
@@ -1565,7 +1587,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             reserve_logical,
             shared,
         } => {
-            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (mut conn, project) =
+                open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let holder = holder.clone().unwrap_or_else(|| "cli".to_string());
             let resources = collect_resources(reserve, reserve_glob, reserve_logical, *shared);
             let lease = lease::claim(
@@ -1772,7 +1795,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 depth,
                 mermaid,
             } => {
-                let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+                let (conn, project) =
+                    open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
                 let graph = edge::graph(&conn, &project, reference, *depth)?;
                 if cli.json {
                     // `--mermaid` и `--json` вместе: отдаём оба вида, иначе флаг молча
@@ -2047,7 +2071,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Ctx { reference } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (conn, project) = open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let chain = overview::context(&conn, &project, reference)?;
             if cli.json {
                 print_json(&chain);
@@ -2107,7 +2131,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Time { parent } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (conn, project) = open_ref(
+                cli.db.as_deref(),
+                cli.project.as_deref(),
+                parent.as_deref().unwrap_or(""),
+            )?;
             let rows = overview::time_report(&conn, &project, parent.as_deref())?;
             if cli.json {
                 print_json(&rows);

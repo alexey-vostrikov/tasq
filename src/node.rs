@@ -93,6 +93,37 @@ fn parse_ref(project: &Project, reference: &str) -> Result<Ref> {
     Ok(Ref::Path(path))
 }
 
+/// Ключ проекта, если ссылка его несёт: `DEV-1.1` → `Some("DEV")`.
+///
+/// Адрес узла самодостаточен, поэтому ключ в ссылке — это выбор проекта. `#12` ключа не
+/// несёт: внутренний id однозначен только внутри проекта.
+pub fn ref_key(reference: &str) -> Option<String> {
+    let raw = reference.trim();
+    if raw.starts_with('#') {
+        return None;
+    }
+    match raw.split_once('-') {
+        Some((prefix, rest)) if is_key_like(prefix) && !rest.is_empty() => Some(prefix.to_string()),
+        _ => None,
+    }
+}
+
+/// Проект, к которому относится ссылка: ключ из неё важнее контекста.
+///
+/// Возвращается владеемое значение: в вызывающем коде ссылку и соединение заимствуют
+/// одновременно (`resolve(&conn, &project, …)`), и ссылка на поле контекста там не собралась бы.
+fn project_for_reference(conn: &Connection, context: &Project, reference: &str) -> Result<Project> {
+    match ref_key(reference) {
+        Some(key) if !key.eq_ignore_ascii_case(&context.key) => crate::project::by_key(conn, &key)?
+            .ok_or_else(|| Error::ProjectNotFound {
+                key,
+                known: crate::project::known_keys(conn).unwrap_or_else(|_| "unknown".to_string()),
+            }),
+        // Свой ключ (или его отсутствие) — контекст как есть.
+        _ => Ok(context.clone()),
+    }
+}
+
 fn is_key_like(prefix: &str) -> bool {
     (2..=8).contains(&prefix.len())
         && prefix
@@ -139,6 +170,28 @@ fn map_node(row: &Row<'_>, project: &Project) -> rusqlite::Result<Node> {
 
 /// Разрешает ссылку в узел проекта (без удалённых).
 pub fn resolve(conn: &Connection, project: &Project, reference: &str) -> Result<Node> {
+    Ok(resolve_with_project(conn, project, reference)?.1)
+}
+
+/// Разрешение ссылки вместе с проектом, к которому она относится.
+///
+/// Нужно там, где после разрешения идёт запись по `id` или в журнал: `load_by_id` и
+/// `activity::log` фильтруют по проекту, и проект контекста («работаю в ALPHA») искал бы узел
+/// чужого проекта по своему id — то есть ссылка `DEV-1.1` читалась бы, но правка падала бы
+/// `NODE_NOT_FOUND #4`.
+pub fn resolve_with_project(
+    conn: &Connection,
+    project: &Project,
+    reference: &str,
+) -> Result<(Project, Node)> {
+    // Ссылка с ключом ведёт в свой проект: `DEV-1.1` читается из сессии ALPHA.
+    let target = project_for_reference(conn, project, reference)?;
+    let node = resolve_in(conn, &target, reference)?;
+    Ok((target, node))
+}
+
+/// Разрешение ссылки внутри уже определённого проекта (ключ в ссылке сверяется с ним).
+fn resolve_in(conn: &Connection, project: &Project, reference: &str) -> Result<Node> {
     let node = match parse_ref(project, reference)? {
         Ref::Id(id) => conn
             .query_row(
@@ -164,6 +217,10 @@ pub fn resolve(conn: &Connection, project: &Project, reference: &str) -> Result<
 
 /// Разрешает ссылку, включая мягко удалённые узлы (для `restore`).
 fn resolve_any(conn: &Connection, project: &Project, reference: &str) -> Result<Node> {
+    // Ключ в ссылке важнее контекста и здесь: восстановить узел чужого проекта по адресу
+    // можно из любой сессии.
+    let target = project_for_reference(conn, project, reference)?;
+    let project = &target;
     let node = match parse_ref(project, reference)? {
         Ref::Id(id) => conn
             .query_row(
@@ -399,7 +456,8 @@ pub fn update(
     reference: &str,
     patch: Patch<'_>,
 ) -> Result<Node> {
-    let node = resolve(conn, project, reference)?;
+    // Проект берётся из ссылки: правка уходит туда, куда указывает адрес узла.
+    let (project, node) = resolve_with_project(conn, project, reference)?;
     if node.archived_at.is_some() {
         return Err(Error::AlreadyInState {
             dot_id: node.dot_id.clone(),
@@ -595,7 +653,7 @@ pub fn update(
         activity::log(&tx, &entry)?;
     }
     tx.commit()?;
-    load_by_id(conn, project, node.id)
+    load_by_id(conn, &project, node.id)
 }
 
 /// Фильтр для `ls`.
@@ -784,10 +842,10 @@ pub fn move_node(
     new_parent: Option<&str>,
     renumber: bool,
 ) -> Result<Node> {
-    let node = resolve(conn, project, reference)?;
+    let (project, node) = resolve_with_project(conn, project, reference)?;
     let (parent_id, new_depth, parent_path) = match new_parent {
         Some(reference) => {
-            let parent = resolve(conn, project, reference)?;
+            let parent = resolve(conn, &project, reference)?;
             if parent.id == node.id || parent.path.starts_with(&format!("{}.", node.path)) {
                 return Err(Error::MoveIntoSelf {
                     dot_id: node.dot_id.clone(),
@@ -918,7 +976,7 @@ pub fn move_node(
         )?;
     }
     tx.commit()?;
-    load_by_id(conn, project, node.id)
+    load_by_id(conn, &project, node.id)
 }
 
 /// Задаёт порядок сиблингов.
@@ -962,7 +1020,7 @@ pub fn archive(
     reference: &str,
     undo: bool,
 ) -> Result<usize> {
-    let node = resolve(conn, project, reference)?;
+    let (project, node) = resolve_with_project(conn, project, reference)?;
     if !undo && node.archived_at.is_some() {
         return Err(Error::AlreadyInState {
             dot_id: node.dot_id.clone(),
@@ -1011,7 +1069,7 @@ pub fn archive(
 /// Мягкое удаление: только узлы до начала работы — `idea`, `backlog`, `todo`
 /// (README §5.3, инвариант 10).
 pub fn delete(conn: &mut Connection, project: &Project, reference: &str) -> Result<()> {
-    let node = resolve(conn, project, reference)?;
+    let (project, node) = resolve_with_project(conn, project, reference)?;
     if !matches!(
         node.stored_status(),
         Status::Idea | Status::Backlog | Status::Todo
@@ -1048,6 +1106,8 @@ pub fn delete(conn: &mut Connection, project: &Project, reference: &str) -> Resu
 
 /// Возвращает мягко удалённый узел.
 pub fn restore(conn: &mut Connection, project: &Project, reference: &str) -> Result<Node> {
+    let target = project_for_reference(conn, project, reference)?;
+    let project = &target;
     let node = resolve_any(conn, project, reference)?;
     let deleted: Option<String> = conn.query_row(
         "SELECT deleted_at FROM nodes WHERE id = ?1",

@@ -119,8 +119,14 @@ fn reference_forms_resolve_to_the_same_node() {
         assert_eq!(resolved.id, task.id, "форма {reference}");
     }
 
+    // Ссылка с чужим ключом — не «битый адрес», а проект, которого нет: перечисляются
+    // существующие ключи. Раньше здесь был INVALID_REF, потому что ключ вообще не читался.
     let err = node::resolve(&conn, &project, "OTHER-1").unwrap_err();
-    assert_eq!(err.code(), "INVALID_REF");
+    assert_eq!(err.code(), "PROJECT_NOT_FOUND");
+    assert!(
+        err.to_string().contains("TASQ"),
+        "отказ перечисляет известные ключи: {err}"
+    );
     let err = node::resolve(&conn, &project, "TASQ-99").unwrap_err();
     assert_eq!(err.code(), "NODE_NOT_FOUND");
 }

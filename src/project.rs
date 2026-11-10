@@ -109,6 +109,28 @@ pub enum Scope {
     All,
 }
 
+/// Проект для команды, которая принимает ссылку на узел.
+///
+/// Порядок: явный селектор → ключ в самой ссылке → единственный проект базы. Ссылка с
+/// ключом самодостаточна: `tasq show DEV-1.1` работает без выбора проекта, иначе адреса,
+/// которые выдаёт обзор по всем проектам, нельзя было бы открыть.
+pub fn for_reference(
+    conn: &Connection,
+    selector: Option<&str>,
+    reference: &str,
+) -> Result<Project> {
+    if let Some(key) = selector.map(str::trim).filter(|value| !value.is_empty()) {
+        return select(conn, Some(key));
+    }
+    if let Some(key) = crate::node::ref_key(reference) {
+        return by_key(conn, &key)?.ok_or_else(|| Error::ProjectNotFound {
+            key,
+            known: known_keys(conn).unwrap_or_else(|_| "unknown".to_string()),
+        });
+    }
+    select(conn, None)
+}
+
 /// Селектор для команд обзора: `all` — все проекты, ключ — один, пусто — единственный.
 pub fn scope(conn: &Connection, key: Option<&str>) -> Result<Scope> {
     match key.map(str::trim).filter(|value| !value.is_empty()) {

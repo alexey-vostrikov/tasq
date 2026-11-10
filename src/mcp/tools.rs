@@ -39,6 +39,13 @@ impl Context {
         if let Some(active) = &self.active {
             return Ok(active.clone());
         }
+        // Проект не выбран и не задан — но ссылка может нести ключ (`DEV-1.1`): адрес узла
+        // самодостаточен, и сессия без проекта обязана уметь открыть то, что ей назвали.
+        if let Some(reference) = referenced_argument(args)
+            && let Some(key) = crate::node::ref_key(reference)
+        {
+            return crate::project::select(&self.conn, Some(&key));
+        }
         // В базе с единственным проектом выбора нет — это не дефолт среди вариантов.
         crate::project::select(&self.conn, None)
     }
@@ -75,6 +82,16 @@ fn error_content(err: &Error) -> Value {
         }],
         "isError": true,
     })
+}
+
+/// Первый аргумент-ссылка вызова: по ним проект определяется, когда он не задан явно.
+const REFERENCE_ARGUMENTS: &[&str] = &["ref", "reference", "parent", "from", "to", "node"];
+
+fn referenced_argument(args: &Value) -> Option<&str> {
+    REFERENCE_ARGUMENTS
+        .iter()
+        .filter_map(|key| arg_str(args, key))
+        .find(|value| crate::node::ref_key(value).is_some())
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
