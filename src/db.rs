@@ -9,25 +9,43 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 9;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 10;
 pub const DB_DIR: &str = ".tasq";
 pub const DB_FILE: &str = "tasq.db";
 
 /// Миграции применяются по возрастанию версии, каждая — один `execute_batch`.
-const MIGRATIONS: &[(i64, &str)] = &[
-    (1, include_str!("../migrations/0001_init.sql")),
-    (2, include_str!("../migrations/0002_search_and_time.sql")),
-    (3, include_str!("../migrations/0003_status_funnel.sql")),
-    (4, include_str!("../migrations/0004_status_registry.sql")),
-    (5, include_str!("../migrations/0005_expired_lease.sql")),
-    (6, include_str!("../migrations/0006_history_cause.sql")),
-    (7, include_str!("../migrations/0007_history_created.sql")),
-    (
-        8,
-        include_str!("../migrations/0008_progress_cycle_guard.sql"),
-    ),
-    (9, include_str!("../migrations/0009_sibling_uniqueness.sql")),
-];
+/// Все миграции по порядку.
+///
+/// Не `const`: миграция 0010 содержит заглушку `__MAX_DEPTH__`, и число в неё подставляется
+/// из `node::MAX_DEPTH` при каждом получении списка. Держать предел глубины вторым литералом в
+/// SQL значило бы иметь два числа на одно правило — ровно так и было: в v8 стояло 64, а
+/// правило гласит 16, и заметить это можно было только чтением файла.
+fn migrations() -> Vec<(i64, String)> {
+    let fixed: &[(i64, &str)] = &[
+        (1, include_str!("../migrations/0001_init.sql")),
+        (2, include_str!("../migrations/0002_search_and_time.sql")),
+        (3, include_str!("../migrations/0003_status_funnel.sql")),
+        (4, include_str!("../migrations/0004_status_registry.sql")),
+        (5, include_str!("../migrations/0005_expired_lease.sql")),
+        (6, include_str!("../migrations/0006_history_cause.sql")),
+        (7, include_str!("../migrations/0007_history_created.sql")),
+        (
+            8,
+            include_str!("../migrations/0008_progress_cycle_guard.sql"),
+        ),
+        (9, include_str!("../migrations/0009_sibling_uniqueness.sql")),
+    ];
+    let mut all: Vec<(i64, String)> = fixed
+        .iter()
+        .map(|(version, sql)| (*version, (*sql).to_string()))
+        .collect();
+    all.push((
+        10,
+        include_str!("../migrations/0010_progress_budget.sql")
+            .replace("__MAX_DEPTH__", &crate::node::MAX_DEPTH.to_string()),
+    ));
+    all
+}
 
 /// Время в UTC, ровно в том виде, в каком его печатает `strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
 /// чтобы строковые сравнения в SQL и в коде были согласованы.
@@ -305,7 +323,8 @@ pub fn init_at(db_path: &Path, key: &str, name: &str) -> Result<InitOutcome> {
 /// Применяет неприменённые миграции; возвращает `true`, если что-то применилось.
 fn apply_migrations(conn: &mut Connection) -> Result<bool> {
     let current = schema_version(conn)?;
-    if MIGRATIONS.iter().all(|(version, _)| *version <= current) {
+    let migrations = migrations();
+    if migrations.iter().all(|(version, _)| *version <= current) {
         return Ok(false);
     }
     // Внешние ключи выключаются ДО транзакции: внутри транзакции `PRAGMA foreign_keys`
@@ -322,7 +341,8 @@ fn apply_migrations(conn: &mut Connection) -> Result<bool> {
 
 fn run_migrations(conn: &mut Connection, current: i64) -> Result<bool> {
     let mut applied = false;
-    for (version, sql) in MIGRATIONS {
+    let migrations = migrations();
+    for (version, sql) in &migrations {
         if *version <= current {
             continue;
         }
@@ -371,6 +391,20 @@ pub struct DoctorReport {
     pub live_attempts: i64,
     pub expired_attempts: i64,
     pub orphan_reservations: i64,
+    /// Узлы глубже предела (`node::MAX_DEPTH`).
+    ///
+    /// Не ошибка и не повод чинить: такие узлы могли остаться от схем до v4. Но прогресс по ним
+    /// считается только до предела, и молчать об этом нельзя — иначе сумма по поддереву
+    /// выглядит неполной без причины.
+    pub nodes_beyond_depth: i64,
+    /// Верхняя граница строк обхода прогресса: `узлы × (предел + 1)`.
+    ///
+    /// Это и есть ответ на вопрос «сколько может стоить обход»: у узла не больше одного
+    /// родителя, поэтому каждая строка представления — пара (предок, потомок), и их не может
+    /// быть больше, чем узлов, умноженных на длину цепочки предков. Величина линейна по числу
+    /// узлов и не зависит от ветвления — в отличие от прежнего обхода вниз, где она равнялась
+    /// сумме размеров поддеревьев.
+    pub progress_scan_bound: i64,
     pub ok: bool,
 }
 
@@ -419,6 +453,17 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
         )?,
         expired_attempts,
         orphan_reservations,
+        // Узлы глубже предела считаются по тому же числу, что и правило глубины: если предел
+        // когда-нибудь изменится, отчёт обязан измениться вместе с ним.
+        nodes_beyond_depth: conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE deleted_at IS NULL AND depth > ?1",
+            [crate::node::MAX_DEPTH],
+            |row| row.get::<_, i64>(0),
+        )?,
+        // Верхняя граница объёма обхода прогресса: пара (предок, потомок) на каждый шаг вверх,
+        // у узла не больше одного родителя — значит строк не больше, чем узлов на длину цепочки.
+        progress_scan_bound: scalar("SELECT COUNT(*) FROM nodes WHERE deleted_at IS NULL")?
+            .saturating_mul(crate::node::MAX_DEPTH + 1),
         // Условия «схема не новее поддерживаемой» здесь нет намеренно: `doctor` открывает
         // базу через `open_checked`, который на новой схеме уже отказал, поэтому такое
         // слагаемое было бы всегда истинным (мёртвым), и его подмена не меняла бы отчёт.

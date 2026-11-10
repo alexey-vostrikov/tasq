@@ -155,6 +155,8 @@ pub fn series(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<Series> {
+    // Ряд строится поверх прогресса поддерева: тот же бюджет, что и у списков.
+    crate::tree::check_scan_budget(conn, Some(project))?;
     let today = today(conn)?;
     let end = match until {
         Some(value) => parse_day(value).ok_or_else(|| Error::InvalidValue {

@@ -725,6 +725,9 @@ pub fn path_sort_key(path: &str) -> Vec<u32> {
 
 /// Список узлов по фильтру, в порядке дерева.
 pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result<Vec<Node>> {
+    // Прогресс поддерева берётся из представления, а оно перечисляет пары «предок — потомок».
+    // На широкой базе это гигабайты временного файла, поэтому объём проверяется до чтения.
+    crate::tree::check_scan_budget(conn, Some(project))?;
     // Исключить проект, в котором и спрашивают, можно — ответ тогда пуст. Игнорировать флаг
     // было бы хуже: скрипт «покажи всё, кроме X» молча получил бы X.
     if filter
@@ -789,6 +792,7 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
 /// здесь не поддерживается — ссылка-родитель живёт внутри проекта, и молча игнорировать её
 /// значило бы выдать не то, что попросили.
 pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
+    crate::tree::check_scan_budget(conn, None)?;
     if filter.parent.is_some() {
         return Err(Error::InvalidValue {
             field: "parent".to_string(),

@@ -1329,6 +1329,21 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         report.expired_attempts, report.orphan_reservations
                     );
                 }
+                // Глубина: узлы за пределом не чинятся молча — их называет отчёт.
+                if report.nodes_beyond_depth > 0 {
+                    println!(
+                        "deep:      {} node(s) deeper than {} level(s); progress counts them to {} levels only",
+                        report.nodes_beyond_depth,
+                        tasq::node::MAX_DEPTH,
+                        tasq::node::MAX_DEPTH
+                    );
+                }
+                println!(
+                    "progress:  scan bound {} row(s) = {} node(s) x {} level(s) plus self",
+                    report.progress_scan_bound,
+                    report.nodes,
+                    tasq::node::MAX_DEPTH
+                );
                 println!("status:    {}", if report.ok { "ok" } else { "FAILED" });
             }
             if *gc {

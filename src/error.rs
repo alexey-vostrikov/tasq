@@ -175,6 +175,19 @@ pub enum Error {
     #[error("node would sit deeper than {} levels", crate::node::MAX_DEPTH)]
     DepthLimit,
 
+    /// Обход дерева вышел за бюджет строк.
+    ///
+    /// Отдельный код, а не общий `STORAGE_ERROR`: причина не в носителе, а в объёме данных, и
+    /// лечится она не перезапуском, а решением о том, что делать с базой. Молчаливое заполнение
+    /// временного файла (в 2026-м так ушло 194 ГБ — 20 % диска) — худший исход из возможных:
+    /// отказ с числами виден сразу и объясняет, откуда он.
+    #[error(
+        "walking the tree would touch about {pairs} row(s), over the {limit} row budget \
+         ({nodes} node(s) x up to {} level(s))",
+        crate::node::MAX_DEPTH
+    )]
+    TraversalBudget { nodes: i64, pairs: i64, limit: i64 },
+
     /// Родитель не может быть потомком перемещаемого узла.
     #[error("cannot move {dot_id} under its own descendant {target}")]
     MoveIntoSelf { dot_id: String, target: String },
@@ -230,6 +243,7 @@ impl Error {
             Error::NotRemovable { .. } => "NOT_REMOVABLE",
             Error::AlreadyInState { .. } => "ALREADY_IN_STATE",
             Error::DepthLimit => "DEPTH_LIMIT",
+            Error::TraversalBudget { .. } => "TRAVERSAL_BUDGET",
             Error::MoveIntoSelf { .. } => "MOVE_INTO_SELF",
             Error::MigrationBroken { .. } => "MIGRATION_BROKEN",
             Error::InvalidValue { .. } => "INVALID_VALUE",
@@ -310,6 +324,10 @@ impl Error {
             }
             Error::AlreadyInState { .. } => "nothing to do",
             Error::DepthLimit => "flatten the tree or move the node higher",
+            Error::TraversalBudget { .. } => {
+                "narrow the request with --project or --parent, or raise the budget deliberately \
+                 (TASQ_SCAN_BUDGET); a database this wide is worth reporting as a defect"
+            }
             Error::MoveIntoSelf { .. } => "pick a parent outside the moved subtree",
             Error::MigrationBroken { .. } => {
                 "restore the database from a backup: the migration was rolled back untouched"

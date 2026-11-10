@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v9**.
+Версия схемы: **v10**.
 
 ## Таблицы
 
@@ -358,8 +358,8 @@ WITH RECURSIVE tree(ancestor_id, node_id, steps) AS (
   SELECT t.ancestor_id, n.id, t.steps + 1
   FROM tree t
   JOIN nodes n ON n.parent_id = t.node_id
-  -- Сторож: на цикле или на дереве глубже предела обход прекращается, а не идёт по кругу.
-  WHERE t.steps < 64
+  -- Сторож завершаемости и предел глубины — одно число.
+  WHERE t.steps < 16
 )
 SELECT
   t.ancestor_id                                                       AS node_id,
