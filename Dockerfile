@@ -20,7 +20,15 @@
 # перестаёт что-то значить.
 FROM rust:1.99.1-slim-bookworm AS toolchain
 
-RUN rustup component add rustfmt clippy
+# Все компоненты тулчейна ставятся ЗДЕСЬ, в стадии с рабочим rustup и сетью, и уезжают в
+# финальный образ вместе с деревом `/usr/local/rustup` (копируется целиком).
+#
+# `llvm-tools-preview` долго стоял не здесь, а в финальном образе (`install-cargo-llvm-cov`), и
+# его там не оказывалось: rustfmt и clippy из этой стадии присутствовали, а llvm-cov — нет.
+# Следствие было не косметическим: `make cov` при каждом прогоне заново тянул компонент из сети
+# (`info: downloading component llvm-tools`), спрашивал `Proceed? [Y/n]` и на неинтерактивном
+# stdin просто ждал — на медленном канале это неотличимо от зависания.
+RUN rustup component add rustfmt clippy llvm-tools-preview
 
 FROM rust:1.90-bullseye
 
@@ -58,5 +66,16 @@ RUN sh /usr/local/bin/install-cargo-deny \
  && sh /usr/local/bin/install-cargo-llvm-cov
 
 # Гейты утверждают наличие инструментов, а не обнаруживают в момент отчёта, что rustfmt
-# не было и проверка молча ничего не делала.
-RUN rustc --version && cargo --version && rustfmt --version && cargo clippy --version
+# не было и проверка молча ничего не делала. `llvm-cov` проверяется ДВУМЯ способами: командой
+# (`cargo llvm-cov --version` — сам плагин) и файлом в sysroot (сам инструмент, без которого
+# плагин уходит качать компонент из сети). Отсутствие любого из них роняет сборку образа, а не
+# откладывается до первого `make cov`.
+#
+# `cargo-deny` и `cargo-mutants` здесь НЕ проверяются намеренно: они живут не в образе, а в томе
+# cargo (`CARGO_HOME=/cargo` при запуске `make`), и в CI ставятся отдельными шагами. Утверждать
+# в образе то, чего он не несёт, — значит либо ложно падать, либо (как было) не проверять вовсе.
+RUN rustc --version && cargo --version && rustfmt --version && cargo clippy --version \
+ && cargo llvm-cov --version \
+ && llvm_cov="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-cov" \
+ && test -x "$llvm_cov" \
+ && echo "llvm-cov: $llvm_cov"

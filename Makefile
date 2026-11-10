@@ -60,8 +60,18 @@ deny: cache-init
 # Покрытие. Порог — пол, ниже которого сборка не выпускается, а не цель: он не должен
 # мешать добавлять код, но обязан ловить «написали и не проверили».
 # Отдельная цель, потому что инструментированная сборка пересобирает всё дерево.
+#
+# Перед запуском проверяется наличие инструмента в sysroot. Без проверки отсутствие компонента
+# выясняется не отказом, а вопросом `Proceed? [Y/n]` от rustup и ожиданием загрузки: на медленном
+# канале это выглядит как зависший замер, а в CI — как таймаут джобы. Отказ сразу и с подсказкой
+# честнее: причина названа, действие понятно.
 COVERAGE_MIN ?= 90
-cov: cache-init
+cov: cache-init image-check
+	@$(RUN) sh -c 'llvm_cov="$$(rustc --print sysroot)/lib/rustlib/$$(rustc -vV | sed -n "s/^host: //p")/bin/llvm-cov"; \
+	  if [ ! -x "$$llvm_cov" ]; then \
+	    echo "LLVM_TOOLS_MISSING: нет $$llvm_cov — llvm-tools-preview отсутствует в образе $(IMAGE); пересобери: make image" >&2; \
+	    exit 1; \
+	  fi' || exit 1
 	$(RUN) cargo llvm-cov --all-targets --summary-only --fail-under-lines $(COVERAGE_MIN)
 
 test: cache-init

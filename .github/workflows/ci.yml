@@ -47,6 +47,11 @@ jobs:
       - name: Coverage floor
         run: |
           sh scripts/install-cargo-llvm-cov.sh
+          # Тот же страж, что и в `make cov`: отсутствие инструмента обязано быть отказом с
+          # названной причиной, а не вопросом rustup `Proceed? [Y/n]` и ожиданием загрузки,
+          # которое в CI выглядит как таймаут джобы.
+          llvm_cov="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-cov"
+          test -x "$llvm_cov" || { echo "LLVM_TOOLS_MISSING: $llvm_cov" >&2; exit 1; }
           cargo llvm-cov --all-targets --summary-only --fail-under-lines 90
 
       - name: Build
