@@ -964,11 +964,37 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
 
         // ------------------------------------------------ поиск и обзоры
         "tasq_search" => {
-            let project = ctx.project(args)?;
-            let hits = overview::search(&ctx.conn, &project, req_str(args, "query")?)?;
+            let query = req_str(args, "query")?;
+            // Без названного проекта поиск идёт по всей базе: ответ «не найдено» на
+            // существующую задачу хуже, чем находка из чужого проекта — она хотя бы правдива.
+            let hits = match arg_str(args, "project") {
+                Some(_) => {
+                    let project = ctx.project(args)?;
+                    overview::search(&ctx.conn, &project, query)?
+                }
+                None => overview::search_all(&ctx.conn, query)?,
+            };
             Ok(text(&hits))
         }
         "tasq_dashboard" => {
+            // `all` — обзор по каждому проекту: один вызов вместо обхода проектов снаружи.
+            if arg_bool(args, "all") {
+                let boards = overview::board_all(&ctx.conn)?;
+                let mut sections = Vec::new();
+                for board in boards {
+                    let Some(project) = crate::project::by_key(&ctx.conn, &board.project)? else {
+                        continue;
+                    };
+                    sections.push(json!({
+                        "project": project.key,
+                        "board": board,
+                        "leases": lease::holdings(&ctx.conn, &project)?,
+                        "next": edge::next_candidates(&ctx.conn, &project, 3)?,
+                        "at_risk": crate::burnup::at_risk(&ctx.conn, &project, 0.2)?,
+                    }));
+                }
+                return Ok(text(&sections));
+            }
             let project = ctx.project(args)?;
             let board = overview::board(&ctx.conn, &project)?;
             let live = lease::holdings(&ctx.conn, &project)?;
@@ -1560,10 +1586,16 @@ pub fn definition(name: &str) -> Option<Value> {
         // ------------------------------------------------ поиск и обзоры
         "tasq_search" => tool(
             name,
-            "Full-text search across nodes and notes",
+            "Full-text search across nodes and notes; without a project it searches every project",
             json!({
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "Words or an FTS query"}},
+                "properties": {
+                    "query": {"type": "string", "description": "Words or an FTS query"},
+                    "project": {
+                        "type": "string",
+                        "description": "Limit to one project; omit to search the whole database"
+                    }
+                },
                 "required": ["query"]
             }),
             (true, false, true),
@@ -1571,7 +1603,16 @@ pub fn definition(name: &str) -> Option<Value> {
         "tasq_dashboard" => tool(
             name,
             "One-call overview: board, live leases, next candidates, at-risk nodes",
-            json!({"type": "object", "properties": {}}),
+            json!({
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project key"},
+                    "all": {
+                        "type": "boolean",
+                        "description": "One section per project instead of a single project"
+                    }
+                }
+            }),
             (true, false, true),
         ),
         "tasq_burnup" => tool(

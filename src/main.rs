@@ -323,7 +323,11 @@ enum Command {
     /// Context chain from the root epic down to the node
     Ctx { reference: String },
     /// Board: nodes grouped by status, with overdue and live leases
-    Board,
+    Board {
+        /// One section per project instead of a single project
+        #[arg(long)]
+        all: bool,
+    },
     /// Hours: estimate against the time actually spent in attempts
     Time {
         /// Only this subtree
@@ -997,6 +1001,32 @@ fn print_candidates(candidates: &[edge::Candidate], origin: &[(String, edge::Ori
             candidate.title
         );
         println!("   because {}", candidate.reason);
+    }
+}
+
+/// Печать одной доски. Отдельно от `Command::Board`, потому что тем же видом печатаются
+/// секции обзора по всем проектам — иначе два вида «одного и того же» расходятся.
+fn print_board(board: &overview::Board) {
+    println!(
+        "{}  open {}  done {}  overdue {}  leased {}",
+        board.project, board.open, board.done, board.overdue, board.leased
+    );
+    for column in &board.columns {
+        println!("\n{} ({})", column.status, column.count);
+        for row in &column.rows {
+            let mut flags = String::new();
+            if row.days_overdue > 0 {
+                flags.push_str(&format!(" OVERDUE {}d", row.days_overdue));
+            }
+            if let Some(holder) = &row.lease_holder {
+                flags.push_str(&format!(" [{holder}]"));
+            }
+            let due = row.due_date.as_deref().unwrap_or("");
+            println!(
+                "  {:<14} {:<8} {:>5} {:<10} {}{}",
+                row.dot_id, row.priority, row.progress, due, row.title, flags
+            );
+        }
     }
 }
 
@@ -2180,8 +2210,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Find { query } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
-            let hits = overview::search(&conn, &project, query)?;
+            // Поиск не требует одного проекта: без селектора ищем по всей базе. Искать «в первом
+            // проекте по порядку» значит отвечать «не найдено» на существующую задачу, причём
+            // уверенным тоном.
+            let cwd = std::env::current_dir()?;
+            let path = db::discover(&cwd, cli.db.as_deref())?;
+            let conn = db::open_checked(&path)?;
+            let hits = match project::scope(&conn, cli.project.as_deref())? {
+                project::Scope::One(project) => overview::search(&conn, &project, query)?,
+                project::Scope::All => overview::search_all(&conn, query)?,
+            };
             if cli.json {
                 print_json(&hits);
                 return Ok(ExitCode::SUCCESS);
@@ -2229,34 +2267,36 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Board => {
+        Command::Board { all } => {
+            if *all {
+                let cwd = std::env::current_dir()?;
+                let path = db::discover(&cwd, cli.db.as_deref())?;
+                let conn = db::open_checked(&path)?;
+                let boards = overview::board_all(&conn)?;
+                if cli.json {
+                    print_json(&boards);
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if boards.is_empty() {
+                    println!("no projects with nodes yet");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                for (index, board) in boards.iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    print_board(board);
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+
             let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
             let board = overview::board(&conn, &project)?;
             if cli.json {
                 print_json(&board);
                 return Ok(ExitCode::SUCCESS);
             }
-            println!(
-                "{}  open {}  done {}  overdue {}  leased {}",
-                board.project, board.open, board.done, board.overdue, board.leased
-            );
-            for column in &board.columns {
-                println!("\n{} ({})", column.status, column.count);
-                for row in &column.rows {
-                    let mut flags = String::new();
-                    if row.days_overdue > 0 {
-                        flags.push_str(&format!(" OVERDUE {}d", row.days_overdue));
-                    }
-                    if let Some(holder) = &row.lease_holder {
-                        flags.push_str(&format!(" [{holder}]"));
-                    }
-                    let due = row.due_date.as_deref().unwrap_or("");
-                    println!(
-                        "  {:<14} {:<8} {:>5} {:<10} {}{}",
-                        row.dot_id, row.priority, row.progress, due, row.title, flags
-                    );
-                }
-            }
+            print_board(&board);
             Ok(ExitCode::SUCCESS)
         }
 

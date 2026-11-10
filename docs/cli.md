@@ -510,6 +510,10 @@ Board: nodes grouped by status, with overdue and live leases
 tasq board [ОПЦИИ]
 ```
 
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--all` | — | — | One section per project instead of a single project |
+
 ## `time`
 
 Hours: estimate against the time actually spent in attempts

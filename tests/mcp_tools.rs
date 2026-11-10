@@ -1070,3 +1070,66 @@ fn project_delete_is_not_in_the_agent_profile() {
     let (_, list, _) = run_cli(&dir, &["list", "projects"]);
     assert!(list.contains("PRJ"), "{list}");
 }
+
+/// Обзор без проекта: `tasq_dashboard` с `all` и `tasq_search` без проекта видят всю базу.
+///
+/// Это контракт MCP, а не ядра: клиент (агент) не должен обходить проекты циклом, чтобы
+/// ответить на вопрос «что у меня есть вообще».
+#[test]
+fn overview_tools_cover_every_project() {
+    let dir = temp_dir("all-projects");
+    cli(&dir, &["init", "--key", "TASQ"]);
+    cli(
+        &dir,
+        &["--project", "TASQ", "add", "Первый эпик", "--kind", "epic"],
+    );
+    cli(&dir, &["create", "project", "OTHER", "--name", "Второй"]);
+    cli(
+        &dir,
+        &["--project", "OTHER", "add", "Второй эпик", "--kind", "epic"],
+    );
+
+    let out = session(
+        &dir,
+        &[
+            // `project` сеанса не нужен: `all` перечисляет каждый проект секцией.
+            ("tasq_dashboard", json!({"all": true})),
+            // Поиск без проекта идёт по всей базе: оба эпика обязаны найтись.
+            ("tasq_search", json!({"query": "эпик"})),
+            ("tasq_dashboard", json!({"project": "OTHER"})),
+        ],
+    );
+
+    let sections = out[0].as_array().expect("секции проектов");
+    let keys: Vec<&str> = sections
+        .iter()
+        .map(|section| section["project"].as_str().expect("ключ проекта"))
+        .collect();
+    assert!(keys.contains(&"TASQ"), "нет секции TASQ: {keys:?}");
+    assert!(keys.contains(&"OTHER"), "нет секции OTHER: {keys:?}");
+    // Счётчики каждой секции — про свой проект: доска лежит внутри секции.
+    assert_eq!(
+        sections
+            .iter()
+            .find(|section| section["project"] == json!("OTHER"))
+            .expect("секция OTHER")["board"]["project"],
+        json!("OTHER")
+    );
+
+    let hits = out[1].as_array().expect("находки");
+    let found: Vec<&str> = hits
+        .iter()
+        .filter_map(|hit| hit["dot_id"].as_str())
+        .collect();
+    assert!(
+        found.iter().any(|dot| dot.starts_with("OTHER-")),
+        "поиск без проекта не дошёл до OTHER: {found:?}"
+    );
+    assert!(
+        found.iter().any(|dot| dot.starts_with("TASQ-")),
+        "поиск без проекта потерял TASQ: {found:?}"
+    );
+
+    // Один проект — прежний ответ: объект, а не массив.
+    assert_eq!(out[2]["project"], json!("OTHER"));
+}

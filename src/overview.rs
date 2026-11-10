@@ -27,6 +27,19 @@ pub struct Hit {
 /// как выражение FTS (например, в нём `-` или `:`), он трактуется как обычный текст:
 /// падение поиска из-за пунктуации пользователя — не ошибка, а повод искать иначе.
 pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hit>> {
+    search_in(conn, Some(project), query)
+}
+
+/// Поиск по всей базе, без выбора проекта.
+///
+/// Нужен там, где проект не назван: искать «в первом проекте по порядку» значит отвечать
+/// «не найдено» на существующую задачу и выглядеть при этом уверенно. Адрес узла начинается
+/// с ключа проекта, поэтому найденное остаётся однозначным и открывается через `tasq show`.
+pub fn search_all(conn: &Connection, query: &str) -> Result<Vec<Hit>> {
+    search_in(conn, None, query)
+}
+
+fn search_in(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err(Error::InvalidValue {
@@ -53,17 +66,28 @@ pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<Vec<H
     Ok(hits)
 }
 
-fn like_notes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hit>> {
+/// Значение фильтра по проекту для SQL: `-1` — «любой проект».
+///
+/// Один запрос на два режима вместо двух текстов: два текста расходятся при первой же правке
+/// (забыть `deleted_at` во втором — обычное дело), а договорённость «отрицательное значит все»
+/// проверяется одним условием в трёх местах.
+fn project_param(project: Option<&Project>) -> i64 {
+    project.map(|project| project.id).unwrap_or(-1)
+}
+
+fn like_notes(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
     let words = query_words(query);
     if words.is_empty() {
         return Ok(Vec::new());
     }
     let mut sql = String::from(
-        "SELECT nt.title, nt.content, x.path FROM notes nt
+        "SELECT nt.title, nt.content, x.path, p.key FROM notes nt
+         JOIN projects p ON p.id = nt.project_id
          LEFT JOIN nodes x ON x.id = nt.node_id
-         WHERE nt.project_id = ?",
+         WHERE (? < 0 OR nt.project_id = ?)",
     );
-    let mut values: Vec<Value> = vec![Value::Integer(project.id)];
+    let param = Value::Integer(project_param(project));
+    let mut values: Vec<Value> = vec![param.clone(), param];
     for word in &words {
         sql.push_str(
             " AND (instr(uni_lower(nt.title), ?) > 0 OR instr(uni_lower(nt.content), ?) > 0)",
@@ -77,9 +101,10 @@ fn like_notes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<H
     let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
         let node_path: Option<String> = row.get(2)?;
         let content: String = row.get(1)?;
+        let key: String = row.get(3)?;
         Ok(Hit {
             entity: "note".to_string(),
-            dot_id: node_path.map(|p| project.dot_id(&p)),
+            dot_id: node_path.map(|path| format!("{key}-{path}")),
             title: row.get(0)?,
             snippet: first_line(&content),
         })
@@ -122,20 +147,24 @@ fn fts_expression(query: &str) -> String {
         .join(" AND ")
 }
 
-fn fts_nodes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hit>> {
+fn fts_nodes(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
+    // Ключ проекта берётся из базы, а не из выбранного проекта: в режиме «все проекты»
+    // выбранного нет, а адрес узла всё равно должен начинаться с ключа его проекта.
     let mut stmt = conn.prepare(
-        "SELECT n.path, n.title, snippet(nodes_fts, -1, '', '', '…', 12)
+        "SELECT n.path, n.title, snippet(nodes_fts, -1, '', '', '…', 12), p.key
          FROM nodes_fts f
          JOIN nodes n ON n.id = f.rowid
-         WHERE nodes_fts MATCH ?1 AND n.project_id = ?2 AND n.deleted_at IS NULL
+         JOIN projects p ON p.id = n.project_id
+         WHERE nodes_fts MATCH ?1 AND (?2 < 0 OR n.project_id = ?2) AND n.deleted_at IS NULL
          ORDER BY rank
          LIMIT 50",
     )?;
-    let rows = stmt.query_map(params![query, project.id], |row| {
+    let rows = stmt.query_map(params![query, project_param(project)], |row| {
         let path: String = row.get(0)?;
+        let key: String = row.get(3)?;
         Ok(Hit {
             entity: "node".to_string(),
-            dot_id: Some(project.dot_id(&path)),
+            dot_id: Some(format!("{key}-{path}")),
             title: row.get(1)?,
             snippet: row.get(2)?,
         })
@@ -143,21 +172,23 @@ fn fts_nodes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hi
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn fts_notes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hit>> {
+fn fts_notes(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
     let mut stmt = conn.prepare(
-        "SELECT nt.title, snippet(notes_fts, -1, '', '', '…', 12), n.node_id, x.path
+        "SELECT nt.title, snippet(notes_fts, -1, '', '', '…', 12), x.path, p.key
          FROM notes_fts f
          JOIN notes nt ON nt.id = f.rowid
+         JOIN projects p ON p.id = nt.project_id
          LEFT JOIN nodes x ON x.id = nt.node_id
-         WHERE notes_fts MATCH ?1 AND nt.project_id = ?2
+         WHERE notes_fts MATCH ?1 AND (?2 < 0 OR nt.project_id = ?2)
          ORDER BY rank
          LIMIT 50",
     )?;
-    let rows = stmt.query_map(params![query, project.id], |row| {
-        let node_path: Option<String> = row.get(3)?;
+    let rows = stmt.query_map(params![query, project_param(project)], |row| {
+        let node_path: Option<String> = row.get(2)?;
+        let key: String = row.get(3)?;
         Ok(Hit {
             entity: "note".to_string(),
-            dot_id: node_path.map(|p| project.dot_id(&p)),
+            dot_id: node_path.map(|path| format!("{key}-{path}")),
             title: row.get(0)?,
             snippet: row.get(1)?,
         })
@@ -165,7 +196,7 @@ fn fts_notes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hi
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn like_nodes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hit>> {
+fn like_nodes(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
     // Запасной путь для запросов, которые FTS не разобрал (пунктуация, двоеточия):
     // каждое слово ищется отдельно и все слова должны встретиться.
     let words = query_words(query);
@@ -174,26 +205,31 @@ fn like_nodes(conn: &Connection, project: &Project, query: &str) -> Result<Vec<H
     }
 
     let mut sql = String::from(
-        "SELECT path, title, COALESCE(description, '') FROM nodes
-         WHERE project_id = ? AND deleted_at IS NULL",
+        "SELECT n.path, n.title, COALESCE(n.description, ''), p.key FROM nodes n
+         JOIN projects p ON p.id = n.project_id
+         WHERE (? < 0 OR n.project_id = ?) AND n.deleted_at IS NULL",
     );
-    let mut values: Vec<Value> = vec![Value::Integer(project.id)];
+    let param = Value::Integer(project_param(project));
+    let mut values: Vec<Value> = vec![param.clone(), param];
     for word in &words {
+        // Колонки названы с псевдонимом: у `projects` тоже есть `description`, и после JOIN
+        // голое имя становится неоднозначным — запрос падает вместо того, чтобы искать.
         sql.push_str(
-            " AND (instr(uni_lower(title), ?) > 0 OR instr(uni_lower(COALESCE(description, '')), ?) > 0)",
+            " AND (instr(uni_lower(n.title), ?) > 0 OR instr(uni_lower(COALESCE(n.description, '')), ?) > 0)",
         );
         values.push(Value::Text(word.clone()));
         values.push(Value::Text(word.clone()));
     }
-    sql.push_str(" ORDER BY path LIMIT 50");
+    sql.push_str(" ORDER BY n.path LIMIT 50");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
         let path: String = row.get(0)?;
         let description: String = row.get(2)?;
+        let key: String = row.get(3)?;
         Ok(Hit {
             entity: "node".to_string(),
-            dot_id: Some(project.dot_id(&path)),
+            dot_id: Some(format!("{key}-{path}")),
             title: row.get(1)?,
             snippet: first_line(&description),
         })
@@ -364,6 +400,26 @@ pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
         open,
         done,
     })
+}
+
+/// Доски всех проектов базы — то, что нужно обзору без выбора проекта.
+///
+/// Считается по проекту отдельно, а не одной сводкой по всем узлам: у каждого свои колонки,
+/// свои просрочки и свои аренды, и сложенные вместе числа не отвечают ни на один вопрос.
+/// Проекты без единого узла в ответ не попадают: пустая секция — не сведения.
+pub fn board_all(conn: &Connection) -> Result<Vec<Board>> {
+    let mut boards = Vec::new();
+    for summary in crate::project::list(conn)? {
+        let Some(project) = crate::project::by_key(conn, &summary.key)? else {
+            continue;
+        };
+        let board = board(conn, &project)?;
+        if board.columns.is_empty() {
+            continue;
+        }
+        boards.push(board);
+    }
+    Ok(boards)
 }
 
 fn today_days(conn: &Connection) -> Result<i64> {
