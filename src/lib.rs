@@ -27,6 +27,7 @@ pub mod status;
 pub mod template;
 pub mod transfer;
 pub mod tree;
+pub mod tui;
 
 pub use error::{Error, Result};
 

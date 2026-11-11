@@ -621,6 +621,18 @@ tasq load [ОПЦИИ]
 | --- | --- | --- | --- |
 | `--force` | — | — | Load into a database that already has nodes |
 
+## `tui`
+
+Board in the terminal: status columns, leases, progress
+
+```
+tasq tui [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--once` | — | — | Draw one frame to standard output and exit (for CI and documentation) |
+
 ## `mcp`
 
 Run the MCP server over stdio

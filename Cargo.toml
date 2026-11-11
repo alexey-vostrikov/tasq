@@ -21,6 +21,7 @@ thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 clap_complete = "4.5"
 serde-saphyr = "2.1.1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "std"] }
 
 [dev-dependencies]
 # Property-тесты вместо cargo-fuzz: fuzz-раннер требует nightly и ASAN, а гейт должен

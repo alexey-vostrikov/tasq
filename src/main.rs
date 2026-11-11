@@ -18,6 +18,7 @@ use tasq::project::{self, Project};
 use tasq::resource;
 use tasq::session;
 use tasq::status::{Kind, Status};
+use tasq::tui;
 use tasq::{activity, budget, burnup, comment, db, note, overview, template, transfer};
 
 #[derive(Parser)]
@@ -406,6 +407,12 @@ enum Command {
         /// Load into a database that already has nodes
         #[arg(long)]
         force: bool,
+    },
+    /// Board in the terminal: status columns, leases, progress
+    Tui {
+        /// Draw one frame to standard output and exit (for CI and documentation)
+        #[arg(long)]
+        once: bool,
     },
     /// Run the MCP server over stdio
     Mcp {
@@ -2312,6 +2319,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             print_board(&board);
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Tui { once } => {
+            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            tui::run(&conn, &project, *once)?;
             Ok(ExitCode::SUCCESS)
         }
 
