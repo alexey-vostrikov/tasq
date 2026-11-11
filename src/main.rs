@@ -189,13 +189,19 @@ enum Command {
         /// Node reference
         reference: String,
     },
-    /// Archive (or unarchive) a subtree
+    /// Archive a subtree, or every node in one status across a project
     Archive {
-        /// Node reference
-        reference: String,
+        /// Node reference; omit it when using --status
+        reference: Option<String>,
         /// Undo the archive
         #[arg(long)]
         undo: bool,
+        /// Archive every node in this effective status (only the topmost node of each subtree)
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+        /// Only show what would be archived; change nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show recent activity
     Log {
@@ -1694,23 +1700,100 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Archive { reference, undo } => {
-            let (mut conn, project) =
-                open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
-            let affected = node::archive(&mut conn, &project, reference, *undo)?;
-            if cli.json {
-                print_json(&serde_json::json!({
-                    "affected": affected,
-                    "archived": !*undo,
-                    "ref": reference,
-                }));
-            } else {
-                println!(
-                    "{} {affected} node(s)",
-                    if *undo { "unarchived" } else { "archived" }
-                );
+        Command::Archive {
+            reference,
+            undo,
+            status,
+            dry_run,
+        } => {
+            match (reference.as_deref(), status.as_deref()) {
+                (Some(_), Some(_)) => Err(Error::InvalidValue {
+                    field: "reference".to_string(),
+                    value: "give a reference or --status, not both".to_string(),
+                }),
+                (None, None) => Err(Error::InvalidValue {
+                    field: "reference".to_string(),
+                    value: "give a reference or --status".to_string(),
+                }),
+                (Some(reference), None) => {
+                    if *dry_run {
+                        // У ссылки «что было бы» — это размер поддерева, то есть число, которое
+                        // человек и так видит в `show --tree`. Отказ честнее, чем флаг, который
+                        // ничего не меняет, но и ничего не добавляет.
+                        return Err(Error::InvalidValue {
+                            field: "--dry-run".to_string(),
+                            value: "only works with --status".to_string(),
+                        });
+                    }
+                    let (mut conn, project) =
+                        open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
+                    let affected = node::archive(&mut conn, &project, reference, *undo)?;
+                    if cli.json {
+                        print_json(&serde_json::json!({
+                            "affected": affected,
+                            "archived": !*undo,
+                            "ref": reference,
+                        }));
+                    } else {
+                        println!(
+                            "{} {affected} node(s)",
+                            if *undo { "unarchived" } else { "archived" }
+                        );
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                (None, Some(status)) => {
+                    let wanted = parse_status(status)?;
+                    let cwd = std::env::current_dir()?;
+                    let path = db::discover(&cwd, cli.db.as_deref())?;
+                    let mut conn = db::open_checked(&path)?;
+                    let projects = match project::scope(&conn, cli.project.as_deref())? {
+                        project::Scope::One(project) => vec![project],
+                        project::Scope::All => project::list(&conn)?
+                            .into_iter()
+                            .map(|summary| project::select(&conn, Some(&summary.key)))
+                            .collect::<Result<Vec<_>>>()?,
+                    };
+                    let mut reports = Vec::new();
+                    for project in &projects {
+                        reports.push(node::archive_batch(
+                            &mut conn, project, &wanted, *undo, *dry_run,
+                        )?);
+                    }
+                    if cli.json {
+                        print_json(&reports);
+                    } else {
+                        for report in &reports {
+                            println!(
+                                "{} {}: {} node(s) in {} subtree(s){}",
+                                if report.archived {
+                                    if report.dry_run {
+                                        "would archive"
+                                    } else {
+                                        "archived"
+                                    }
+                                } else if report.dry_run {
+                                    "would unarchive"
+                                } else {
+                                    "unarchived"
+                                },
+                                report.project,
+                                report.affected,
+                                report.refs.len(),
+                                if report.refs.is_empty() {
+                                    " (nothing matched)"
+                                } else {
+                                    ""
+                                }
+                            );
+                            for reference in &report.refs {
+                                println!("  {reference}");
+                            }
+                        }
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
             }
-            Ok(ExitCode::SUCCESS)
         }
 
         Command::Log { limit } => {

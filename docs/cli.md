@@ -147,7 +147,7 @@ tasq restore [ОПЦИИ]
 
 ## `archive`
 
-Archive (or unarchive) a subtree
+Archive a subtree, or every node in one status across a project
 
 ```
 tasq archive [ОПЦИИ]
@@ -156,6 +156,8 @@ tasq archive [ОПЦИИ]
 | флаг | значение | по умолчанию | описание |
 | --- | --- | --- | --- |
 | `--undo` | — | — | Undo the archive |
+| `--status` | `STATUS` | — | Archive every node in this effective status (only the topmost node of each subtree) |
+| `--dry-run` | — | — | Only show what would be archived; change nothing |
 
 ## `log`
 

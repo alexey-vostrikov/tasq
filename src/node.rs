@@ -1166,6 +1166,146 @@ pub fn archive(
     Ok(affected)
 }
 
+/// Итог массового архива.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveBatch {
+    /// Ключ проекта, в котором работали.
+    pub project: String,
+    /// Адреса выбранных узлов — САМЫХ ВЕРХНИХ в своём поддереве.
+    pub refs: Vec<String>,
+    /// Сколько узлов изменилось (или изменилось бы при `dry_run`).
+    pub affected: usize,
+    /// Ничего не записано: только показано, что было бы.
+    pub dry_run: bool,
+    /// Что делали: архив или распаковка.
+    pub archived: bool,
+}
+
+/// Архив (или распаковка) всех узлов проекта в заданном статусе.
+///
+/// Выбираются только САМЫЕ ВЕРХНИЕ узлы множества: если родитель тоже в множестве, ребёнок не
+/// берётся — родитель накрывает его поддеревом. Без этого правила второй проход упирается в
+/// `ALREADY_IN_STATE` на каждом вложенном узле, а первый пишет по строке журнала на каждый из
+/// них вместо одного на поддерево.
+///
+/// Статус берётся ЭФФЕКТИВНЫЙ — тот, который человек видит в `ls` и `board`. Разница видна на
+/// производных статусах: `in_progress` появляется от живой аренды, `blocked` — от незакрытого
+/// блокера, и по хранимому статусу это были бы другие узлы. Для `done` разницы нет: представление
+/// отдаёт `done` только тогда, когда хранимый статус и есть `done` (`cancelled` идёт отдельно).
+///
+/// Поддерево уходит целиком, включая детей в других статусах: это поведение `archive` для одной
+/// ссылки, и второй набор правил здесь разошёлся бы с ним.
+pub fn archive_batch(
+    conn: &mut Connection,
+    project: &Project,
+    status: &Status,
+    undo: bool,
+    dry_run: bool,
+) -> Result<ArchiveBatch> {
+    let roots = topmost_in_status(conn, project, status, undo)?;
+    let affected = count_in_subtrees(conn, &roots)?;
+    let report = ArchiveBatch {
+        project: project.key.clone(),
+        refs: roots.iter().map(|(_, dot_id)| dot_id.clone()).collect(),
+        affected,
+        dry_run,
+        archived: !undo,
+    };
+    if dry_run || roots.is_empty() {
+        return Ok(report);
+    }
+
+    // Одна транзакция на весь пакет: половина заархивированного пакета — это состояние, которого
+    // никто не просил, и его пришлось бы разбирать руками.
+    let now = now_iso();
+    let tx = db::write_tx(conn)?;
+    for (id, dot_id) in &roots {
+        tx.execute(
+            &format!(
+                "UPDATE nodes SET archived_at = ?, updated_at = ? WHERE id IN ({})",
+                crate::tree::subtree_sql()
+            ),
+            params![if undo { None } else { Some(now.clone()) }, now, id],
+        )?;
+        activity::log(
+            &tx,
+            &Entry {
+                project_id: project.id,
+                node_id: Some(*id),
+                entity_type: "node",
+                entity_id: *id,
+                action: if undo { "unarchive" } else { "archive" },
+                field_name: Some("archived_at"),
+                old_value: None,
+                new_value: if undo { None } else { Some(now.as_str()) },
+                summary: Some(dot_id.as_str()),
+                actor: "-",
+            },
+        )?;
+    }
+    tx.commit()?;
+    Ok(report)
+}
+
+/// Самые верхние узлы проекта в заданном статусе: `(id, dot_id)`.
+///
+/// `undo` переворачивает признак архива: распаковываются те, что УЖЕ архивны, и верхним считается
+/// тот, чей родитель не архивный, — иначе распаковка родителя и ребёнка шла бы дважды.
+fn topmost_in_status(
+    conn: &Connection,
+    project: &Project,
+    status: &Status,
+    undo: bool,
+) -> Result<Vec<(i64, String)>> {
+    // Признак архива вынесен в литерал SQL, а не в параметр: `IS ?` с NULL не работает, а
+    // `= NULL` не совпадает никогда — на этом легко получить пустой список вместо отказа.
+    let archived = if undo { "IS NOT NULL" } else { "IS NULL" };
+    let sql = format!(
+        "SELECT e.id, e.path FROM v_node_effective e
+          WHERE e.project_id = ?1
+            AND e.deleted_at IS NULL
+            AND e.effective_status = ?2
+            AND e.archived_at {archived}
+            AND NOT EXISTS (
+              SELECT 1 FROM v_node_effective p
+               WHERE p.id = e.parent_id
+                 AND p.deleted_at IS NULL
+                 AND p.effective_status = ?2
+                 AND p.archived_at {archived})
+          ORDER BY e.path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![project.id, status.as_str()], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (id, path) = row?;
+        found.push((id, project.dot_id(&path)));
+    }
+    Ok(found)
+}
+
+/// Сколько узлов накрывают выбранные поддеревья — с повторами не считая.
+///
+/// Именно размер поддерева, а не число выбранных узлов: человеку важно, сколько строк исчезнет из
+/// выдач, а не сколько ссылок было напечатано.
+fn count_in_subtrees(conn: &Connection, roots: &[(i64, String)]) -> Result<usize> {
+    let mut total = 0usize;
+    for (id, _) in roots {
+        let count: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM nodes WHERE id IN ({})",
+                crate::tree::subtree_sql()
+            ),
+            [id],
+            |row| row.get(0),
+        )?;
+        total += usize::try_from(count).unwrap_or(0);
+    }
+    Ok(total)
+}
+
 /// Мягкое удаление: только узлы до начала работы — `idea`, `backlog`, `todo`
 /// (README §5.3, инвариант 10).
 pub fn delete(conn: &mut Connection, project: &Project, reference: &str) -> Result<()> {
