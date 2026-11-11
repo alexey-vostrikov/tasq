@@ -399,7 +399,15 @@ fn json_to_sql(value: &Value) -> SqlValue {
 
 /// Человеческая причина отказа вставки: диагностика SQLite без номеров и префиксов.
 fn classify(err: &rusqlite::Error) -> String {
-    let message = err.to_string();
+    classify_message(&err.to_string())
+}
+
+/// Разбор текста ошибки SQLite — отдельно от её типа.
+///
+/// Отдельно потому, что `rusqlite::Error` с произвольным текстом не собрать: четыре ветки
+/// распознавания иначе проверяются только теми ошибками, которые удалось вызвать на живой
+/// базе, то есть обычно одной.
+fn classify_message(message: &str) -> String {
     if message.contains("FOREIGN KEY constraint failed") {
         return "висячая ссылка: строка, на которую ссылаются, не перенесена".to_string();
     }
@@ -415,7 +423,7 @@ fn classify(err: &rusqlite::Error) -> String {
     if message.contains("NOT NULL constraint failed") {
         return format!("пустое обязательное поле: {message}");
     }
-    message
+    message.to_string()
 }
 
 /// Нарушение внешнего ключа: кто, где и на кого ссылался.
@@ -479,4 +487,244 @@ fn violation_address(
         project_keys,
         node_addresses,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn db_conn() -> Connection {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-restore-{nanos}"));
+        let outcome = crate::db::init(&dir, "RST", "restore").expect("init");
+        crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open")
+    }
+
+    /// Минимальный дамп: пустой набор таблиц, текущая схема.
+    fn empty_dump() -> Value {
+        json!({
+            "kind": DUMP_KIND,
+            "format": DUMP_FORMAT,
+            "schema_version": SUPPORTED_SCHEMA_VERSION,
+            "tables": {},
+        })
+    }
+
+    /// Чужой документ отвергается по полю `kind`, а не падением на разборе.
+    #[test]
+    fn a_document_of_another_kind_is_refused() {
+        let mut conn = db_conn();
+        let err =
+            restore(&mut conn, &json!({"kind": "something-else"})).expect_err("чужой kind принят");
+        assert_eq!(err.code(), "INVALID_VALUE");
+        assert!(err.to_string().contains("kind"), "поле не названо: {err}");
+    }
+
+    /// Дамп новее нашего формата отвергается: разбирать его наугад нельзя.
+    #[test]
+    fn a_newer_format_is_refused() {
+        let mut conn = db_conn();
+        let doc = json!({
+            "kind": DUMP_KIND,
+            "format": DUMP_FORMAT + 1,
+            "schema_version": SUPPORTED_SCHEMA_VERSION,
+            "tables": {},
+        });
+        let err = restore(&mut conn, &doc).expect_err("формат из будущего принят");
+        assert_eq!(err.code(), "INVALID_VALUE");
+        assert!(err.to_string().contains("format"), "поле не названо: {err}");
+    }
+
+    /// Без версии схемы дамп не читается: неизвестно, что в нём за схема.
+    #[test]
+    fn a_dump_without_a_schema_version_is_refused() {
+        let mut conn = db_conn();
+        let doc = json!({"kind": DUMP_KIND, "format": DUMP_FORMAT, "tables": {}});
+        let err = restore(&mut conn, &doc).expect_err("дамп без версии схемы принят");
+        assert_eq!(err.code(), "INVALID_VALUE");
+        assert!(
+            err.to_string().contains("schema_version"),
+            "поле не названо: {err}"
+        );
+    }
+
+    /// Схема из будущего — отдельный код отказа, по нему решают «обнови tasq».
+    #[test]
+    fn a_newer_schema_is_refused_with_its_own_code() {
+        let mut conn = db_conn();
+        let mut doc = empty_dump();
+        doc["schema_version"] = json!(SUPPORTED_SCHEMA_VERSION + 1);
+        let err = restore(&mut conn, &doc).expect_err("схема из будущего принята");
+        assert_eq!(err.code(), "SCHEMA_TOO_NEW", "другой код отказа: {err}");
+    }
+
+    /// Документ без `tables` — не дамп, и это сказано прямо.
+    #[test]
+    fn a_document_without_tables_is_refused() {
+        let mut conn = db_conn();
+        let doc = json!({
+            "kind": DUMP_KIND,
+            "format": DUMP_FORMAT,
+            "schema_version": SUPPORTED_SCHEMA_VERSION,
+        });
+        let err = restore(&mut conn, &doc).expect_err("документ без tables принят");
+        assert_eq!(err.code(), "INVALID_VALUE");
+        assert!(err.to_string().contains("tables"), "поле не названо: {err}");
+    }
+
+    /// Текущий формат и текущая схема — ГРАНИЦА, которая обязана приниматься.
+    ///
+    /// Без этого утверждения мутация `>` → `>=` не отличима от верного кода: дамп «из будущего»
+    /// отвергается в обоих случаях, и красными становятся все тесты сразу — то есть граница
+    /// проверяется не там, где она записана.
+    #[test]
+    fn the_current_format_and_schema_are_accepted() {
+        let mut conn = db_conn();
+        let doc = json!({
+            "kind": DUMP_KIND,
+            "format": DUMP_FORMAT,
+            "schema_version": SUPPORTED_SCHEMA_VERSION,
+            "tables": {},
+        });
+        let report = restore(&mut conn, &doc).expect("ровно текущая версия отвергнута");
+        assert!(report.committed, "дамп текущей версии не закоммичен");
+        assert_eq!(report.schema_from, SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(report.schema_to, SUPPORTED_SCHEMA_VERSION);
+    }
+
+    /// Пустой дамп проходит и коммитится: восстанавливать нечего — не отказ.
+    #[test]
+    fn an_empty_dump_commits() {
+        let mut conn = db_conn();
+        let report = restore(&mut conn, &empty_dump()).expect("пустой дамп");
+        assert!(report.committed, "пустой дамп не закоммичен");
+        assert!(report.tables.is_empty(), "таблицы без строк попали в отчёт");
+        assert!(!report.has_losses(), "у пустого дампа нашлись потери");
+    }
+
+    /// Таблица, которой больше нет в схеме, попадает в ПОТЕРИ с числом строк.
+    ///
+    /// Имя берётся из `DUMP_TABLES` и таблица УДАЛЯЕТСЯ из базы: разбор идёт по закрытому
+    /// списку, поэтому выдуманное имя («ghost_table») до этой ветки не доходит вовсе — оно
+    /// молча пропускается, и тест на нём проверял бы пустоту.
+    #[test]
+    fn a_table_unknown_to_the_schema_is_reported_as_a_loss() {
+        let mut conn = db_conn();
+        conn.execute_batch("DROP TABLE burn_snapshots")
+            .expect("drop");
+        let mut doc = empty_dump();
+        doc["tables"] = json!({"burn_snapshots": [{"id": 1}, {"id": 2}]});
+        let report = restore(&mut conn, &doc).expect("дамп с исчезнувшей таблицей");
+        assert!(!report.committed, "дамп с потерями закоммичен");
+        assert_eq!(report.losses.len(), 1, "потеря не записана: {report:?}");
+        let loss = &report.losses[0];
+        assert_eq!(loss.table, "burn_snapshots");
+        assert!(
+            loss.reason.contains("2 строк"),
+            "в причине нет числа строк: {}",
+            loss.reason
+        );
+        let table = report
+            .tables
+            .iter()
+            .find(|t| t.table == "burn_snapshots")
+            .expect("таблица не попала в отчёт");
+        assert_eq!((table.in_dump, table.inserted, table.skipped), (2, 0, 2));
+    }
+
+    /// Таблица из схемы без строк в дампе попадает в отчёт нулями и потерей НЕ считается.
+    ///
+    /// Дамп перечисляет все таблицы, включая пустые, поэтому «ноль строк» — обычное состояние,
+    /// а не потеря; отличить «таблица была и пуста» от «таблицы в дампе нет» отчёт обязан.
+    #[test]
+    fn an_empty_table_is_reported_with_zeros_and_is_not_a_loss() {
+        let mut conn = db_conn();
+        let mut doc = empty_dump();
+        doc["tables"] = json!({"nodes": []});
+        let report = restore(&mut conn, &doc).expect("дамп с пустой таблицей");
+        assert!(report.committed, "пустая таблица считается потерей");
+        assert!(
+            !report.has_losses(),
+            "у пустой таблицы нашлись потери: {report:?}"
+        );
+        let table = report
+            .tables
+            .iter()
+            .find(|t| t.table == "nodes")
+            .unwrap_or_else(|| panic!("пустая таблица выпала из отчёта: {report:?}"));
+        assert_eq!(
+            (table.in_dump, table.inserted, table.skipped),
+            (0, 0, 0),
+            "пустая таблица описана не нулями"
+        );
+    }
+
+    /// Значения JSON ложатся в SQLite тем типом, которым их потом читают: флаг — числом,
+    /// объект — текстом. Иначе круговой путь «экспорт → восстановление» меняет тип поля.
+    #[test]
+    fn json_values_map_to_the_types_the_reader_expects() {
+        let num = |n: serde_json::Number| Value::Number(n);
+        assert!(matches!(json_to_sql(&Value::Null), SqlValue::Null));
+        assert!(matches!(
+            json_to_sql(&Value::Bool(true)),
+            SqlValue::Integer(1)
+        ));
+        assert!(matches!(
+            json_to_sql(&Value::Bool(false)),
+            SqlValue::Integer(0)
+        ));
+        assert!(matches!(
+            json_to_sql(&num(serde_json::Number::from(7))),
+            SqlValue::Integer(7)
+        ));
+        match json_to_sql(&num(serde_json::Number::from_f64(1.5).expect("float"))) {
+            SqlValue::Real(value) => assert!((value - 1.5).abs() < f64::EPSILON),
+            other => panic!("дробное стало {other:?}"),
+        }
+        match json_to_sql(&Value::String("текст".to_string())) {
+            SqlValue::Text(text) => assert_eq!(text, "текст"),
+            other => panic!("строка стала {other:?}"),
+        }
+        match json_to_sql(&json!(["a", "b"])) {
+            SqlValue::Text(text) => assert_eq!(text, r#"["a","b"]"#),
+            other => panic!("массив стал {other:?}"),
+        }
+        match json_to_sql(&json!({"k": 1})) {
+            SqlValue::Text(text) => assert_eq!(text, r#"{"k":1}"#),
+            other => panic!("объект стал {other:?}"),
+        }
+    }
+
+    /// Четыре вида отказа вставки называются по-разному: иначе в отчёте они неразличимы.
+    #[test]
+    fn every_constraint_violation_gets_its_own_wording() {
+        assert_eq!(
+            classify_message("FOREIGN KEY constraint failed"),
+            "висячая ссылка: строка, на которую ссылаются, не перенесена"
+        );
+        assert_eq!(
+            classify_message("CHECK constraint failed: status "),
+            "недопустимое значение по CHECK status",
+            "текст CHECK-отказа изменился: пробел по краю срезается, двоеточия не остаётся"
+        );
+        let unique = classify_message("UNIQUE constraint failed: nodes.project_id, nodes.path");
+        assert!(
+            unique.starts_with("дубль ключа: UNIQUE constraint failed"),
+            "уникальность названа не по-своему: {unique}"
+        );
+        let null = classify_message("NOT NULL constraint failed: nodes.title");
+        assert!(
+            null.starts_with("пустое обязательное поле: NOT NULL"),
+            "пустое поле названо не по-своему: {null}"
+        );
+        assert_eq!(
+            classify_message("database is locked"),
+            "database is locked",
+            "незнакомая ошибка переписана"
+        );
+    }
 }
