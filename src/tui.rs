@@ -176,6 +176,10 @@ where
             let mut hits = Hits::default();
             terminal.draw(|frame| hits = draw(frame, app))?;
             app.hits = hits;
+            // Пределы прокрутки уменьшились — окно могло стать выше, узел сменился, текст стал
+            // короче. Прокрутка подтягивается к новому пределу здесь, а не в момент нажатия:
+            // иначе первый же кадр после ресайза показал бы пустую панель.
+            app.clamp_panels();
             // Сигнал `kill` или закрытие терминала не должны оставить мышь захваченной: флаг
             // снимается здесь, а не в обработчике, потому что обработчик сигнала не имеет права
             // ни печатать, ни брать блокировки.
@@ -597,9 +601,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) -> Hits {
         [panel, main, ratatui::layout::Rect::default()]
     };
 
-    hits.extend(draw_panel(frame, app, panel));
+    hits.absorb(draw_panel(frame, app, panel));
     if sidebar {
-        draw_sidebar(frame, app, side);
+        hits.absorb(draw_sidebar(frame, app, side));
     }
 
     // Шапка: счётчики доски. Проект здесь не выбирается — панель слева делает это лучше, показывая
@@ -633,8 +637,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) -> Hits {
         model::Mode::Search => draw_search(frame, app, content),
         model::Mode::Node => draw_card(frame, app, content),
         _ => match app.state.view {
-            model::View::List => hits.extend(draw_list(frame, app, content)),
-            model::View::Kanban => hits.extend(draw_kanban(frame, app, content)),
+            model::View::List => hits.absorb(draw_list(frame, app, content)),
+            model::View::Kanban => hits.absorb(draw_kanban(frame, app, content)),
         },
     }
 
@@ -658,7 +662,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) -> Hits {
     );
     frame.render_widget(
         Paragraph::new(Line::from(format!(
-            "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, v — вид, T — тема, q — выход",
+            "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, v — вид, PgUp/PgDn — панель, T — тема, q — выход",
             app.state.mode.title()
         )))
         .style(theme.dim_style()),
@@ -683,6 +687,73 @@ fn mode_text(app: &app::App) -> String {
             None => String::new(),
         },
     }
+}
+
+/// Смещение прокрутки панели в виде, который принимает `Paragraph::scroll`.
+///
+/// Порядок кортежа у виджета — `(вертикаль, горизонталь)`, и это единственное место в программе,
+/// где он перевёрнут относительно привычного: горизонтальная составляющая всегда ноль, панели
+/// переносят строки по словам, и уехать вбок в них нечего.
+fn offset_of(offset: usize) -> u16 {
+    u16::try_from(offset).unwrap_or(u16::MAX)
+}
+
+/// Сколько строк займёт текст в колонке заданной ширины, с переносом по словам.
+///
+/// Своя мера вместо `Paragraph::line_count`: в ratatui 0.30 тот закрыт как нестабильный API, а без
+/// меры прокрутка не имеет предела — колесо уводило бы панель в пустоту и возвращаться пришлось
+/// бы столько же раз. Считается построчно, потому что `Paragraph` переносит каждую `Line`
+/// отдельно и не склеивает соседние.
+fn wrapped_height(lines: &[Line<'_>], width: usize) -> usize {
+    let width = width.max(1);
+    lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            words_height(&text, width)
+        })
+        .sum()
+}
+
+/// Строк в одном абзаце: слова укладываются жадно, как это делает виджет.
+///
+/// Слово длиннее ширины занимает несколько строк — иначе длинный адрес или слово без пробелов
+/// считались бы одной строкой, и предел прокрутки оказался бы меньше настоящего.
+fn words_height(text: &str, width: usize) -> usize {
+    // Защита внутри, а не только у вызывающего: функция публичная для тестов, и деление на ноль
+    // здесь было бы паникой на ровном месте.
+    let width = width.max(1);
+    if text.trim().is_empty() {
+        return 1;
+    }
+    let mut lines = 1usize;
+    let mut used = 0usize;
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        let fits = if used == 0 {
+            len <= width
+        } else {
+            used + 1 + len <= width
+        };
+        if fits {
+            used = if used == 0 { len } else { used + 1 + len };
+            continue;
+        }
+        if used != 0 {
+            lines += 1;
+        }
+        // Слово начинается с новой строки; если оно шире панели, оно займёт несколько. `used`
+        // здесь означает «сколько знаков слова уже занято на этой строке» — он же становится
+        // остатком, поэтому обнулять его перед этим не нужно.
+        let extra = len.div_ceil(width);
+        lines += extra - 1;
+        used = len - (extra - 1) * width;
+    }
+    lines
 }
 
 /// Панель проектов: ключ, счётчик узлов, пометка активного и курсора панели.
@@ -744,7 +815,12 @@ pub const SIDEBAR_WIDTH: u16 = 32;
 ///
 /// Три раздела, а не один список: это разные вопросы («где я в дереве», «что решено», «что
 /// сказали»), и смешивать их значило бы заставить человека разбирать строки по виду.
-fn draw_sidebar(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+fn draw_sidebar(
+    frame: &mut ratatui::Frame<'_>,
+    app: &app::App,
+    area: ratatui::layout::Rect,
+) -> Hits {
+    let mut hits = Hits::default();
     let theme = app.theme;
     let mut lines: Vec<Line<'_>> = Vec::new();
     let heading = |text: &'static str| Line::from(text).style(theme.header_style());
@@ -762,17 +838,32 @@ fn draw_sidebar(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::l
     for comment in &app.comments {
         lines.push(Line::from(format!("  {comment}")).style(theme.dim_style()));
     }
+    // Панель узкая: заметка в три слова занимает три строки, а не одну. Поэтому предел
+    // прокрутки — в строках после переноса, а не в записях: иначе колесо останавливалось бы на
+    // середине последней заметки.
+    let width = area.width.saturating_sub(2).max(1);
+    let rows = usize::from(area.height.saturating_sub(2)).max(1);
+    // Высота в строках считается ДО передачи строк в виджет: виджет их забирает, а мера нужна и
+    // после. Своя мера, а не `Paragraph::line_count`: тот в ratatui 0.30 закрыт как нестабильный.
+    let height = wrapped_height(&lines, usize::from(width));
+    let paragraph = Paragraph::new(lines)
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border_style())
+                .title(" узел "),
+        );
+    hits.sidebar = hits::Pane {
+        rows,
+        max: height.saturating_sub(rows),
+    };
+    hits.add(area, Hit::Sidebar);
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme.border_style())
-                    .title(" узел "),
-            ),
+        paragraph.scroll((offset_of(app.state.sidebar_scroll), 0)),
         area,
     );
+    hits
 }
 
 /// Форма узла: поля по одному, текущее помечено.
@@ -1049,7 +1140,7 @@ fn draw_kanban(
                 ),
             board_area,
         );
-        hits.extend(draw_detail(frame, app, detail_area));
+        hits.absorb(draw_detail(frame, app, detail_area));
         return hits;
     }
 
@@ -1139,7 +1230,7 @@ fn draw_kanban(
         );
     }
 
-    hits.extend(draw_detail(frame, app, detail_area));
+    hits.absorb(draw_detail(frame, app, detail_area));
     hits
 }
 
@@ -1183,13 +1274,23 @@ fn draw_detail(
         }
         None => lines.push(Line::from("узел не выбран").style(theme.dim_style())),
     }
+    // Тот же предел, что у панели узла: в строках после переноса. Описание задачи — это абзацы,
+    // и «прокрутить на запись» в нём не значит ничего.
+    let width = area.width.saturating_sub(2).max(1);
+    let rows = usize::from(area.height.saturating_sub(2)).max(1);
+    let height = wrapped_height(&lines, usize::from(width));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border_style())
+            .title(" задача "),
+    );
+    hits.detail = hits::Pane {
+        rows,
+        max: height.saturating_sub(rows),
+    };
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(theme.border_style())
-                .title(" задача "),
-        ),
+        paragraph.scroll((offset_of(app.state.detail_scroll), 0)),
         area,
     );
     hits
@@ -2096,6 +2197,200 @@ mod tests {
             hits.find(3, 2),
             Some(Hit::Project(1)),
             "вторая строка панели проектов не размечена"
+        );
+    }
+
+    /// Перенос по словам: сколько строк займёт абзац в узкой колонке.
+    ///
+    /// Мера своя, потому что `Paragraph::line_count` в ratatui 0.30 закрыт. Проверяются края, на
+    /// которых она врёт: пустая строка, ровно по ширине, слово длиннее колонки.
+    #[test]
+    fn the_wrapped_height_counts_words_and_long_words() {
+        // Пустая строка занимает строку: она тоже место на экране.
+        assert_eq!(words_height("", 10), 1);
+        assert_eq!(words_height("   ", 10), 1);
+        // Ровно по ширине — одна строка, на знак больше — две.
+        assert_eq!(words_height("1234567890", 10), 1);
+        assert_eq!(words_height("12345678901", 10), 2);
+        // Слова укладываются жадно: "три четыре" при ширине 9 влезает ("3+1+6=10"? нет — 10 > 9).
+        assert_eq!(words_height("три четыре", 9), 2);
+        assert_eq!(words_height("три пять", 9), 1);
+        // Слово шире колонки занимает несколько строк: адрес без пробелов не должен считаться
+        // одной строкой, иначе предел прокрутки окажется меньше настоящего.
+        assert_eq!(words_height("abcdefghijklmnopqrstuvwxyz", 10), 3);
+        // Пустой вход и нулевая ширина не делят на ноль.
+        assert_eq!(words_height("x", 0), 1);
+    }
+
+    /// Панель узла измеряется кадром: длинный текст даёт ненулевой предел прокрутки, короткий —
+    /// нулевой. Это единственное место, где предел вообще известен.
+    #[test]
+    fn the_sidebar_reports_its_scroll_limit() {
+        let mut app = app::App::new(overview::Board {
+            project: "DEMO".to_string(),
+            columns: Vec::new(),
+            overdue: 0,
+            leased: 0,
+            open: 0,
+            done: 0,
+        });
+        app.context = (1..=40).map(|n| format!("DEMO-{n} узел {n}")).collect();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        let mut hits = Hits::default();
+        terminal
+            .draw(|frame| {
+                hits = draw(frame, &app);
+            })
+            .expect("draw");
+        assert!(hits.sidebar.rows > 0, "высота панели не измерена");
+        assert!(
+            hits.sidebar.max > 0,
+            "длинный текст в панели дал предел прокрутки ноль"
+        );
+
+        // Короткий текст прокручивать некуда.
+        app.context = vec!["DEMO-1 единственный".to_string()];
+        terminal
+            .draw(|frame| {
+                hits = draw(frame, &app);
+            })
+            .expect("draw");
+        assert_eq!(
+            hits.sidebar.max, 0,
+            "короткий текст объявлен прокручиваемым"
+        );
+    }
+
+    /// Смещение панели действительно двигает текст: первая видимая строка меняется.
+    #[test]
+    fn the_sidebar_offset_moves_the_text() {
+        let mut app = app::App::new(overview::Board {
+            project: "DEMO".to_string(),
+            columns: Vec::new(),
+            overdue: 0,
+            leased: 0,
+            open: 0,
+            done: 0,
+        });
+        app.context = (1..=40).map(|n| format!("DEMO-{n}")).collect();
+
+        let first_line = |app: &app::App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    draw(frame, app);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            // Панель узла — справа: 32 знака от правого края, читается по её первой строке.
+            let left = 120 - SIDEBAR_WIDTH;
+            (left + 1..119)
+                .map(|x| buffer[(x, 1)].symbol())
+                .collect::<String>()
+        };
+
+        let top = first_line(&app);
+        assert!(
+            top.contains("контекст") || top.contains("DEMO-1"),
+            "верх панели: {top:?}"
+        );
+        app.state.sidebar_scroll = 6;
+        let scrolled = first_line(&app);
+        assert_ne!(
+            scrolled, top,
+            "смещение не сдвинуло текст панели: {scrolled:?}"
+        );
+    }
+
+    /// Панель задачи под канбаном тоже листается: предел считается по её собственной ширине.
+    #[test]
+    fn the_task_panel_reports_its_scroll_limit() {
+        let mut app = app::App::new(overview::Board {
+            project: "DEMO".to_string(),
+            columns: vec![overview::BoardColumn {
+                status: "todo".to_string(),
+                count: 1,
+                rows: vec![overview::BoardRow {
+                    dot_id: "DEMO-1".to_string(),
+                    title: "длинное описание".to_string(),
+                    priority: "high".to_string(),
+                    due_date: None,
+                    days_overdue: 0,
+                    lease_holder: None,
+                    progress: "0%".to_string(),
+                }],
+            }],
+            overdue: 0,
+            leased: 0,
+            open: 1,
+            done: 0,
+        });
+        app.state.view = model::View::Kanban;
+        app.detail = (1..=30)
+            .map(|n| format!("строка описания номер {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        let mut hits = Hits::default();
+        terminal
+            .draw(|frame| {
+                hits = draw(frame, &app);
+            })
+            .expect("draw");
+        assert!(hits.detail.rows > 0, "высота панели задачи не измерена");
+        assert!(
+            hits.detail.max > 0,
+            "длинное описание дало предел прокрутки ноль"
+        );
+    }
+
+    /// Переход на другой узел возвращает панели к началу.
+    ///
+    /// Иначе пролистанное описание первого узла осталось бы пролистанным и на втором: человек
+    /// читал бы чужой текст с середины и не понял бы, почему он начинается не сначала.
+    #[test]
+    fn another_node_resets_the_panel_scroll() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-tui-scroll-{nanos}"));
+        let outcome = crate::db::init(&dir, "SCROLL", "scroll").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        for title in ["первый", "второй"] {
+            crate::node::create(
+                &mut conn,
+                &project,
+                crate::node::NewNode {
+                    parent: None,
+                    title,
+                    kind: None,
+                    description: Some("описание задачи, достаточно длинное для прокрутки"),
+                    priority: Some("medium"),
+                    due_date: None,
+                    estimated_hours: None,
+                    weight: None,
+                    source_ref: None,
+                    branch: None,
+                },
+            )
+            .expect("node");
+        }
+
+        let board = overview::board(&conn, &project).expect("board");
+        let mut app = app::App::new(board);
+        app.refresh(&conn, &project).expect("refresh");
+        app.state.detail_scroll = 3;
+        app.state.sidebar_scroll = 2;
+
+        // Курсор на второй узел и перечитывание — как после `j`.
+        app.state.row = 1;
+        app.refresh(&conn, &project).expect("refresh");
+        assert_eq!(app.state.detail_scroll, 0, "описание осталось пролистанным");
+        assert_eq!(
+            app.state.sidebar_scroll, 0,
+            "панель узла осталась пролистанной"
         );
     }
 }

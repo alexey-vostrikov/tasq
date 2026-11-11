@@ -62,6 +62,12 @@ pub struct App {
     /// Мышь приходит координатами, а экран живёт индексами, поэтому связь хранится здесь, а не
     /// считается в обработчике заново: второй расчёт разошёлся бы с первым.
     pub hits: super::hits::Hits,
+    /// Узел, для которого сейчас нарисованы панели.
+    ///
+    /// Нужен ровно для одного: сбросить прокрутку панелей, когда человек перешёл на другой узел.
+    /// Без этого длинное описание, пролистанное до середины, осталось бы пролистанным и на
+    /// следующем узле — и человек читал бы чужой текст с середины.
+    pub shown: Option<String>,
     /// Описание выбранного узла: текст задачи для панели под канбаном.
     ///
     /// Читается из базы отдельным запросом при каждом перечитывании: в `overview::BoardRow`
@@ -104,6 +110,7 @@ impl App {
             project: None,
             theme: crate::tui::theme::Theme::default(),
             hits: super::hits::Hits::default(),
+            shown: None,
             detail: String::new(),
             context: Vec::new(),
             notes: Vec::new(),
@@ -265,7 +272,16 @@ impl App {
         self.notes.clear();
         self.comments.clear();
         self.detail.clear();
-        let Some(reference) = self.selected().map(|row| row.dot_id.clone()) else {
+        let reference = self.selected().map(|row| row.dot_id.clone());
+        // Другой узел — панели начинаются сверху. Проверка по «показанному» узлу, а не по факту
+        // перечитывания: доска перечитывается на каждом тике (раз в четверть секунды), и сброс по
+        // нему означал бы, что прокрутить панель невозможно вовсе.
+        if self.shown != reference {
+            self.state.sidebar_scroll = 0;
+            self.state.detail_scroll = 0;
+            self.shown = reference.clone();
+        }
+        let Some(reference) = reference else {
             return Ok(());
         };
         // Описание — отдельным чтением: доска его не отдаёт, а панель под канбаном без него
@@ -463,6 +479,15 @@ impl App {
                 }
                 Some(key) => match model::intent(self.state.mode, key) {
                     Some(intent) => {
+                        // Прокрутка панели обрабатывается здесь, а не в модели: предел и шаг знает
+                        // кадр (ширина панели, перенос строк, высота окна), а модель состояния
+                        // кадра не видит и знать не должна.
+                        if matches!(
+                            intent,
+                            Intent::ScrollDown | Intent::ScrollUp | Intent::ScrollTop
+                        ) {
+                            return self.scroll(self.state.view == model::View::Kanban, intent);
+                        }
                         if intent == Intent::ChangeStatus {
                             self.prepare_statuses();
                         }
@@ -478,6 +503,48 @@ impl App {
         }
     }
 
+    /// Подтягивает прокрутку панелей к пределам, измеренным последним кадром.
+    ///
+    /// Нужна после ресайза и после смены узла: предел мог уменьшиться, а сохранённое смещение —
+    /// остаться больше него, и панель показала бы пустоту вместо текста.
+    pub fn clamp_panels(&mut self) {
+        self.state.sidebar_scroll = self.state.sidebar_scroll.min(self.hits.sidebar.max);
+        self.state.detail_scroll = self.state.detail_scroll.min(self.hits.detail.max);
+    }
+
+    /// Прокрутка панели: `task` — текст задачи под канбаном, иначе сведения об узле справа.
+    ///
+    /// Предел и шаг берутся из измерений ПРОШЛОГО кадра: их сделала отрисовка, и до следующего
+    /// кадра они верны — содержимое и ширина панели между двумя кадрами не меняются. Так прокрутка
+    /// не может уехать за конец текста и показать пустоту даже на один тик.
+    fn scroll(&mut self, task: bool, intent: Intent) -> Outcome {
+        let measured = if task {
+            self.hits.detail
+        } else {
+            self.hits.sidebar
+        };
+        let offset = if task {
+            &mut self.state.detail_scroll
+        } else {
+            &mut self.state.sidebar_scroll
+        };
+        // Шаг — почти вся панель: строка в панели это часть абзаца, и построчное движение
+        // заставляло бы читать по одной строке. Минус одна строка остаётся как зацепка: видно,
+        // что текст продолжается, а не начинается заново.
+        let page = measured.rows.saturating_sub(1).max(1);
+        let next = match intent {
+            Intent::ScrollDown => (*offset + page).min(measured.max),
+            Intent::ScrollUp => offset.saturating_sub(page),
+            Intent::ScrollTop => 0,
+            _ => return Outcome::Ignored,
+        };
+        if next == *offset {
+            return Outcome::Ignored;
+        }
+        *offset = next;
+        Outcome::Redraw
+    }
+
     /// Мышь: колесо двигает то же, что `j`/`k`, клик выбирает то, по чему попали.
     ///
     /// Колесо НЕ прокручивает окно отдельно от курсора: в этой модели прокрутка привязана к
@@ -488,13 +555,24 @@ impl App {
     /// ничего не значат, а реакция на отпускание превращала бы одно нажатие в два действия.
     fn step_mouse(&mut self, mouse: MouseEvent) -> Outcome {
         match mouse.kind {
-            MouseEventKind::ScrollDown => match self.state.focus {
-                model::Focus::Projects => self.state.apply(Intent::ProjectDown),
-                model::Focus::Board => self.state.apply(Intent::MoveDown),
+            // Колесо над панелью листает панель, над доской — курсор. Что под указателем, знает
+            // карта кадра: без неё колесо над длинным описанием двигало бы выбранный узел, то есть
+            // работало бы не там, куда человек смотрит.
+            MouseEventKind::ScrollDown => match self.hits.find(mouse.column, mouse.row) {
+                Some(super::hits::Hit::Sidebar) => self.scroll(false, Intent::ScrollDown),
+                Some(super::hits::Hit::Detail) => self.scroll(true, Intent::ScrollDown),
+                _ => match self.state.focus {
+                    model::Focus::Projects => self.state.apply(Intent::ProjectDown),
+                    model::Focus::Board => self.state.apply(Intent::MoveDown),
+                },
             },
-            MouseEventKind::ScrollUp => match self.state.focus {
-                model::Focus::Projects => self.state.apply(Intent::ProjectUp),
-                model::Focus::Board => self.state.apply(Intent::MoveUp),
+            MouseEventKind::ScrollUp => match self.hits.find(mouse.column, mouse.row) {
+                Some(super::hits::Hit::Sidebar) => self.scroll(false, Intent::ScrollUp),
+                Some(super::hits::Hit::Detail) => self.scroll(true, Intent::ScrollUp),
+                _ => match self.state.focus {
+                    model::Focus::Projects => self.state.apply(Intent::ProjectUp),
+                    model::Focus::Board => self.state.apply(Intent::MoveUp),
+                },
             },
             MouseEventKind::Down(MouseButton::Left) => {
                 // Карта попаданий построена по прошлому кадру. Если она пуста (кадр ещё не
@@ -527,7 +605,10 @@ impl App {
                         Outcome::Redraw
                     }
                     Some(super::hits::Hit::Detail) => self.state.apply(Intent::Open),
-                    None => Outcome::Ignored,
+                    // Колесо листает панель, но клик по ней означает «открыть узел» (см. выше);
+                    // для правой панели клика нет: она показывает то же, что и карточка, и
+                    // отдельного действия у неё нет.
+                    Some(super::hits::Hit::Sidebar) | None => Outcome::Ignored,
                 }
             }
             _ => Outcome::Ignored,
@@ -972,6 +1053,9 @@ pub fn key_of(key: KeyEvent) -> Option<Key> {
         KeyCode::Left => Some(Key::Left),
         KeyCode::Right => Some(Key::Right),
         KeyCode::Backspace => Some(Key::Backspace),
+        KeyCode::PageUp => Some(Key::PageUp),
+        KeyCode::PageDown => Some(Key::PageDown),
+        KeyCode::Home => Some(Key::Home),
         _ => None,
     }
 }
@@ -998,6 +1082,16 @@ mod tests {
     fn mouse_click(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Колесо в заданной точке экрана.
+    fn mouse_wheel_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
             column,
             row,
             modifiers: KeyModifiers::NONE,
@@ -1264,6 +1358,9 @@ mod tests {
             (KeyCode::Backspace, Key::Backspace),
             (KeyCode::Char('ж'), Key::Char('ж')),
             (KeyCode::Char('/'), Key::Char('/')),
+            (KeyCode::PageUp, Key::PageUp),
+            (KeyCode::PageDown, Key::PageDown),
+            (KeyCode::Home, Key::Home),
         ];
         for (code, expected) in table {
             assert_eq!(
@@ -1272,7 +1369,7 @@ mod tests {
                 "{code:?}"
             );
         }
-        for code in [KeyCode::Home, KeyCode::End, KeyCode::F(5), KeyCode::Delete] {
+        for code in [KeyCode::End, KeyCode::F(5), KeyCode::Delete] {
             assert_eq!(
                 key_of(KeyEvent::new(code, KeyModifiers::NONE)),
                 None,
@@ -2137,5 +2234,108 @@ mod tests {
         )
         .expect("description");
         (conn, project)
+    }
+
+    /// Колесо над панелью листает панель, а не курсор доски.
+    ///
+    /// Это и была ошибка: панель длиной в экран стояла на месте, а колесо над ней двигало
+    /// выбранный узел — то есть работало не там, куда человек смотрит.
+    #[test]
+    fn the_wheel_over_a_panel_scrolls_the_panel() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1", "DEMO-2"])]));
+        app.hits.sidebar = super::super::hits::Pane { rows: 6, max: 20 };
+        app.hits.add(
+            ratatui::layout::Rect::new(90, 0, 30, 40),
+            super::super::hits::Hit::Sidebar,
+        );
+        assert_eq!(
+            app.step(Event::Mouse(mouse_wheel_at(
+                MouseEventKind::ScrollDown,
+                100,
+                10
+            ))),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            app.state.sidebar_scroll, 5,
+            "шаг не равен высоте панели без строки"
+        );
+        assert_eq!(
+            app.selected().map(|row| row.dot_id.as_str()),
+            Some("DEMO-1"),
+            "колесо над панелью сдвинуло курсор доски"
+        );
+    }
+
+    /// Предел соблюдается: дальше конца текста панель не уезжает, и вверх она возвращается.
+    #[test]
+    fn the_panel_stops_at_the_end_of_the_text() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1"])]));
+        app.hits.detail = super::super::hits::Pane { rows: 4, max: 7 };
+        app.state.view = model::View::Kanban;
+        app.hits.add(
+            ratatui::layout::Rect::new(0, 20, 60, 6),
+            super::super::hits::Hit::Detail,
+        );
+        // Три шага по три строки: 3, 6, 7 — дальше предел.
+        for expected in [3, 6, 7, 7] {
+            app.step(Event::Mouse(mouse_wheel_at(
+                MouseEventKind::ScrollDown,
+                10,
+                22,
+            )));
+            assert_eq!(
+                app.state.detail_scroll, expected,
+                "предел прокрутки нарушен"
+            );
+        }
+        app.step(Event::Mouse(mouse_wheel_at(
+            MouseEventKind::ScrollUp,
+            10,
+            22,
+        )));
+        assert_eq!(app.state.detail_scroll, 4, "вверх прокрутка идёт на шаг");
+    }
+
+    /// Клавиши страниц листают панель, которая видна: на списке — правую, на канбане — задачу.
+    #[test]
+    fn the_page_keys_scroll_the_visible_panel() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1"])]));
+        app.hits.sidebar = super::super::hits::Pane { rows: 10, max: 30 };
+        app.hits.detail = super::super::hits::Pane { rows: 5, max: 40 };
+
+        let page_down = || Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.step(page_down()), Outcome::Redraw);
+        assert_eq!(
+            app.state.sidebar_scroll, 9,
+            "страница вниз не полистала панель"
+        );
+        assert_eq!(app.state.detail_scroll, 0, "полисталась невидимая панель");
+
+        app.state.view = model::View::Kanban;
+        app.step(page_down());
+        assert_eq!(
+            app.state.detail_scroll, 4,
+            "на канбане страница не дошла до задачи"
+        );
+
+        let home = Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.step(home), Outcome::Redraw);
+        assert_eq!(app.state.detail_scroll, 0, "Home не вернул панель к началу");
+        assert_eq!(
+            app.step(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))),
+            Outcome::Ignored,
+            "Home в начале текста просит перерисовку впустую"
+        );
+    }
+
+    /// Панель без измерений (кадр ещё не рисовался) не листается: предел неизвестен, и угадывать
+    /// его нельзя — прокрутка уехала бы в пустоту.
+    #[test]
+    fn an_unmeasured_panel_does_not_scroll() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1"])]));
+        let page_down = Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.step(page_down), Outcome::Ignored);
+        assert_eq!(app.state.sidebar_scroll, 0);
     }
 }
