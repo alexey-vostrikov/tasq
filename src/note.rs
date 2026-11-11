@@ -27,19 +27,6 @@ pub enum NoteType {
 }
 
 impl NoteType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            NoteType::General => "general",
-            NoteType::Decision => "decision",
-            NoteType::Context => "context",
-            NoteType::Meeting => "meeting",
-            NoteType::Technical => "technical",
-            NoteType::Blocker => "blocker",
-            NoteType::Progress => "progress",
-            NoteType::Release => "release",
-        }
-    }
-
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "general" => NoteType::General,
@@ -277,7 +264,6 @@ pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<Vec<N
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Удаляет заметку. Возвращает `true`, если запись была.
 /// Удаляет заметку.
 ///
 /// Заметки не удаляются мягко: у них нет ни статуса, ни детей, и восстанавливать
@@ -307,4 +293,177 @@ pub fn delete(conn: &mut Connection, project: &Project, id: i64, actor: &str) ->
     )?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Своя база на тест: файл в каталоге процесса, имя уникально по времени.
+    fn db_conn() -> (Connection, Project) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-note-{nanos}"));
+        let outcome = crate::db::init(&dir, "NOTE", "notes").expect("init");
+        let conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        (conn, project)
+    }
+
+    fn note_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .expect("count")
+    }
+
+    /// Все восемь имён принимаются, остальное — нет. По случаю на каждое имя: `match` из восьми
+    /// ветвей иначе проверяется одной и мутация в любой ветви выживает.
+    #[test]
+    fn every_declared_type_is_accepted_and_nothing_else_is() {
+        for (text, expected) in [
+            ("general", NoteType::General),
+            ("decision", NoteType::Decision),
+            ("context", NoteType::Context),
+            ("meeting", NoteType::Meeting),
+            ("technical", NoteType::Technical),
+            ("blocker", NoteType::Blocker),
+            ("progress", NoteType::Progress),
+            ("release", NoteType::Release),
+        ] {
+            assert_eq!(
+                NoteType::parse(text),
+                Some(expected),
+                "имя {text} не принято"
+            );
+        }
+        for text in ["", "general ", "Decision", "todo", "unknown"] {
+            assert_eq!(
+                NoteType::parse(text),
+                None,
+                "{text:?} принято как тип заметки"
+            );
+        }
+    }
+
+    /// Неизвестный тип отвергается ДО записи: заметки в базе после отказа нет.
+    #[test]
+    fn an_unknown_type_is_refused_and_nothing_is_written() {
+        let (mut conn, project) = db_conn();
+        let err = save(
+            &mut conn,
+            &project,
+            SaveNote {
+                title: Some("t"),
+                note_type: Some("bogus"),
+                ..SaveNote::default()
+            },
+        )
+        .expect_err("неизвестный тип принят");
+        assert_eq!(err.code(), "INVALID_VALUE", "другой код отказа: {err}");
+        assert!(
+            err.to_string().contains("note_type"),
+            "в отказе не назван тип заметки: {err}"
+        );
+        assert_eq!(note_count(&conn), 0, "заметка записана вопреки отказу");
+    }
+
+    /// Тот же отказ на фильтре списка: искать по несуществующему типу нечего.
+    #[test]
+    fn an_unknown_type_is_refused_in_the_filter() {
+        let (conn, project) = db_conn();
+        let filter = Filter {
+            note_type: Some("bogus"),
+            ..Filter::default()
+        };
+        let err = list(&conn, &project, &filter).expect_err("фильтр по мусору принят");
+        assert_eq!(err.code(), "INVALID_VALUE", "другой код отказа: {err}");
+    }
+
+    /// Обновление несуществующей заметки — отказ, а не молчаливое создание.
+    #[test]
+    fn updating_a_missing_note_is_refused() {
+        let (mut conn, project) = db_conn();
+        let err = save(
+            &mut conn,
+            &project,
+            SaveNote {
+                id: Some(9999),
+                title: Some("t"),
+                ..SaveNote::default()
+            },
+        )
+        .expect_err("обновление несуществующей заметки прошло");
+        assert_eq!(err.code(), "INVALID_VALUE", "другой код отказа: {err}");
+        assert_eq!(note_count(&conn), 0, "заметка завелась при отказе");
+    }
+
+    /// Смена заголовка видна в журнале: старое значение, новое, поле и автор.
+    #[test]
+    fn renaming_a_note_leaves_an_activity_row() {
+        let (mut conn, project) = db_conn();
+        let created = save(
+            &mut conn,
+            &project,
+            SaveNote {
+                title: Some("старое имя"),
+                actor: Some("tester"),
+                ..SaveNote::default()
+            },
+        )
+        .expect("create");
+        save(
+            &mut conn,
+            &project,
+            SaveNote {
+                id: Some(created.id),
+                title: Some("новое имя"),
+                actor: Some("tester"),
+                ..SaveNote::default()
+            },
+        )
+        .expect("rename");
+
+        let (old, new, field, actor): (String, String, String, String) = conn
+            .query_row(
+                "SELECT old_value, new_value, field_name, actor FROM activity_log
+                  WHERE entity_type = 'note' AND entity_id = ?1 AND action = 'update'
+                    AND field_name = 'title'",
+                [created.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("строка журнала о смене заголовка");
+        assert_eq!(old, "старое имя");
+        assert_eq!(new, "новое имя");
+        assert_eq!(field, "title");
+        assert_eq!(actor, "tester");
+    }
+
+    /// Смена типа без смены заголовка заголовок не трогает — и заметка остаётся с новым типом.
+    #[test]
+    fn a_type_change_keeps_the_title() {
+        let (mut conn, project) = db_conn();
+        let created = save(
+            &mut conn,
+            &project,
+            SaveNote {
+                title: Some("имя"),
+                note_type: Some("general"),
+                ..SaveNote::default()
+            },
+        )
+        .expect("create");
+        let updated = save(
+            &mut conn,
+            &project,
+            SaveNote {
+                id: Some(created.id),
+                note_type: Some("blocker"),
+                ..SaveNote::default()
+            },
+        )
+        .expect("retype");
+        assert_eq!(updated.title, "имя", "заголовок затёрт сменой типа");
+        assert_eq!(updated.note_type, "blocker", "тип не сменился");
+    }
 }

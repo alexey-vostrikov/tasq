@@ -205,3 +205,133 @@ fn comment_node(conn: &Connection, id: i64) -> Result<Option<i64>> {
         )
         .optional()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{self, NewNode};
+
+    fn db_conn() -> (Connection, Project) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-comment-{nanos}"));
+        let outcome = crate::db::init(&dir, "CMT", "comments").expect("init");
+        let conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        (conn, project)
+    }
+
+    fn with_task() -> (Connection, Project, String) {
+        let (mut conn, project) = db_conn();
+        let task = node::create(
+            &mut conn,
+            &project,
+            NewNode {
+                parent: None,
+                title: "задача",
+                kind: None,
+                description: None,
+                priority: None,
+                due_date: None,
+                estimated_hours: None,
+                weight: None,
+                source_ref: None,
+                branch: None,
+            },
+        )
+        .expect("node");
+        let reference = task.dot_id.clone();
+        (conn, project, reference)
+    }
+
+    /// Пустой и из пробелов комментарий отвергается: пустая запись в ленте не читается.
+    #[test]
+    fn an_empty_comment_is_refused() {
+        let (mut conn, project, reference) = with_task();
+        for content in ["", "   ", "\n\t"] {
+            let err = add(&mut conn, &project, &reference, content, "tester")
+                .expect_err("пустой комментарий принят");
+            assert_eq!(err.code(), "INVALID_VALUE", "другой код отказа: {err}");
+            assert!(
+                err.to_string().contains("content"),
+                "в отказе не назван текст: {err}"
+            );
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM comments", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 0, "пустой комментарий записан");
+    }
+
+    /// Отсутствующий комментарий называется в отказе своим id.
+    #[test]
+    fn a_missing_comment_is_reported_by_id() {
+        let (conn, project) = db_conn();
+        let err = by_id(&conn, &project, 4242).expect_err("отсутствующий комментарий найден");
+        assert_eq!(err.code(), "INVALID_VALUE", "другой код отказа: {err}");
+        let text = err.to_string();
+        assert!(text.contains("4242"), "в отказе нет id: {err}");
+        assert!(
+            text.contains("not found"),
+            "отказ не говорит об отсутствии: {err}"
+        );
+    }
+
+    /// Восстановление не удалённого комментария — отказ: состояние уже такое.
+    #[test]
+    fn restoring_a_present_comment_is_refused() {
+        let (mut conn, project, reference) = with_task();
+        let comment = add(&mut conn, &project, &reference, "текст", "tester").expect("add");
+        let err = restore(&mut conn, &project, comment.id, "tester")
+            .expect_err("восстановление живого комментария прошло");
+        assert_eq!(err.code(), "ALREADY_IN_STATE", "другой код отказа: {err}");
+        assert!(
+            err.to_string().contains("present"),
+            "отказ не называет состояние: {err}"
+        );
+    }
+
+    /// Повторное удаление — отказ «deleted», а не вторая запись в журнале.
+    #[test]
+    fn deleting_twice_is_refused() {
+        let (mut conn, project, reference) = with_task();
+        let comment = add(&mut conn, &project, &reference, "текст", "tester").expect("add");
+        delete(&mut conn, &project, comment.id, "tester", Some("дубль")).expect("delete");
+        let err = delete(&mut conn, &project, comment.id, "tester", None)
+            .expect_err("повторное удаление прошло");
+        assert_eq!(err.code(), "ALREADY_IN_STATE", "другой код отказа: {err}");
+        assert!(
+            err.to_string().contains("deleted"),
+            "отказ не называет состояние: {err}"
+        );
+    }
+
+    /// Удалённый комментарий скрыт из ленты, пока не попросили явно, и возвращается восстановлением.
+    #[test]
+    fn a_deleted_comment_is_hidden_until_asked_and_comes_back() {
+        let (mut conn, project, reference) = with_task();
+        let comment = add(&mut conn, &project, &reference, "текст", "tester").expect("add");
+        delete(&mut conn, &project, comment.id, "tester", Some("устарел")).expect("delete");
+
+        let visible = list(&conn, &project, &reference, false).expect("list");
+        assert!(visible.is_empty(), "удалённый комментарий остался в ленте");
+        let all = list(&conn, &project, &reference, true).expect("list all");
+        assert_eq!(
+            all.len(),
+            1,
+            "удалённый комментарий пропал из полной выдачи"
+        );
+        assert!(all[0].is_deleted, "признак удаления не выставлен");
+        assert_eq!(
+            all[0].delete_reason.as_deref(),
+            Some("устарел"),
+            "причина удаления не сохранена"
+        );
+
+        restore(&mut conn, &project, comment.id, "tester").expect("restore");
+        let visible = list(&conn, &project, &reference, false).expect("list");
+        assert_eq!(visible.len(), 1, "восстановленный комментарий не вернулся");
+    }
+}

@@ -37,8 +37,17 @@ pub fn new_id() -> Result<String> {
 /// Пустое значение читается как отсутствие: `TASQ_SESSION=` в скрипте — обычная случайность, и
 /// превращать её в сессию с пустым id значило бы завести невидимую общую привязку.
 pub fn from_env() -> Option<String> {
-    std::env::var(ENV)
-        .ok()
+    from_lookup(|key| std::env::var(key).ok())
+}
+
+/// Разбор значения, взятого откуда угодно.
+///
+/// Отдельно от `from_env`, потому что окружение процесса — общий ресурс: тест, правящий
+/// `TASQ_SESSION`, перетирает соседние тесты того же бинаря, и набор начинает падать по порядку
+/// запуска. Тест подставляет карту, а правило «пустое равно отсутствию, пробелы срезаются»
+/// проверяется без `set_var` и без уборки за собой.
+pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    lookup(ENV)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -54,15 +63,6 @@ pub fn ensure(conn: &Connection, id: &str, holder: &str) -> Result<()> {
          VALUES (?1, ?2, NULL, ?3, ?3)
          ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
         params![id, holder, now],
-    )?;
-    Ok(())
-}
-
-/// Отметка «сессия жива». Отдельно от `ensure`, потому что вызывается чаще.
-pub fn touch(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2",
-        params![now_iso(), id],
     )?;
     Ok(())
 }
@@ -147,5 +147,41 @@ mod tests {
     fn an_unknown_session_has_no_affinity() {
         let (conn, _project) = db_conn();
         assert_eq!(affinity(&conn, "ghost").expect("affinity"), None);
+    }
+
+    /// Правило чтения идентификатора: пустое и из пробелов — это отсутствие, а не сессия.
+    ///
+    /// Каждое значение — отдельный случай карты, а не отдельный тест: переменная окружения
+    /// процесса одна на весь бинарь, и тесты, правящие её, перетирают друг друга.
+    #[test]
+    fn a_blank_identifier_means_no_session() {
+        let value = |v: Option<&'static str>| {
+            from_lookup(move |key| {
+                assert_eq!(key, ENV, "читается ровно объявленная переменная");
+                v.map(str::to_string)
+            })
+        };
+        assert_eq!(value(None), None, "не задана — сессии нет");
+        assert_eq!(value(Some("")), None, "пустая — сессии нет");
+        assert_eq!(value(Some("   ")), None, "из одних пробелов — сессии нет");
+        assert_eq!(
+            value(Some("  s-1  ")),
+            Some("s-1".to_string()),
+            "пробелы по краям срезаются"
+        );
+    }
+
+    /// Идентификаторы двух сессий не совпадают: иначе две параллельные «hermes» склеятся в одну,
+    /// а привязка `next` к проекту начнёт тянуть их друг за другом.
+    #[test]
+    fn two_identifiers_differ_and_are_hex() {
+        let first = new_id().expect("id");
+        let second = new_id().expect("id");
+        assert_ne!(first, second, "два вызова дали один идентификатор");
+        assert_eq!(first.len(), 32, "16 байт в hex — это 32 знака: {first}");
+        assert!(
+            first.chars().all(|c| c.is_ascii_hexdigit()),
+            "идентификатор не hex: {first}"
+        );
     }
 }
