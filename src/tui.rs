@@ -21,7 +21,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use rusqlite::Connection;
@@ -34,8 +34,11 @@ use crate::overview;
 /// Фиксированная, а не по размеру терминала: у CI и у файла с картинкой размера нет, а кадр,
 /// зависящий от окна, нельзя сравнить в тесте. Сто символов — столько влезает в обычный
 /// терминал без переносов.
-/// Сто сорок, а не сто: слева панель проектов (24), справа сведения об узле (32), и в сотне на
-/// таблицу остаётся 44 знака — заголовок и адрес в неё не влезают и молча обрезаются.
+/// Ширина по умолчанию для `--once`: сто сорок, а не сто.
+///
+/// Слева панель проектов (24), справа сведения об узле (32), и в сотне на таблицу остаётся 44
+/// знака — заголовок и адрес в неё не влезают и молча обрезаются. Применяется, только когда
+/// ширину неоткуда взять: у терминала она своя (см. [`once_width`]).
 pub const ONCE_WIDTH: u16 = 140;
 
 /// Как часто перерисовывать кадр без событий.
@@ -68,11 +71,14 @@ pub fn run(
     start: Option<&str>,
     theme: Option<&str>,
     once: bool,
+    color: bool,
 ) -> Result<()> {
     let mut app = build(conn, start, theme)?;
 
     if once {
-        print!("{}", render_once(&app));
+        // Ширина берётся у терминала, если он есть: `--once` чаще печатают руками, чем в лог, и
+        // кадр под фиксированные 140 знаков рассыпается переносами посреди рамки.
+        print!("{}", render_once_sized(&app, once_width(), color));
         return Ok(());
     }
 
@@ -185,23 +191,197 @@ where
     result
 }
 
+/// Ширина кадра для `--once`.
+///
+/// Три источника по порядку достоверности:
+///
+/// 1. **Размер терминала**, если вывод идёт в него: `--once` печатают руками чаще, чем в лог, и
+///    кадр, свёрстанный под 140 знаков, «рассыпается» — человек видит переносы посреди рамки.
+/// 2. **`COLUMNS`**, если терминала нет, но переменную выставила оболочка или CI: это ровно то, что
+///    человек имеет в виду, когда перенаправляет вывод в файл, а потом читает его в `less -S`.
+/// 3. **`ONCE_WIDTH`**, если нет ни того ни другого. Не «девяносто по умолчанию», а 140: у экрана
+///    слева панель проектов (24) и справа сведения об узле (32), и при узкой ширине таблица
+///    обрезает адреса и названия посреди слова.
+///
+/// Нижняя граница — 60 знаков: уже этого панель и доска не помещаются вместе, и усечение
+/// осмысленнее сделать один раз здесь, чем показывать человеку кашу из трёх обрезков.
+pub fn once_width() -> u16 {
+    terminal::size()
+        .ok()
+        .map(|(width, _)| width)
+        .or_else(|| parse_width(std::env::var("COLUMNS").ok().as_deref()))
+        .unwrap_or(ONCE_WIDTH)
+        .max(MIN_ONCE_WIDTH)
+}
+
+/// Разбор ширины из строки: мусор и всё, что уже минимума, читается как «не задано».
+///
+/// Отдельная функция, потому что `std::env` в тестах общий: проверять разбор через подмену
+/// `COLUMNS` значило бы ломать соседние тесты того же бинаря.
+pub fn parse_width(value: Option<&str>) -> Option<u16> {
+    value
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|width| *width >= MIN_ONCE_WIDTH)
+}
+
+/// Снимает все escape-последовательности: нужен, чтобы сверить текст цветного кадра с обычным.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // ESC '[' … финальный байт в диапазоне @–~ ; всё прочее после ESC тоже пропускаем.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Меньше этого `--once` не верстает: панель проектов и доска вместе не влезают.
+pub const MIN_ONCE_WIDTH: u16 = 60;
+
 /// Кадр в виде текста, без терминала.
 ///
 /// Рисуется в буфер памяти (`TestBackend`), а не в stdout: у `--once` нет терминала, из которого
 /// можно взять размер, и ждать `tty` от CI нечего. Заодно это единственный способ проверить
 /// вывод кадра тестом — сравнить строки, а не перехватывать поток.
+///
+/// Без цвета: так кадр сравнивается в гейте (`make smoke`, CI) строками. Цветной кадр — отдельная
+/// функция, потому что сравнение с escape-последовательностями проверяло бы не экран, а
+/// сериализатор.
 pub fn render_once(app: &app::App) -> String {
+    render_once_sized(app, ONCE_WIDTH, false)
+}
+
+/// Кадр заданной ширины, с цветом или без.
+pub fn render_once_sized(app: &app::App, width: u16, color: bool) -> String {
+    let width = width.max(MIN_ONCE_WIDTH);
     let height = frame_height_for(app);
     // Буфер в памяти отказать не может: его `Error` — `Infallible`. Поэтому `render_once` не
     // возвращает `Result`: ошибка, которой нельзя случиться, в подписи была бы ложью, и
     // вызывающий писал бы `?` там, где нечего обрабатывать.
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(ONCE_WIDTH, height))
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height))
         .expect("рисование в буфер памяти не может отказать");
     terminal
         .draw(|frame| draw(frame, app))
         .expect("рисование в буфер памяти не может отказать");
     let buffer = terminal.backend().buffer().clone();
-    buffer_lines(&buffer, ONCE_WIDTH)
+    if color {
+        buffer_ansi(&buffer, width)
+    } else {
+        buffer_lines(&buffer, width)
+    }
+}
+
+/// Буфер кадра → текст с ANSI-цветами.
+///
+/// Своя сериализация, а не `CrosstermBackend`: тот спрашивает размер у терминала, а у `--once`
+/// терминала может не быть вовсе. Здесь же буфер уже нарисован нужной ширины, и остаётся
+/// превратить стили в escape-последовательности.
+///
+/// Хвостовые пробелы срезаются ДО добавления escape: иначе строка заканчивалась бы «цвет + сорок
+/// пробелов + сброс», и файл с кадром весил бы втрое больше нужного.
+fn buffer_ansi(buffer: &ratatui::buffer::Buffer, width: u16) -> String {
+    let area = buffer.area();
+    let mut text = String::new();
+    for y in 0..area.height {
+        // Последняя непустая клетка: дальше пробелы, которые в текст не идут.
+        let last = (0..width).rev().find(|x| buffer[(*x, y)].symbol() != " ");
+        let Some(last) = last else {
+            text.push('\n');
+            continue;
+        };
+        let mut current: Option<Style> = None;
+        for x in 0..=last {
+            let cell = &buffer[(x, y)];
+            let style = cell.style();
+            if current != Some(style) {
+                text.push_str(&sgr(style));
+                current = Some(style);
+            }
+            text.push_str(cell.symbol());
+        }
+        // Сброс в конце строки, а не в начале следующей: строка без сброса «протекает» на
+        // терминал, и всё, что человек напечатает после кадра, окажется цветным.
+        text.push_str("\x1b[0m");
+        text.push('\n');
+    }
+    text
+}
+
+/// Стиль → escape-последовательности SGR.
+///
+/// Порядок «сброс, затем цвет, затем модификаторы» выбран потому, что так одна и та же функция
+/// годится и для первой установки, и для смены стиля посреди строки: без сброса пришлось бы
+/// считать разницу между стилями, а это второй способ ошибиться в том же месте.
+fn sgr(style: Style) -> String {
+    // `Color::Reset` означает «цвет по умолчанию», и в буфере `TestBackend` он стоит почти в
+    // каждой клетке. Как код SGR он бессмысленен: сброс уже сделан первым элементом списка, и
+    // от него в строке оставалось `0;0` — лишние байты в каждом кадре и шум в `git diff`.
+    let fg = style.fg.filter(|color| *color != Color::Reset);
+    let bg = style.bg.filter(|color| *color != Color::Reset);
+    let mut codes: Vec<String> = vec!["0".to_string()];
+    if let Some(color) = fg {
+        codes.push(color_code(color, false));
+    }
+    if let Some(color) = bg {
+        codes.push(color_code(color, true));
+    }
+    let modifier = style.add_modifier;
+    for (flag, code) in [
+        (Modifier::BOLD, "1"),
+        (Modifier::DIM, "2"),
+        (Modifier::ITALIC, "3"),
+        (Modifier::UNDERLINED, "4"),
+        (Modifier::SLOW_BLINK, "5"),
+        (Modifier::REVERSED, "7"),
+        (Modifier::CROSSED_OUT, "9"),
+    ] {
+        if modifier.contains(flag) {
+            codes.push(code.to_string());
+        }
+    }
+    format!("\x1b[{}m", codes.join(";"))
+}
+
+/// Цвет → код SGR. `background` сдвигает обычные коды на десять, как и в стандарте.
+fn color_code(color: Color, background: bool) -> String {
+    let base = if background { 10 } else { 0 };
+    match color {
+        Color::Reset => format!("{}", 39 + base),
+        Color::Black => format!("{}", 30 + base),
+        Color::Red => format!("{}", 31 + base),
+        Color::Green => format!("{}", 32 + base),
+        Color::Yellow => format!("{}", 33 + base),
+        Color::Blue => format!("{}", 34 + base),
+        Color::Magenta => format!("{}", 35 + base),
+        Color::Cyan => format!("{}", 36 + base),
+        Color::Gray => format!("{}", 37 + base),
+        Color::DarkGray => format!("{}", 90 + base),
+        Color::LightRed => format!("{}", 91 + base),
+        Color::LightGreen => format!("{}", 92 + base),
+        Color::LightYellow => format!("{}", 93 + base),
+        Color::LightBlue => format!("{}", 94 + base),
+        Color::LightMagenta => format!("{}", 95 + base),
+        Color::LightCyan => format!("{}", 96 + base),
+        Color::White => format!("{}", 97 + base),
+        Color::Rgb(r, g, b) => {
+            let prefix = if background { "48" } else { "38" };
+            format!("{prefix};2;{r};{g};{b}")
+        }
+        Color::Indexed(index) => {
+            let prefix = if background { "48" } else { "38" };
+            format!("{prefix};5;{index}")
+        }
+    }
 }
 
 /// Высота кадра: всё, что рисуется, по строкам.
@@ -919,7 +1099,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tasq-tui-run-{nanos}"));
         let outcome = crate::db::init(&dir, "RUN", "run").expect("init");
         let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-        run(&mut conn, None, None, true).expect("один кадр в обычный вывод без --project");
+        run(&mut conn, None, None, true, false).expect("один кадр в обычный вывод без --project");
     }
 
     /// Курсор ВИДЕН: строка под ним помечена реверсом, и помечена ровно одна.
@@ -1163,5 +1343,126 @@ mod tests {
             text.contains("первая") && text.contains("третья"),
             "названия не показаны вторыми строками:\n{text}"
         );
+    }
+
+    /// Ширина: `COLUMNS` уважается, мусор в ней читается как «не задана», и ниже минимума кадр
+    /// не верстается.
+    ///
+    /// Проверяется на функции с явными входами, а не на окружении процесса: `std::env` в тестах
+    /// общий, и подмена `COLUMNS` ломала бы соседние тесты того же бинаря.
+    #[test]
+    fn the_width_comes_from_the_environment_when_valid() {
+        assert_eq!(parse_width(Some("120")), Some(120));
+        assert_eq!(parse_width(Some(" 100 ")), Some(100));
+        assert_eq!(parse_width(Some("")), None, "пустая — это не ширина");
+        assert_eq!(parse_width(Some("широко")), None, "мусор — это не ширина");
+        assert_eq!(parse_width(Some("0")), None, "ноль колонок — не ширина");
+        assert_eq!(
+            parse_width(Some("20")),
+            None,
+            "уже минимума: панель и доска не влезают вместе"
+        );
+        assert_eq!(parse_width(None), None);
+    }
+
+    /// Цветной кадр содержит escape-последовательности, а обычный — нет, и оба несут один текст.
+    ///
+    /// Утверждение про ТЕКСТ важно: цветной кадр с другим содержимым означал бы, что гейт
+    /// (`make smoke`, CI) проверяет не тот экран, который видит человек.
+    #[test]
+    fn the_coloured_frame_carries_the_same_text_and_adds_escapes() {
+        let board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: vec![overview::BoardColumn {
+                status: "todo".to_string(),
+                count: 1,
+                rows: vec![overview::BoardRow {
+                    dot_id: "DEMO-1".to_string(),
+                    title: "задача".to_string(),
+                    priority: "high".to_string(),
+                    due_date: None,
+                    days_overdue: 3,
+                    lease_holder: Some("hermes".to_string()),
+                    progress: "0%".to_string(),
+                }],
+            }],
+            overdue: 1,
+            leased: 1,
+            open: 1,
+            done: 0,
+        };
+        let app = app::App::new(board);
+        let plain = render_once_sized(&app, 120, false);
+        let coloured = render_once_sized(&app, 120, true);
+
+        assert!(
+            !plain.contains("\x1b["),
+            "в обычном кадре появились escape-последовательности"
+        );
+        assert!(
+            coloured.contains("\x1b["),
+            "цветной кадр нарисован без цвета"
+        );
+        // Снимаем escape и сверяем текст построчно: цвет не должен менять содержимое.
+        let stripped = strip_ansi(&coloured);
+        assert_eq!(
+            stripped, plain,
+            "цветной кадр отличается текстом от обычного"
+        );
+        assert!(stripped.contains("DEMO-1"), "узла нет в кадре");
+    }
+
+    /// Каждая строка цветного кадра заканчивается сбросом: без него цвет «протекает» на всё, что
+    /// человек напечатает после кадра.
+    #[test]
+    fn every_coloured_line_resets_the_style() {
+        let board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: Vec::new(),
+            overdue: 0,
+            leased: 0,
+            open: 0,
+            done: 0,
+        };
+        let app = app::App::new(board);
+        let coloured = render_once_sized(&app, 100, true);
+        for (number, line) in coloured.lines().enumerate() {
+            if !line.contains("\x1b[") {
+                continue;
+            }
+            assert!(
+                line.ends_with("\x1b[0m"),
+                "строка {} не сбрасывает стиль: {line:?}",
+                number + 1
+            );
+        }
+    }
+
+    /// Ширина кадра уважается: узкая не паникует, широкая не добавляет пустых знаков в конце.
+    #[test]
+    fn the_frame_honours_the_requested_width() {
+        let board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: Vec::new(),
+            overdue: 0,
+            leased: 0,
+            open: 0,
+            done: 0,
+        };
+        let app = app::App::new(board);
+        for width in [MIN_ONCE_WIDTH, 80, 140, 200] {
+            let frame = render_once_sized(&app, width, false);
+            for line in frame.lines() {
+                let length = line.chars().count();
+                assert!(
+                    length <= usize::from(width),
+                    "строка шире кадра ({length} > {width}): {line:?}"
+                );
+                assert!(
+                    !line.ends_with(' '),
+                    "в строке остались хвостовые пробелы: {line:?}"
+                );
+            }
+        }
     }
 }
