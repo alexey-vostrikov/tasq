@@ -35,6 +35,10 @@ pub struct App {
     pub projects: Vec<crate::project::Summary>,
     /// Проект, который показан на доске. `None` — доска не загружена (экран только собран).
     pub project: Option<crate::project::Project>,
+    /// Боковая панель: цепочка контекста, заметки и комментарии выбранного узла.
+    pub context: Vec<String>,
+    pub notes: Vec<String>,
+    pub comments: Vec<String>,
     /// Вид узла по адресу: от него зависит, какие статусы матрица разрешает (эпик не бывает
     /// `todo`, задача не бывает `planned`). Читается вместе с доской одним запросом.
     pub kinds: HashMap<String, crate::status::Kind>,
@@ -65,6 +69,9 @@ impl App {
             session: String::new(),
             projects: Vec::new(),
             project: None,
+            context: Vec::new(),
+            notes: Vec::new(),
+            comments: Vec::new(),
             kinds: HashMap::new(),
             tokens: HashMap::new(),
         }
@@ -178,6 +185,7 @@ impl App {
         if let Some(reference) = keep {
             self.select_by_id(&reference);
         }
+        self.reload_sidebar(conn, project)?;
         Ok(())
     }
 
@@ -205,6 +213,140 @@ impl App {
         }
         self.kinds = kinds;
         Ok(())
+    }
+
+    /// Читает боковую панель для узла под курсором.
+    ///
+    /// Три запроса на кадр, а не один сводный: цепочка, заметки и комментарии живут в разных
+    /// модулях библиотеки (`overview::context`, `note::list`, `comment::list`), и собирать их
+    /// одним SQL значило бы завести в интерфейсе второе правило о том, что считается контекстом.
+    fn reload_sidebar(
+        &mut self,
+        conn: &rusqlite::Connection,
+        project: &crate::project::Project,
+    ) -> crate::Result<()> {
+        self.context.clear();
+        self.notes.clear();
+        self.comments.clear();
+        let Some(reference) = self.selected().map(|row| row.dot_id.clone()) else {
+            return Ok(());
+        };
+        // Ошибка чтения панели не должна ломать доску: панель — удобство, а доска — работа.
+        if let Ok(chain) = crate::overview::context(conn, project, &reference) {
+            for entry in chain {
+                self.context
+                    .push(format!("{} {}", entry.dot_id, entry.title));
+            }
+        }
+        if let Ok(notes) = crate::note::list(conn, project, &crate::note::Filter::default()) {
+            for note in notes.into_iter().take(5) {
+                self.notes
+                    .push(format!("{} {}", note.note_type, note.title));
+            }
+        }
+        if let Ok(comments) = crate::comment::list(conn, project, &reference, false) {
+            for comment in comments.into_iter().rev().take(5) {
+                self.comments.push(format!(
+                    "{}: {}",
+                    comment.author.as_deref().unwrap_or("-"),
+                    comment.content
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Открывает форму создания узла.
+    ///
+    /// Поля фиксированы и идут в порядке, в котором человек о них думает: название, описание,
+    /// приоритет, срок. Остальные поля `tasq add` (вес, оценка, ветка) в форме не нужны: их
+    /// ставят скриптом или один раз, а не при создании на ходу.
+    pub fn open_create(&mut self) {
+        self.state.fields = vec![
+            model::Field {
+                label: "название",
+                value: String::new(),
+            },
+            model::Field {
+                label: "описание",
+                value: String::new(),
+            },
+            model::Field {
+                label: "приоритет",
+                value: "medium".to_string(),
+            },
+            model::Field {
+                label: "срок",
+                value: String::new(),
+            },
+        ];
+        self.state.field = 0;
+        self.state.editing = None;
+        self.state.mode = Mode::Form;
+    }
+
+    /// Открывает форму правки выбранного узла: значения берутся из базы, а не из доски.
+    ///
+    /// Из базы, потому что доска показывает не всё: описания в ней нет вовсе, а приоритет и срок
+    /// есть. Форма, заполненная по доске, потеряла бы описание при сохранении.
+    pub fn open_edit(
+        &mut self,
+        conn: &rusqlite::Connection,
+        project: &crate::project::Project,
+    ) -> crate::Result<()> {
+        let Some(reference) = self.selected().map(|row| row.dot_id.clone()) else {
+            self.say("под курсором нет узла");
+            return Ok(());
+        };
+        let node = crate::node::resolve(conn, project, &reference)?;
+        self.state.fields = vec![
+            model::Field {
+                label: "название",
+                value: node.title.clone(),
+            },
+            model::Field {
+                label: "описание",
+                value: node.description.clone().unwrap_or_default(),
+            },
+            model::Field {
+                label: "приоритет",
+                value: node.priority.clone(),
+            },
+            model::Field {
+                label: "срок",
+                value: node.due_date.clone().unwrap_or_default(),
+            },
+        ];
+        self.state.field = 0;
+        self.state.editing = Some(reference);
+        self.state.mode = Mode::Form;
+        Ok(())
+    }
+
+    /// Открывает ввод заметки или комментария к выбранному узлу.
+    pub fn open_note(&mut self, kind: &str) {
+        let Some(reference) = self.selected().map(|row| row.dot_id.clone()) else {
+            self.say("под курстором нет узла");
+            return;
+        };
+        self.state.fields = vec![model::Field {
+            label: "текст",
+            value: String::new(),
+        }];
+        self.state.field = 0;
+        // Вид записи и адрес узла едут в одной строке: отдельного поля под вид не нужно, а
+        // разбирать «адрес|вид» в двух местах — лишний способ ошибиться.
+        self.state.editing = Some(format!("{kind}@{reference}"));
+        self.state.mode = Mode::Note;
+    }
+
+    /// Значение поля формы по подписи.
+    fn field(&self, label: &str) -> Option<&str> {
+        self.state
+            .fields
+            .iter()
+            .find(|field| field.label == label)
+            .map(|field| field.value.as_str())
     }
 
     /// Вид узла под курсором (по умолчанию — задача: неизвестный вид не должен запрещать выбор).
@@ -286,6 +428,174 @@ impl App {
         }
     }
 
+    /// Записывает форму: создаёт узел, правит его или добавляет заметку/комментарий.
+    ///
+    /// Валидация не своя: пустое название, приоритет вне списка и срок не датой отбивает
+    /// библиотека (`node::create`, `node::update`), и её отказ приходит с названным полем. Своя
+    /// проверка здесь означала бы второе правило о том, что такое допустимый узел.
+    fn submit(
+        &mut self,
+        conn: &mut rusqlite::Connection,
+        project: &crate::project::Project,
+    ) -> Result<&'static str, crate::error::Error> {
+        let title = self.field("название").unwrap_or_default().to_string();
+        let description = self.field("описание").unwrap_or_default().to_string();
+        let priority = self.field("приоритет").unwrap_or_default().to_string();
+        let due = self.field("срок").unwrap_or_default().to_string();
+        let text = self.field("текст").unwrap_or_default().to_string();
+
+        match self.state.mode {
+            Mode::Note => {
+                let spec = self.state.editing.clone().unwrap_or_default();
+                let (kind, reference) =
+                    spec.split_once('@')
+                        .ok_or_else(|| crate::error::Error::InvalidValue {
+                            field: "note".to_string(),
+                            value: "вид записи потерян".to_string(),
+                        })?;
+                let text = text.trim();
+                if kind == "comment" {
+                    crate::comment::add(conn, project, reference, text, "tui")?;
+                } else {
+                    crate::note::save(
+                        conn,
+                        project,
+                        crate::note::SaveNote {
+                            title: Some(text),
+                            actor: Some("tui"),
+                            node: Some(reference),
+                            ..crate::note::SaveNote::default()
+                        },
+                    )?;
+                }
+                self.state.mode = Mode::Board;
+                self.state.fields.clear();
+                self.state.editing = None;
+                return Ok(if kind == "comment" {
+                    "комментарий добавлен"
+                } else {
+                    "заметка добавлена"
+                });
+            }
+            Mode::Form => {}
+            _ => return Ok(""),
+        }
+
+        // Пустое необязательное поле — это «не задано», а не пустая строка: иначе описание,
+        // которого не было, стало бы пустым, и `description_locked` считал бы его заданным.
+        let description = Some(description.as_str()).filter(|text| !text.trim().is_empty());
+        let due = Some(due.as_str()).filter(|text| !text.trim().is_empty());
+        let priority = Some(priority.as_str()).filter(|text| !text.trim().is_empty());
+
+        match self.state.editing.clone() {
+            None => {
+                crate::node::create(
+                    conn,
+                    project,
+                    crate::node::NewNode {
+                        parent: None,
+                        title: &title,
+                        kind: None,
+                        description,
+                        priority,
+                        due_date: due,
+                        estimated_hours: None,
+                        weight: None,
+                        source_ref: None,
+                        branch: None,
+                    },
+                )?;
+                self.state.mode = Mode::Board;
+                self.state.fields.clear();
+                Ok("узел создан")
+            }
+            Some(reference) => {
+                crate::node::update(
+                    conn,
+                    project,
+                    &reference,
+                    crate::node::Patch {
+                        title: Some(&title),
+                        description,
+                        priority,
+                        due_date: due,
+                        actor: Some("tui"),
+                        ..crate::node::Patch::default()
+                    },
+                )?;
+                self.state.mode = Mode::Board;
+                self.state.fields.clear();
+                self.state.editing = None;
+                Ok("узел изменён")
+            }
+        }
+    }
+
+    /// Ищет по всей базе тем же запросом, что `tasq find` без `--project`.
+    ///
+    /// По всей базе, а не по активному проекту: экран показывает все проекты, и поиск, который
+    /// молча ограничен одним из них, — это ответ «не найдено» на существующий узел.
+    fn run_search(&mut self, conn: &rusqlite::Connection) {
+        self.state.results.clear();
+        self.state.result = 0;
+        let query = self.state.input.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        match crate::overview::search_all(conn, &query) {
+            Ok(hits) => {
+                for hit in hits {
+                    // Заметки в результатах тоже есть; перейти можно только к узлу, и это
+                    // называется в строке состояния, а не молча пропускается.
+                    if let Some(dot_id) = hit.dot_id {
+                        self.state.results.push((dot_id, hit.title));
+                    }
+                }
+                if self.state.results.is_empty() {
+                    self.say("ничего не найдено");
+                }
+            }
+            Err(err) => self.say(describe(&err)),
+        }
+    }
+
+    /// Открывает найденный узел: переключает проект, если узел в чужом, и ставит на него курсор.
+    fn open_result(&mut self, conn: &rusqlite::Connection, project: &crate::project::Project) {
+        let Some((dot_id, _)) = self.state.results.get(self.state.result).cloned() else {
+            self.say("в результатах ничего не выбрано");
+            return;
+        };
+        // Ключ проекта — часть адреса: `TASQDEV-6` означает проект TASQDEV. Искать по нему, а не
+        // по активному проекту, иначе переход в чужой проект не сработает.
+        let key = dot_id.split('-').next().unwrap_or_default().to_string();
+        match self.projects.iter().position(|summary| summary.key == key) {
+            Some(index) if index != self.state.active => {
+                if let Err(err) = self.switch_project(conn, index) {
+                    self.say(describe(&err));
+                    return;
+                }
+            }
+            Some(_) => {}
+            None => {
+                self.say(format!("проект {key} не найден в базе"));
+                return;
+            }
+        }
+        if !self.select_by_id(&dot_id) {
+            // Узел в другом проекте уже перечитан; если и теперь его нет — он вне доски
+            // (закрыт фильтром доски, например), и об этом говорим прямо.
+            self.say(format!("{dot_id} нет на доске этого проекта"));
+            return;
+        }
+        self.state.mode = Mode::Node;
+        self.state.input.clear();
+        self.state.results.clear();
+        let project = self.project.clone().unwrap_or_else(|| project.clone());
+        if let Err(err) = self.reload_sidebar(conn, &project) {
+            self.say(describe(&err));
+        }
+    }
+
     /// Показывает отказ в строке состояния.
     ///
     /// Отказ, напечатанный в stdout, сломает кадр; отказ, проглоченный молча, выглядит как
@@ -363,11 +673,53 @@ impl App {
             return match self.switch_project(&*conn, index) {
                 Ok(()) => Outcome::Redraw,
                 Err(err) => {
-                    self.say(format!("{}: {}", err.code(), err.hint()));
+                    self.say(describe(&err));
                     Outcome::Redraw
                 }
             };
         }
+        // Формы открываются до выбора строки: создание узла не требует узла под курсором.
+        match intent {
+            Intent::Create => {
+                self.open_create();
+                return Outcome::Redraw;
+            }
+            Intent::Edit => {
+                if let Err(err) = self.open_edit(&*conn, project) {
+                    self.say(describe(&err));
+                }
+                return Outcome::Redraw;
+            }
+            Intent::AddNote => {
+                self.open_note("note");
+                return Outcome::Redraw;
+            }
+            Intent::AddComment => {
+                self.open_note("comment");
+                return Outcome::Redraw;
+            }
+            Intent::SearchRun => {
+                self.run_search(&*conn);
+                return Outcome::Redraw;
+            }
+            Intent::SearchOpen => {
+                self.open_result(&*conn, project);
+                return Outcome::Redraw;
+            }
+            Intent::ResultDown => {
+                if !self.state.results.is_empty() {
+                    let last = self.state.results.len() - 1;
+                    self.state.result = (self.state.result + 1).min(last);
+                }
+                return Outcome::Redraw;
+            }
+            Intent::ResultUp => {
+                self.state.result = self.state.result.saturating_sub(1);
+                return Outcome::Redraw;
+            }
+            _ => {}
+        }
+
         let reference = match self.selected() {
             Some(row) => row.dot_id.clone(),
             None => {
@@ -411,6 +763,11 @@ impl App {
                         "статус изменён"
                     })
             }
+            Intent::SubmitForm => self.submit(conn, project),
+            Intent::SearchRun | Intent::SearchOpen | Intent::ResultDown | Intent::ResultUp => {
+                Ok("")
+            }
+            Intent::Create | Intent::Edit | Intent::AddNote | Intent::AddComment => Ok(""),
             Intent::ChangeStatus | Intent::ChooseStatus(_) | Intent::ProjectOpen => Ok(""),
             _ => Ok(""),
         };
@@ -424,7 +781,7 @@ impl App {
             Err(err) => {
                 // Подсказка идёт рядом с отказом: в терминале нет места на два экрана, а без
                 // подсказки `UNMET_PREREQUISITES` читается как «нельзя» без «что сделать».
-                self.say(format!("{}: {}", err.code(), err.hint()));
+                self.say(describe(&err));
             }
         }
         // Перечитывание обязательно: иначе строка аренды останется на экране после отпускания,
@@ -432,12 +789,22 @@ impl App {
         // возвращается на тот же УЗЕЛ, а не на те же координаты: действие могло переехать его в
         // другую колонку.
         if let Err(err) = self.refresh(conn, project) {
-            self.say(format!("{}: {}", err.code(), err.hint()));
+            self.say(describe(&err));
         } else {
             self.select_by_id(&reference);
         }
         Outcome::Redraw
     }
+}
+
+/// Отказ в одну строку: код, текст и подсказка.
+///
+/// Все три нужны и все три не влезают в одну строку по-хорошему, но порядок выбран так, чтобы
+/// обрезка справа была безопасной: код различает отказы машинно, текст называет поле, подсказка
+/// говорит, что делать. Показывать только код с подсказкой (как было) значило терять имя поля —
+/// и `INVALID_VALUE` на пустом названии читался как «что-то не так с каким-то значением».
+fn describe(err: &crate::error::Error) -> String {
+    format!("{}: {err} — {}", err.code(), err.hint())
 }
 
 /// Клавиша терминала → клавиша модели.
@@ -1244,5 +1611,226 @@ mod tests {
         app.perform(&mut conn, &project, Intent::ProjectOpen);
         assert_eq!(app.project_key(), "BBB", "проект не переключился");
         assert_eq!(app.board.project, "BBB");
+    }
+
+    /// Форма создаёт узел: значения из полей попадают в базу, пустое необязательное — не попадает.
+    #[test]
+    fn the_form_creates_a_node() {
+        let (mut conn, project) = simple("form-create");
+        let board = crate::overview::board(&conn, &project).expect("board");
+        let mut app = App::with_session(board, "sess-form");
+        app.open_create();
+        assert_eq!(app.state.mode, Mode::Form);
+        assert_eq!(app.state.fields.len(), 4, "полей в форме не четыре");
+
+        // Вводим посимвольно, как человек: значение идёт в ТЕКУЩЕЕ поле.
+        for c in "новая задача".chars() {
+            app.state.apply(model::Intent::Type(c));
+        }
+        app.state.apply(model::Intent::FieldNext); // описание
+        app.state.apply(model::Intent::FieldNext); // приоритет
+        app.state.apply(model::Intent::FieldNext); // срок: оставляем пустым
+        assert_eq!(app.state.field, 3);
+
+        let note = app.perform(&mut conn, &project, Intent::SubmitForm);
+        assert_eq!(note, Outcome::Redraw);
+        assert_eq!(app.message.as_deref(), Some("узел создан"));
+        assert_eq!(app.state.mode, Mode::Board, "форма не закрылась");
+
+        let (title, description, priority, due): (String, Option<String>, String, Option<String>) =
+            conn.query_row(
+                "SELECT title, description, priority, due_date FROM nodes WHERE title = 'новая задача'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("созданный узел");
+        assert_eq!(title, "новая задача");
+        assert_eq!(description, None, "пустое описание записано строкой");
+        assert_eq!(priority, "medium", "приоритет по умолчанию не сохранён");
+        assert_eq!(due, None, "пустой срок записан");
+    }
+
+    /// Пустое название отбивает библиотека, и это видно в строке состояния, а запись не идёт.
+    #[test]
+    fn an_empty_title_is_refused_by_the_library() {
+        let (mut conn, project) = simple("form-empty");
+        let board = crate::overview::board(&conn, &project).expect("board");
+        let mut app = App::with_session(board, "sess-form");
+        app.open_create();
+        app.perform(&mut conn, &project, Intent::SubmitForm);
+        let message = app.message.clone().unwrap_or_default();
+        assert!(
+            message.starts_with("INVALID_VALUE"),
+            "отказ не назван кодом: {message}"
+        );
+        assert!(
+            message.contains("title"),
+            "отказ не называет поле: {message}"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "пустой узел всё-таки записан");
+        assert_eq!(app.state.mode, Mode::Form, "форма закрылась на отказе");
+    }
+
+    /// Правка берёт значения из БАЗЫ: описание, которого нет на доске, не теряется.
+    #[test]
+    fn editing_fills_the_form_from_the_database() {
+        let (mut conn, project) = with_description("form-edit");
+        let board = crate::overview::board(&conn, &project).expect("board");
+        let mut app = App::with_session(board, "sess-form");
+        app.load_kinds(&conn, &project).expect("kinds");
+        app.open_edit(&conn, &project).expect("open_edit");
+        assert_eq!(
+            app.state.editing.as_deref().map(|s| s.to_string()),
+            Some("EDT-1".to_string()),
+            "форма не помнит, какой узел правит"
+        );
+        assert_eq!(
+            app.field("описание"),
+            Some("описание из базы"),
+            "описание не прочитано из базы"
+        );
+
+        // Меняем только название.
+        app.state.field = 0;
+        app.state.fields[0].value = "переименован".to_string();
+        app.perform(&mut conn, &project, Intent::SubmitForm);
+        assert_eq!(app.message.as_deref(), Some("узел изменён"));
+
+        let (title, description): (String, Option<String>) = conn
+            .query_row(
+                "SELECT title, description FROM nodes WHERE path = '1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("узел");
+        assert_eq!(title, "переименован");
+        assert_eq!(
+            description.as_deref(),
+            Some("описание из базы"),
+            "описание потеряно при правке названия"
+        );
+    }
+
+    /// Заметка и комментарий идут через библиотеку и попадают в боковую панель узла.
+    #[test]
+    fn notes_and_comments_land_on_the_node() {
+        let (mut conn, project) = simple("note");
+        let board = crate::overview::board(&conn, &project).expect("board");
+        let mut app = App::with_session(board, "sess-note");
+        app.load_kinds(&conn, &project).expect("kinds");
+
+        app.perform(&mut conn, &project, Intent::AddComment);
+        assert_eq!(app.state.mode, Mode::Note);
+        for c in "первый комментарий".chars() {
+            app.state.apply(model::Intent::Type(c));
+        }
+        app.perform(&mut conn, &project, Intent::SubmitForm);
+        assert_eq!(app.message.as_deref(), Some("комментарий добавлен"));
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM comments", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "комментарий не записан");
+
+        // Перечитали — панель показывает его.
+        app.refresh(&conn, &project).expect("refresh");
+        assert_eq!(
+            app.comments.len(),
+            1,
+            "боковая панель пуста после добавления: {:?}",
+            app.comments
+        );
+        assert!(
+            app.comments[0].contains("первый комментарий"),
+            "в панели не тот текст: {:?}",
+            app.comments
+        );
+
+        app.perform(&mut conn, &project, Intent::AddNote);
+        for c in "решение".chars() {
+            app.state.apply(model::Intent::Type(c));
+        }
+        app.perform(&mut conn, &project, Intent::SubmitForm);
+        assert_eq!(app.message.as_deref(), Some("заметка добавлена"));
+        let notes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(notes, 1, "заметка не записана");
+    }
+
+    /// Поиск находит узел ЧУЖОГО проекта и переключает на него доску.
+    ///
+    /// Это и есть причина, по которой поиск идёт по всей базе: экран показывает все проекты, и
+    /// поиск, ограниченный активным, отвечал бы «не найдено» на существующий узел.
+    #[test]
+    fn search_finds_a_node_in_another_project_and_switches() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-search-{nanos}"));
+        let outcome = crate::db::init(&dir, "SRC", "src").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let first = crate::project::first_project(&conn).expect("project");
+        create(&mut conn, &first, "узел первого проекта");
+        let second = crate::project::create(&mut conn, "OTH", Some("другой")).expect("create");
+        create(&mut conn, &second, "иголка в стоге");
+
+        let projects = crate::project::list(&conn).expect("projects");
+        let board = crate::overview::board(&conn, &first).expect("board");
+        let mut app = App::with_projects(board, "sess", projects, 0, first);
+
+        app.state.mode = Mode::Search;
+        for c in "иголка".chars() {
+            app.state.apply(model::Intent::Type(c));
+            app.perform(
+                &mut conn,
+                &app.project.clone().expect("проект"),
+                Intent::SearchRun,
+            );
+        }
+        assert_eq!(
+            app.state.results.len(),
+            1,
+            "поиск по всей базе не нашёл узел: {:?}",
+            app.state.results
+        );
+        assert_eq!(app.state.results[0].0, "OTH-1");
+
+        let project = app.project.clone().expect("проект");
+        app.perform(&mut conn, &project, Intent::SearchOpen);
+        assert_eq!(app.project_key(), "OTH", "перехода в чужой проект не было");
+        assert_eq!(
+            app.selected().map(|row| row.dot_id.clone()),
+            Some("OTH-1".to_string()),
+            "курсор не встал на найденный узел"
+        );
+        assert_eq!(app.state.mode, Mode::Node, "карточка не открылась");
+    }
+
+    fn simple(tag: &str) -> (rusqlite::Connection, crate::project::Project) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-{tag}-{nanos}"));
+        let outcome = crate::db::init(&dir, "EDT", tag).expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        create(&mut conn, &project, "исходный узел");
+        (conn, project)
+    }
+
+    fn with_description(tag: &str) -> (rusqlite::Connection, crate::project::Project) {
+        let (conn, project) = simple(tag);
+        conn.execute(
+            "UPDATE nodes SET description = 'описание из базы' WHERE path = '1'",
+            [],
+        )
+        .expect("description");
+        (conn, project)
     }
 }

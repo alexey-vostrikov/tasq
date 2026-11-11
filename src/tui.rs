@@ -33,7 +33,9 @@ use crate::overview;
 /// Фиксированная, а не по размеру терминала: у CI и у файла с картинкой размера нет, а кадр,
 /// зависящий от окна, нельзя сравнить в тесте. Сто символов — столько влезает в обычный
 /// терминал без переносов.
-pub const ONCE_WIDTH: u16 = 100;
+/// Сто сорок, а не сто: слева панель проектов (24), справа сведения об узле (32), и в сотне на
+/// таблицу остаётся 44 знака — заголовок и адрес в неё не влезают и молча обрезаются.
+pub const ONCE_WIDTH: u16 = 140;
 
 /// Как часто перерисовывать кадр без событий.
 ///
@@ -174,7 +176,7 @@ where
 /// можно взять размер, и ждать `tty` от CI нечего. Заодно это единственный способ проверить
 /// вывод кадра тестом — сравнить строки, а не перехватывать поток.
 pub fn render_once(app: &app::App) -> String {
-    let height = frame_height(&app.board);
+    let height = frame_height_for(app);
     // Буфер в памяти отказать не может: его `Error` — `Infallible`. Поэтому `render_once` не
     // возвращает `Result`: ошибка, которой нельзя случиться, в подписи была бы ложью, и
     // вызывающий писал бы `?` там, где нечего обрабатывать.
@@ -199,6 +201,20 @@ fn frame_height(board: &overview::Board) -> u16 {
     // режима и подсказка.
     let height = 4 + 2 + 1 + rows + 2;
     u16::try_from(height).unwrap_or(u16::MAX)
+}
+
+/// Высота кадра для того режима, который сейчас на экране.
+///
+/// Форма и поиск рисуются в основной области и своей высоты не требуют — им хватает места
+/// таблицы; но форма из четырёх полей в кадре на три строки обрезалась бы молча. Поэтому при
+/// открытой форме высота не меньше, чем нужно ей.
+fn frame_height_for(app: &app::App) -> u16 {
+    let base = frame_height(&app.board);
+    let needed = match app.state.mode {
+        model::Mode::Form | model::Mode::Note => 4 + app.state.fields.len() as u16 + 6,
+        _ => base,
+    };
+    base.max(needed)
 }
 
 /// Буфер кадра → текст: по строке на ряд, хвостовые пробелы срезаны.
@@ -231,10 +247,27 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
     ])
     .areas(frame.area());
 
-    let [panel, main] =
-        Layout::horizontal([Constraint::Length(PANEL_WIDTH), Constraint::Min(20)]).areas(body);
+    // Панель проектов слева, доска в центре, сведения об узле справа. Боковая панель
+    // показывается только у списка: в канбане колонкам нужна вся ширина, иначе они становятся
+    // в четыре знака.
+    let sidebar = app.state.view == model::View::List && body.width > PANEL_WIDTH + 60;
+    let [panel, main, side] = if sidebar {
+        Layout::horizontal([
+            Constraint::Length(PANEL_WIDTH),
+            Constraint::Min(20),
+            Constraint::Length(SIDEBAR_WIDTH),
+        ])
+        .areas(body)
+    } else {
+        let [panel, main] =
+            Layout::horizontal([Constraint::Length(PANEL_WIDTH), Constraint::Min(20)]).areas(body);
+        [panel, main, ratatui::layout::Rect::default()]
+    };
 
     draw_panel(frame, app, panel);
+    if sidebar {
+        draw_sidebar(frame, app, side);
+    }
 
     // Шапка: переключатель проекта (тот самый «дропдаун») и счётчики. Один и тот же вид у списка
     // и у канбана: переключение вида не должно менять место, где проект выбирается.
@@ -264,9 +297,16 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
         header,
     );
 
-    match app.state.view {
-        model::View::List => draw_list(frame, app, content),
-        model::View::Kanban => draw_kanban(frame, app, content),
+    // Форма, поиск и карточка занимают основную область: это временные режимы, и человек
+    // смотрит в них, а не в доску. Доска остаётся под ними — Esc возвращает её же.
+    match app.state.mode {
+        model::Mode::Form | model::Mode::Note => draw_form(frame, app, content),
+        model::Mode::Search => draw_search(frame, app, content),
+        model::Mode::Node => draw_card(frame, app, content),
+        _ => match app.state.view {
+            model::View::List => draw_list(frame, app, content),
+            model::View::Kanban => draw_kanban(frame, app, content),
+        },
     }
 
     frame.render_widget(Paragraph::new(Line::from(mode_text(app))), mode_line);
@@ -295,6 +335,130 @@ fn mode_text(app: &app::App) -> String {
             None => String::new(),
         },
     }
+}
+
+/// Ширина боковой панели: цепочка контекста, заметки и комментарии.
+pub const SIDEBAR_WIDTH: u16 = 32;
+
+/// Боковая панель с тем, что относится к выбранному узлу.
+///
+/// Три раздела, а не один список: это разные вопросы («где я в дереве», «что решено», «что
+/// сказали»), и смешивать их значило бы заставить человека разбирать строки по виду.
+fn draw_sidebar(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from("контекст").style(Style::default().add_modifier(Modifier::BOLD)));
+    for entry in &app.context {
+        lines.push(Line::from(format!("  {entry}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("заметки").style(Style::default().add_modifier(Modifier::BOLD)));
+    for note in &app.notes {
+        lines.push(Line::from(format!("  {note}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("комментарии").style(Style::default().add_modifier(Modifier::BOLD)));
+    for comment in &app.comments {
+        lines.push(Line::from(format!("  {comment}")));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title(" узел ")),
+        area,
+    );
+}
+
+/// Форма узла: поля по одному, текущее помечено.
+///
+/// Показываются ВСЕ поля сразу, а не одно: человек должен видеть, что он уже ввёл, иначе
+/// исправление опечатки в третьем поле требует помнить первые два.
+fn draw_form(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let title = if app.state.editing.is_some() {
+        " правка узла "
+    } else {
+        " новый узел "
+    };
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (index, field) in app.state.fields.iter().enumerate() {
+        let marker = if index == app.state.field { ">" } else { " " };
+        let mut line = Line::from(format!("{marker} {:<11} {}", field.label, field.value));
+        if index == app.state.field {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        lines.push(line);
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Tab — следующее поле, Enter — записать, Esc — отменить",
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+/// Поиск: строка запроса и результаты.
+fn draw_search(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let [query, results] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(format!("/{}", app.state.input)))
+            .block(Block::default().borders(Borders::ALL).title(" поиск ")),
+        query,
+    );
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (index, (dot_id, title)) in app.state.results.iter().enumerate() {
+        let mut line = Line::from(format!("{:<14} {title}", dot_id));
+        if index == app.state.result {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("  введите запрос"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" результат (Enter — открыть, Esc — назад) "),
+        ),
+        results,
+    );
+}
+
+/// Карточка узла: заголовок, поля и подсказка.
+fn draw_card(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let Some(row) = app.selected() else {
+        frame.render_widget(
+            Paragraph::new("узел не выбран")
+                .block(Block::default().borders(Borders::ALL).title(" карточка ")),
+            area,
+        );
+        return;
+    };
+    let lines = vec![
+        Line::from(row.dot_id.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(row.title.clone()),
+        Line::from(""),
+        Line::from(format!(
+            "статус {}   приоритет {}   прогресс {}",
+            app.selected_status().unwrap_or("-"),
+            row.priority,
+            row.progress
+        )),
+        Line::from(format!(
+            "срок {}   держатель {}",
+            row.due_date.as_deref().unwrap_or("-"),
+            row.lease_holder.as_deref().unwrap_or("-")
+        )),
+        Line::from(""),
+        Line::from("m — комментарий, n — заметка, e — правка, Esc — назад"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" карточка ")),
+        area,
+    );
 }
 
 /// Панель проектов: ключ, счётчик узлов, пометка активного и курсора панели.

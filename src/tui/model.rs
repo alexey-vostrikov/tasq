@@ -57,6 +57,8 @@ pub enum Mode {
     Outcome,
     /// Выбор нового статуса из того, что разрешает матрица.
     Status,
+    /// Ввод заметки или комментария к узлу.
+    Note,
     /// Подтверждение опасного действия.
     Confirm,
     /// Форма узла: создание или правка.
@@ -75,6 +77,7 @@ impl Mode {
             Mode::Node => "узел",
             Mode::Outcome => "исход работы",
             Mode::Status => "новый статус",
+            Mode::Note => "текст к узлу",
             Mode::Confirm => "подтверждение",
             Mode::Form => "форма",
             Mode::Search => "поиск",
@@ -143,6 +146,15 @@ pub enum Intent {
     ProjectDown,
     /// Переключиться на выбранный проект.
     ProjectOpen,
+    /// Запустить поиск по введённому запросу.
+    SearchRun,
+    /// Открыть найденный узел.
+    SearchOpen,
+    /// Записать форму (создать или изменить узел).
+    SubmitForm,
+    /// Результат поиска выше/ниже.
+    ResultDown,
+    ResultUp,
     /// Выбран статус под номером: буква — это позиция в списке допустимых.
     ChooseStatus(char),
     /// Подтверждённый переход в выбранный статус.
@@ -161,13 +173,35 @@ pub fn intent(mode: Mode, key: Key) -> Option<Intent> {
     // В форме и поиске печатный символ — это ВВОД, поэтому общая таблица к ним не применяется:
     // `q` в поле названия — буква, а не выход.
     match mode {
-        Mode::Form | Mode::Search => {
+        Mode::Note => {
+            return match key {
+                K::Char(c) => Some(I::Type(c)),
+                K::Backspace => Some(I::Erase),
+                K::Enter => Some(I::SubmitForm),
+                K::Esc => Some(I::Cancel),
+                _ => None,
+            };
+        }
+        Mode::Form => {
             return match key {
                 K::Char(c) => Some(I::Type(c)),
                 K::Backspace => Some(I::Erase),
                 K::Tab | K::Down => Some(I::FieldNext),
                 K::BackTab | K::Up => Some(I::FieldPrev),
-                K::Enter => Some(I::Confirm),
+                K::Enter => Some(I::SubmitForm),
+                K::Esc => Some(I::Cancel),
+                _ => None,
+            };
+        }
+        Mode::Search => {
+            // В поиске стрелки листают РЕЗУЛЬТАТЫ, а не поля: поле здесь одно, и движение по нему
+            // ничего не значит. Ввод идёт в строку запроса.
+            return match key {
+                K::Char(c) => Some(I::Type(c)),
+                K::Backspace => Some(I::Erase),
+                K::Down => Some(I::ResultDown),
+                K::Up => Some(I::ResultUp),
+                K::Enter => Some(I::SearchOpen),
                 K::Esc => Some(I::Cancel),
                 _ => None,
             };
@@ -297,6 +331,36 @@ pub struct State {
     pub projects: usize,
     /// Номер проекта, который показан на доске.
     pub active: usize,
+    /// Поля формы: подпись и значение. Заполняется вызывающим перед открытием формы.
+    pub fields: Vec<Field>,
+    /// Номер поля, в которое идёт ввод.
+    pub field: usize,
+    /// Что делаем формой: создать узел (`None`) или править этот узел (`Some(адрес)`).
+    pub editing: Option<String>,
+    /// Найденные узлы: адрес и название — то, что видно в списке результатов.
+    pub results: Vec<(String, String)>,
+    /// Номер выбранного результата поиска.
+    pub result: usize,
+}
+
+/// Поле формы: подпись для экрана и значение.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Field {
+    pub label: &'static str,
+    pub value: String,
+}
+
+impl State {
+    /// Поле, в которое идёт ввод: у формы — текущее, у поиска — строка запроса.
+    fn editing_field(&mut self) -> Option<&mut String> {
+        if matches!(self.mode, Mode::Form | Mode::Note) {
+            self.fields
+                .get_mut(self.field)
+                .map(|field| &mut field.value)
+        } else {
+            Some(&mut self.input)
+        }
+    }
 }
 
 impl State {
@@ -378,14 +442,47 @@ impl State {
                 O::Redraw
             }
             I::Type(c) => {
-                self.input.push(c);
+                if let Some(text) = self.editing_field() {
+                    text.push(c);
+                }
+                // В поиске ввод меняет запрос, а значит и результаты: об этом сообщается
+                // вызывающему, иначе список остался бы от предыдущей буквы.
+                if self.mode == Mode::Search {
+                    return O::Act(I::SearchRun);
+                }
                 O::Redraw
             }
             I::Erase => {
-                self.input.pop();
+                if let Some(text) = self.editing_field() {
+                    text.pop();
+                }
+                if self.mode == Mode::Search {
+                    return O::Act(I::SearchRun);
+                }
                 O::Redraw
             }
-            I::FieldNext | I::FieldPrev => O::Act(intent),
+            I::FieldNext => {
+                if self.mode == Mode::Form {
+                    // По кругу: из последнего поля Tab ведёт в первое, и выйти из формы можно
+                    // только Esc или записью — «Tab в никуда» читается как зависание.
+                    let count = self.fields.len();
+                    if count > 0 {
+                        self.field = (self.field + 1) % count;
+                        return O::Redraw;
+                    }
+                }
+                O::Act(I::FieldNext)
+            }
+            I::FieldPrev => {
+                if self.mode == Mode::Form {
+                    let count = self.fields.len();
+                    if count > 0 {
+                        self.field = (self.field + count - 1) % count;
+                        return O::Redraw;
+                    }
+                }
+                O::Act(I::FieldPrev)
+            }
             I::Quit => {
                 // Незаписанный ввод терять молча нельзя: `q` в форме — это вопрос, а не выход.
                 if !self.input.is_empty() {
@@ -434,10 +531,16 @@ impl State {
                 O::Ask(I::ApplyStatus)
             }
             I::Cancel => {
-                // Отмена в выборе (исхода или статуса) возвращает на доску: иначе экран остаётся
-                // в режиме, из которого нет выхода, кроме выбора.
-                if matches!(self.mode, Mode::Outcome | Mode::Status) {
+                // Отмена в выборе (исхода, статуса, формы) возвращает на доску: иначе экран
+                // остаётся в режиме, из которого нет выхода, кроме выбора.
+                if matches!(
+                    self.mode,
+                    Mode::Outcome | Mode::Status | Mode::Form | Mode::Note
+                ) {
                     self.mode = Mode::Board;
+                    self.fields.clear();
+                    self.field = 0;
+                    self.editing = None;
                     O::Redraw
                 } else {
                     O::Ignored
@@ -467,6 +570,9 @@ impl State {
             I::ProjectOpen => {
                 self.focus = Focus::Board;
                 O::Act(I::ProjectOpen)
+            }
+            I::SearchRun | I::SearchOpen | I::SubmitForm | I::ResultDown | I::ResultUp => {
+                O::Act(intent)
             }
             I::Confirm | I::ApplyStatus => O::Ignored,
             I::Claim | I::Create | I::Edit | I::AddNote | I::AddComment => O::Act(intent),
@@ -578,10 +684,25 @@ mod tests {
             assert_eq!(intent(mode, K::Char('c')), Some(I::Type('c')), "{mode:?}");
             assert_eq!(intent(mode, K::Char('?')), Some(I::Type('?')), "{mode:?}");
             assert_eq!(intent(mode, K::Backspace), Some(I::Erase), "{mode:?}");
-            assert_eq!(intent(mode, K::Enter), Some(I::Confirm), "{mode:?}");
+            // Enter в форме записывает, в поиске — открывает выбранный результат: одно и то же
+            // нажатие в двух режимах значит разное, и это правило живёт в таблице, а не в коде.
+            let expected = if mode == Mode::Search {
+                I::SearchOpen
+            } else {
+                I::SubmitForm
+            };
+            assert_eq!(intent(mode, K::Enter), Some(expected), "{mode:?}");
             assert_eq!(intent(mode, K::Esc), Some(I::Cancel), "{mode:?}");
-            assert_eq!(intent(mode, K::Tab), Some(I::FieldNext), "{mode:?}");
-            assert_eq!(intent(mode, K::BackTab), Some(I::FieldPrev), "{mode:?}");
+            // Tab между полями есть только в форме: в поиске поле одно, и движение по нему
+            // ничего не значит — там стрелки листают РЕЗУЛЬТАТЫ.
+            if mode == Mode::Form {
+                assert_eq!(intent(mode, K::Tab), Some(I::FieldNext), "{mode:?}");
+                assert_eq!(intent(mode, K::BackTab), Some(I::FieldPrev), "{mode:?}");
+            } else {
+                assert_eq!(intent(mode, K::Tab), None, "{mode:?}");
+                assert_eq!(intent(mode, K::Down), Some(I::ResultDown), "{mode:?}");
+                assert_eq!(intent(mode, K::Up), Some(I::ResultUp), "{mode:?}");
+            }
         }
     }
 
@@ -793,14 +914,16 @@ mod tests {
     fn typing_and_erasing_shape_the_input() {
         let mut state = State::new(vec![1]);
         state.mode = Mode::Search;
+        // В поиске ввод ЗАПУСКАЕТ поиск: без этого список результатов остался бы от предыдущей
+        // буквы, и «н» показывал бы ответ на «на».
         for c in "abc".chars() {
-            assert_eq!(state.apply(I::Type(c)), Outcome::Redraw);
+            assert_eq!(state.apply(I::Type(c)), Outcome::Act(I::SearchRun));
         }
         assert_eq!(state.input, "abc");
-        assert_eq!(state.apply(I::Erase), Outcome::Redraw);
+        assert_eq!(state.apply(I::Erase), Outcome::Act(I::SearchRun));
         assert_eq!(state.input, "ab");
         state.input.clear();
-        assert_eq!(state.apply(I::Erase), Outcome::Redraw);
+        assert_eq!(state.apply(I::Erase), Outcome::Act(I::SearchRun));
         assert_eq!(
             state.input, "",
             "стирание на пустом вводе ничего не добавило"
