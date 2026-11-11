@@ -116,7 +116,12 @@ smoke: build
 	  $(TARGET_DIR)/release/tasq init --key TASQ --name smoke; \
 	  $(TARGET_DIR)/release/tasq doctor --check; \
 	  $(TARGET_DIR)/release/tasq doctor --json > doctor.json; \
-	  cat doctor.json; grep -q "\"ok\": true" doctor.json'
+	  cat doctor.json; grep -q "\"ok\": true" doctor.json; \
+	  $(TARGET_DIR)/release/tasq --project TASQ add "узел для кадра" >/dev/null; \
+	  frame=$$($(TARGET_DIR)/release/tasq --project TASQ tui --once); \
+	  printf "%s\n" "$$frame" | grep -q "TASQ-1"; \
+	  printf "%s\n" "$$frame" | grep -q "доска"; \
+	  echo "tui --once: кадр нарисован, узел на месте"'
 
 # Гейт бюджета схем MCP: тот же порог, что в CI.
 tokens: build

@@ -70,6 +70,21 @@ jobs:
           "$bin" doctor --json > doctor.json
           grep -q '"ok": true' doctor.json
 
+      - name: TUI frame without a terminal
+        # `--once` рисует один кадр в буфер памяти и печатает его: единственный способ проверить
+        # TUI там, где нет tty. Пустой или упавший кадр обязан быть слышен здесь, а не у человека.
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$GITHUB_WORKSPACE/target/release/tasq"
+          work="$(mktemp -d)"
+          cd "$work"
+          "$bin" init --key TUI --name "tui smoke" > /dev/null
+          "$bin" --project TUI add "узел для кадра" > /dev/null
+          frame="$("$bin" --project TUI tui --once)"
+          printf '%s\n' "$frame" | grep -q 'TUI-1' || { printf '%s\n' "$frame" >&2; echo "TUI_FRAME_MISSING_NODE: узел не попал в кадр" >&2; exit 1; }
+          printf '%s\n' "$frame" | grep -q 'доска' || { printf '%s\n' "$frame" >&2; echo "TUI_FRAME_MISSING_TABLE: таблица не нарисована" >&2; exit 1; }
+
       - name: glibc floor of the artifact
         # Вторая половина — негативный контроль: предел 2.9 ниже реального порога по значению,
         # но выше при строковом сравнении, поэтому обязан быть отвергнут. Гейт, сравнивающий

@@ -22,33 +22,91 @@ use crate::error::Result;
 use crate::overview;
 use crate::project::Project;
 
+/// Ширина кадра в режиме `--once`.
+///
+/// Фиксированная, а не по размеру терминала: у CI и у файла с картинкой размера нет, а кадр,
+/// зависящий от окна, нельзя сравнить в тесте. Сто символов — столько влезает в обычный
+/// терминал без переносов.
+pub const ONCE_WIDTH: u16 = 100;
+
 /// Рисует доску и возвращает управление.
 ///
 /// `once` — один кадр в обычный вывод и выход: так TUI проверяется в CI, где нет терминала,
-/// и так же снимается скриншот для документации. Без `once` экран занимает терминал целиком
-/// и ждёт клавишу `q`; полноценный цикл появится на шаге 6.5.
+/// и так же снимается картинка для документации. Без `once` экран занимает терминал целиком;
+/// цикл событий появится на шаге 6.5, сейчас рисуется один кадр и в этом режиме.
 pub fn run(conn: &Connection, project: &Project, once: bool) -> Result<()> {
     let board = overview::board(conn, project)?;
-    let mut out = std::io::stdout();
 
     if once {
-        // Без альтернативного экрана и без raw mode: вывод остаётся текстом, который можно
-        // перенаправить в файл и сравнить в тесте.
-        let backend = CrosstermBackend::new(&mut out);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| draw(frame, &board))?;
-    } else {
-        // `Error::Io` принимает `std::io::Error` через `#[from]`, поэтому `?` работает и на
-        // ошибках ratatui: они того же типа.
-        terminal::enable_raw_mode()?;
-        let mut backend_out = std::io::stdout();
-        execute!(backend_out, terminal::EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(backend_out);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.draw(|frame| draw(frame, &board))?;
-        terminal::disable_raw_mode()?;
+        print!("{}", render_once(&board));
+        return Ok(());
     }
+
+    // `Error::Io` принимает `std::io::Error` через `#[from]`, поэтому `?` работает и на
+    // ошибках ratatui: они того же типа.
+    terminal::enable_raw_mode()?;
+    let outcome = draw_on_terminal(std::io::stdout(), &board);
+    // raw mode снимается ДО возврата ошибки: иначе упавшая отрисовка оставит терминал в
+    // состоянии, где Enter не отправляет строку, и человеку придётся спасать сессию `reset`.
+    terminal::disable_raw_mode()?;
+    outcome
+}
+
+/// Рисует кадр на настоящем терминале (альтернативный экран).
+fn draw_on_terminal<W>(mut out: W, board: &overview::Board) -> Result<()>
+where
+    W: std::io::Write,
+{
+    execute!(out, terminal::EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(out);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| draw(frame, board))?;
     Ok(())
+}
+
+/// Кадр в виде текста, без терминала.
+///
+/// Рисуется в буфер памяти (`TestBackend`), а не в stdout: у `--once` нет терминала, из которого
+/// можно взять размер, и ждать `tty` от CI нечего. Заодно это единственный способ проверить
+/// вывод кадра тестом — сравнить строки, а не перехватывать поток.
+pub fn render_once(board: &overview::Board) -> String {
+    let height = frame_height(board);
+    // Буфер в памяти отказать не может: его `Error` — `Infallible`. Поэтому `render_once` не
+    // возвращает `Result`: ошибка, которой нельзя случиться, в подписи была бы ложью, и
+    // вызывающий писал бы `?` там, где нечего обрабатывать.
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(ONCE_WIDTH, height))
+        .expect("рисование в буфер памяти не может отказать");
+    terminal
+        .draw(|frame| draw(frame, board))
+        .expect("рисование в буфер памяти не может отказать");
+    let buffer = terminal.backend().buffer().clone();
+    buffer_lines(&buffer, ONCE_WIDTH)
+}
+
+/// Высота кадра: шапка со счётчиками (3 строки) плюс таблица с рамкой и строкой заголовка.
+fn frame_height(board: &overview::Board) -> u16 {
+    let rows: usize = board.columns.iter().map(|column| column.rows.len()).sum();
+    // 3 — блок счётчиков, 2 — рамка таблицы, 1 — её заголовок.
+    let height = 3 + 2 + 1 + rows;
+    u16::try_from(height).unwrap_or(u16::MAX)
+}
+
+/// Буфер кадра → текст: по строке на ряд, хвостовые пробелы срезаны.
+///
+/// Срезать обязательно: рамка рисуется на всю ширину, и без этого каждая строка несёт десятки
+/// пробелов, которые ломают сравнение в тесте и `git diff` картинки в документации.
+fn buffer_lines(buffer: &ratatui::buffer::Buffer, width: u16) -> String {
+    let area = buffer.area();
+    let mut text = String::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text
 }
 
 /// Кадр: строка состояния и таблица открытых узлов по статусам.
@@ -170,5 +228,90 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &board))
             .expect("кадр 1x1 должен рисоваться, а не падать на усечении");
+    }
+
+    /// Кадр из настоящей базы: чтение → доска → текст. Проверяется сквозной путь, а не
+    /// собранная руками структура, — иначе тест не поймал бы расхождение между `overview::board`
+    /// и тем, что экран показывает.
+    #[test]
+    fn the_once_frame_comes_from_the_database() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-tui-{nanos}"));
+        let outcome = crate::db::init(&dir, "SMOKE", "smoke").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        crate::node::create(
+            &mut conn,
+            &project,
+            crate::node::NewNode {
+                parent: None,
+                title: "виден на доске",
+                kind: None,
+                description: None,
+                priority: Some("high"),
+                due_date: None,
+                estimated_hours: None,
+                weight: None,
+                source_ref: None,
+                branch: None,
+            },
+        )
+        .expect("node");
+
+        let board = overview::board(&conn, &project).expect("board");
+        let frame = render_once(&board);
+
+        assert!(
+            frame.contains("SMOKE"),
+            "ключ проекта не попал в кадр:\n{frame}"
+        );
+        assert!(frame.contains("SMOKE-1"), "узел не попал в кадр:\n{frame}");
+        assert!(
+            frame.contains("виден на доске"),
+            "название не попало в кадр:\n{frame}"
+        );
+        assert!(
+            !frame.lines().any(|line| line.ends_with(' ')),
+            "в кадре остались хвостовые пробелы — сравнение и diff будут шуметь"
+        );
+    }
+
+    /// Высота кадра вмещает все строки доски: ряд, не влезший в буфер, — это молча потерянный
+    /// узел, а не «слишком длинный экран».
+    #[test]
+    fn the_frame_height_fits_every_row() {
+        let mut board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: Vec::new(),
+            overdue: 0,
+            leased: 0,
+            open: 0,
+            done: 0,
+        };
+        board.columns.push(overview::BoardColumn {
+            status: "todo".to_string(),
+            count: 5,
+            rows: (1..=5)
+                .map(|n| overview::BoardRow {
+                    dot_id: format!("DEMO-{n}"),
+                    title: format!("задача {n}"),
+                    priority: "medium".to_string(),
+                    due_date: None,
+                    days_overdue: 0,
+                    lease_holder: None,
+                    progress: "0%".to_string(),
+                })
+                .collect(),
+        });
+        let frame = render_once(&board);
+        for n in 1..=5 {
+            assert!(
+                frame.contains(&format!("DEMO-{n}")),
+                "строка DEMO-{n} не влезла в кадр:\n{frame}"
+            );
+        }
     }
 }
