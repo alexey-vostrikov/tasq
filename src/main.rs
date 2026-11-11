@@ -2406,8 +2406,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Tui { once } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
-            tui::run(&conn, &project, *once)?;
+            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            tui::run(&mut conn, &project, *once)?;
             Ok(ExitCode::SUCCESS)
         }
 

@@ -23,6 +23,8 @@ pub enum Mode {
     Board,
     /// Карточка узла.
     Node,
+    /// Выбор исхода работы: завершена, снята, провалена.
+    Outcome,
     /// Подтверждение опасного действия.
     Confirm,
     /// Форма узла: создание или правка.
@@ -39,6 +41,7 @@ impl Mode {
         match self {
             Mode::Board => "доска",
             Mode::Node => "узел",
+            Mode::Outcome => "исход работы",
             Mode::Confirm => "подтверждение",
             Mode::Form => "форма",
             Mode::Search => "поиск",
@@ -91,6 +94,12 @@ pub enum Intent {
     Cancel,
     Type(char),
     Erase,
+    /// Работа завершена: узел закрывается как сделанный.
+    CompleteWork,
+    /// Работа снята без результата: узел возвращается в `todo`.
+    ReleaseWork,
+    /// Работа провалена: узел возвращается в `todo`, причина в чекпойнте.
+    FailWork,
 }
 
 /// Намерение по режиму и клавише; `None` — клавиша здесь ничего не значит.
@@ -112,6 +121,17 @@ pub fn intent(mode: Mode, key: Key) -> Option<Intent> {
                 K::Tab | K::Down => Some(I::FieldNext),
                 K::BackTab | K::Up => Some(I::FieldPrev),
                 K::Enter => Some(I::Confirm),
+                K::Esc => Some(I::Cancel),
+                _ => None,
+            };
+        }
+        Mode::Outcome => {
+            // Три исхода — три клавиши, и ни одна не совпадает с теми, что двигают курсор:
+            // случайное нажатие в этом режиме не должно закрывать узел.
+            return match key {
+                K::Char('d') | K::Char('D') => Some(I::CompleteWork),
+                K::Char('x') | K::Char('X') => Some(I::ReleaseWork),
+                K::Char('f') | K::Char('F') => Some(I::FailWork),
                 K::Esc => Some(I::Cancel),
                 _ => None,
             };
@@ -288,14 +308,37 @@ impl State {
                     O::Quit
                 }
             }
-            I::Release | I::ChangeStatus => {
-                // Оба меняют то, что человек видит на доске, и оба обратимы не всегда: спрашиваем.
+            I::Release => {
+                // Отпускание аренды — не одно действие, а три разных, и разница между ними в
+                // СТАТУСЕ узла: завершённая работа закрывает его, снятая и проваленная
+                // возвращают в `todo`. Поэтому сперва выбор исхода, потом подтверждение: одно
+                // нажатие не должно решать за человека, закрыта задача или нет.
+                self.mode = Mode::Outcome;
+                O::Redraw
+            }
+            I::CompleteWork | I::ReleaseWork | I::FailWork => {
+                self.back_to = Some(Mode::Board);
+                self.pending = Some(intent);
+                self.mode = Mode::Confirm;
+                O::Ask(intent)
+            }
+            I::ChangeStatus => {
                 self.back_to = Some(self.mode);
                 self.pending = Some(intent);
                 self.mode = Mode::Confirm;
                 O::Ask(intent)
             }
-            I::Confirm | I::Cancel => O::Ignored,
+            I::Cancel => {
+                // Отмена в выборе исхода возвращает на доску: иначе экран остаётся в режиме,
+                // из которого нет выхода, кроме выбора.
+                if self.mode == Mode::Outcome {
+                    self.mode = Mode::Board;
+                    O::Redraw
+                } else {
+                    O::Ignored
+                }
+            }
+            I::Confirm => O::Ignored,
             I::Claim | I::Create | I::Edit | I::AddNote | I::AddComment => O::Act(intent),
         }
     }
@@ -501,24 +544,21 @@ mod tests {
     /// Опасные действия спрашивают подтверждение, безопасные — нет.
     #[test]
     fn risky_actions_ask_and_safe_ones_do_not() {
-        for (intent, name) in [
-            (I::Release, "отпустить аренду"),
-            (I::ChangeStatus, "сменить статус"),
-        ] {
-            let mut state = State::new(vec![1]);
-            assert_eq!(state.apply(intent), Outcome::Ask(intent), "{name}");
-            assert_eq!(
-                state.pending,
-                Some(intent),
-                "{name}: не записано, что подтверждают"
-            );
-            assert_eq!(state.mode, Mode::Confirm);
-            assert_eq!(
-                state.apply(I::Confirm),
-                Outcome::Act(intent),
-                "{name}: не подтвердилось"
-            );
-        }
+        // Смена статуса спрашивает сразу; отпускание сперва спросит ИСХОД, а подтверждение —
+        // после него (см. `releasing_asks_for_the_outcome_first`).
+        let mut state = State::new(vec![1]);
+        assert_eq!(state.apply(I::ChangeStatus), Outcome::Ask(I::ChangeStatus));
+        assert_eq!(
+            state.pending,
+            Some(I::ChangeStatus),
+            "не записано, что подтверждают"
+        );
+        assert_eq!(state.mode, Mode::Confirm);
+        assert_eq!(
+            state.apply(I::Confirm),
+            Outcome::Act(I::ChangeStatus),
+            "не подтвердилось"
+        );
         for intent in [I::Claim, I::Create, I::Edit, I::AddNote, I::AddComment] {
             let mut state = State::new(vec![1]);
             assert_eq!(
@@ -584,5 +624,63 @@ mod tests {
         assert_eq!(state.mode, Mode::Node);
         assert_eq!(state.apply(I::Back), Outcome::Redraw);
         assert_eq!(state.mode, Mode::Board);
+    }
+
+    /// Отпускание аренды спрашивает ИСХОД, и только потом подтверждение: разница между исходами
+    /// в статусе узла, и одно нажатие не должно решать за человека, закрыта задача или нет.
+    #[test]
+    fn releasing_asks_for_the_outcome_first() {
+        let mut state = State::new(vec![1]);
+        assert_eq!(state.apply(I::Release), Outcome::Redraw);
+        assert_eq!(state.mode, Mode::Outcome, "не открылся выбор исхода");
+        assert_eq!(
+            state.pending, None,
+            "вопрос о исхоте поставлен раньше времени"
+        );
+
+        for (key, work) in [
+            (K::Char('d'), I::CompleteWork),
+            (K::Char('x'), I::ReleaseWork),
+            (K::Char('f'), I::FailWork),
+        ] {
+            let mut state = State::new(vec![1]);
+            state.apply(I::Release);
+            assert_eq!(intent(Mode::Outcome, key), Some(work), "{key:?}");
+            assert_eq!(state.apply(work), Outcome::Ask(work), "{work:?}");
+            assert_eq!(state.pending, Some(work));
+            assert_eq!(state.mode, Mode::Confirm);
+            assert_eq!(
+                state.apply(I::Confirm),
+                Outcome::Act(work),
+                "{work:?}: подтверждение не сработало"
+            );
+        }
+    }
+
+    /// В выборе исхода нажатие мимо не закрывает узел: только три названные клавиши.
+    #[test]
+    fn only_the_three_outcome_keys_do_anything() {
+        for key in [K::Char('j'), K::Char('q'), K::Char('r'), K::Tab, K::Enter] {
+            assert_eq!(
+                intent(Mode::Outcome, key),
+                None,
+                "{key:?} принята как исход"
+            );
+        }
+        assert_eq!(
+            intent(Mode::Outcome, K::Esc),
+            Some(I::Cancel),
+            "выйти из выбора исхода нечем"
+        );
+    }
+
+    /// Отмена в выборе исхода возвращает на доску, а не оставляет экран без выхода.
+    #[test]
+    fn cancelling_the_outcome_returns_to_the_board() {
+        let mut state = State::new(vec![1]);
+        state.apply(I::Release);
+        assert_eq!(state.apply(I::Cancel), Outcome::Redraw);
+        assert_eq!(state.mode, Mode::Board);
+        assert_eq!(state.pending, None);
     }
 }

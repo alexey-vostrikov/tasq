@@ -7,6 +7,7 @@
 //! Источник данных — `overview::board`, то же, что у `tasq board`: экран не имеет права
 //! считать статусы, аренды и просрочку по-своему, иначе доска и TUI разойдутся в числах.
 
+pub mod actions;
 pub mod app;
 pub mod model;
 
@@ -44,7 +45,10 @@ const TICK: Duration = Duration::from_millis(250);
 /// `once` — один кадр в обычный вывод и выход: так TUI проверяется в CI, где нет терминала,
 /// и так же снимается картинка для документации. Без `once` экран занимает терминал целиком и
 /// живёт в цикле до `q`.
-pub fn run(conn: &Connection, project: &Project, once: bool) -> Result<()> {
+/// Соединение берётся изменяемым: экран не только читает, но и пишет (аренда, статус, заметка),
+/// и второе соединение «на запись» рядом с читающим — это два разных представления об одной базе
+/// и лишний способ разойтись с ней. Запись идёт той же транзакцией, что у CLI.
+pub fn run(conn: &mut Connection, project: &Project, once: bool) -> Result<()> {
     let board = overview::board(conn, project)?;
 
     if once {
@@ -68,7 +72,12 @@ pub fn run(conn: &Connection, project: &Project, once: bool) -> Result<()> {
 }
 
 /// Цикл: кадр → событие → решение. Тело решения в `App::step`, здесь только ввод-вывод.
-fn event_loop<W>(mut out: W, conn: &Connection, project: &Project, app: &mut app::App) -> Result<()>
+fn event_loop<W>(
+    mut out: W,
+    conn: &mut Connection,
+    project: &Project,
+    app: &mut app::App,
+) -> Result<()>
 where
     W: std::io::Write,
 {
@@ -86,7 +95,7 @@ where
                 // перерисовываем тот же снимок. Ошибка чтения не выходит из цикла — она
                 // показывается в строке состояния: база, запертая другим процессом, не повод
                 // терять экран.
-                if let Err(err) = app.refresh(conn, project) {
+                if let Err(err) = app.refresh(&*conn, project) {
                     app.say(err.to_string());
                 }
                 continue;
@@ -94,12 +103,17 @@ where
             let event = event::read()?;
             match app.step(event) {
                 model::Outcome::Quit => break,
-                model::Outcome::Redraw => {
-                    if let Err(err) = app.refresh(conn, project) {
+                // `Act` — просьба модели. Здесь она превращается в вызов библиотеки: экран не
+                // знает, что такое аренда, он знает, что человек нажал `c`.
+                model::Outcome::Act(intent) => {
+                    app.perform(conn, project, intent);
+                }
+                model::Outcome::Redraw | model::Outcome::Ask(_) => {
+                    if let Err(err) = app.refresh(&*conn, project) {
                         app.say(err.to_string());
                     }
                 }
-                _ => {}
+                model::Outcome::Ignored => {}
             }
         }
         Ok(())
@@ -436,9 +450,9 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("tasq-tui-run-{nanos}"));
         let outcome = crate::db::init(&dir, "RUN", "run").expect("init");
-        let conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
         let project = crate::project::first_project(&conn).expect("project");
-        run(&conn, &project, true).expect("один кадр в обычный вывод");
+        run(&mut conn, &project, true).expect("один кадр в обычный вывод");
     }
 
     /// Курсор ВИДЕН: строка под ним помечена реверсом, и помечена ровно одна.
