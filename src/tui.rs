@@ -7,6 +7,8 @@
 //! Источник данных — `overview::board`, то же, что у `tasq board`: экран не имеет права
 //! считать статусы, аренды и просрочку по-своему, иначе доска и TUI разойдутся в числах.
 
+pub mod model;
+
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{execute, terminal};
