@@ -314,4 +314,20 @@ mod tests {
             );
         }
     }
+
+    /// `run(.., once = true)` — путь, которым пользуется CI и документация: доска читается из
+    /// базы, кадр печатается, функция возвращается без терминала. Без этого теста сам вход в
+    /// режим не исполнялся ни разу: `--once` проверялся на живом бинаре, а код — нет.
+    #[test]
+    fn run_once_reads_the_board_and_returns() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-tui-run-{nanos}"));
+        let outcome = crate::db::init(&dir, "RUN", "run").expect("init");
+        let conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        run(&conn, &project, true).expect("один кадр в обычный вывод");
+    }
 }
