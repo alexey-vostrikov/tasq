@@ -1372,6 +1372,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2",
+ "signal-hook",
  "thiserror",
  "tiktoken-rs",
  "time",

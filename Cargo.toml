@@ -22,6 +22,10 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 clap_complete = "4.5"
 serde-saphyr = "2.1.1"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "std"] }
+# Только флаг на SIGTERM/SIGINT/SIGHUP: крейт уже есть в дереве через crossterm, отдельной
+# зависимости «в нагрузку» он не тянет. Нужен, чтобы `kill` не оставлял терминал в raw mode с
+# захваченной мышью — при сигнале размотки стека нет, и `Drop` не срабатывает.
+signal-hook = "0.3"
 
 [dev-dependencies]
 # Property-тесты вместо cargo-fuzz: fuzz-раннер требует nightly и ASAN, а гейт должен

@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use super::actions;
 use super::model::{self, Intent, Key, Mode, Outcome, State};
@@ -55,6 +57,11 @@ pub struct App {
     pub project: Option<crate::project::Project>,
     /// Цветовая тема: её переключает `T`, и она живёт на экране, а не в константе.
     pub theme: crate::tui::theme::Theme,
+    /// Карта кадра: что нарисовано где. Заполняется отрисовкой и живёт до следующего кадра.
+    ///
+    /// Мышь приходит координатами, а экран живёт индексами, поэтому связь хранится здесь, а не
+    /// считается в обработчике заново: второй расчёт разошёлся бы с первым.
+    pub hits: super::hits::Hits,
     /// Описание выбранного узла: текст задачи для панели под канбаном.
     ///
     /// Читается из базы отдельным запросом при каждом перечитывании: в `overview::BoardRow`
@@ -96,6 +103,7 @@ impl App {
             projects: Vec::new(),
             project: None,
             theme: crate::tui::theme::Theme::default(),
+            hits: super::hits::Hits::default(),
             detail: String::new(),
             context: Vec::new(),
             notes: Vec::new(),
@@ -465,8 +473,81 @@ impl App {
                 None => Outcome::Ignored,
             },
             Event::Resize(_, _) => Outcome::Redraw,
+            Event::Mouse(mouse) => self.step_mouse(mouse),
             _ => Outcome::Ignored,
         }
+    }
+
+    /// Мышь: колесо двигает то же, что `j`/`k`, клик выбирает то, по чему попали.
+    ///
+    /// Колесо НЕ прокручивает окно отдельно от курсора: в этой модели прокрутка привязана к
+    /// курсору, и второе смещение означало бы два разных представления о том, где человек
+    /// находится — «я на пятой строке», а видно третью.
+    ///
+    /// Нажатия обрабатываются только левой кнопкой и только вниз: отпускание и правая кнопка
+    /// ничего не значат, а реакция на отпускание превращала бы одно нажатие в два действия.
+    fn step_mouse(&mut self, mouse: MouseEvent) -> Outcome {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => match self.state.focus {
+                model::Focus::Projects => self.state.apply(Intent::ProjectDown),
+                model::Focus::Board => self.state.apply(Intent::MoveDown),
+            },
+            MouseEventKind::ScrollUp => match self.state.focus {
+                model::Focus::Projects => self.state.apply(Intent::ProjectUp),
+                model::Focus::Board => self.state.apply(Intent::MoveUp),
+            },
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Карта попаданий построена по прошлому кадру. Если она пуста (кадр ещё не
+                // рисовался), клик ничего не делает: угадывать, куда он пришёлся, нельзя.
+                match self.hits.find(mouse.column, mouse.row) {
+                    Some(super::hits::Hit::Project(index)) => self.select_project(index),
+                    Some(super::hits::Hit::Header) => {
+                        self.state.focus = model::Focus::Projects;
+                        Outcome::Redraw
+                    }
+                    Some(super::hits::Hit::Column(column)) => {
+                        self.state.focus = model::Focus::Board;
+                        self.state.column = column.min(self.board.columns.len().saturating_sub(1));
+                        self.state.row = self
+                            .board
+                            .columns
+                            .get(self.state.column)
+                            .map_or(0, |value| {
+                                self.state.row.min(value.rows.len().saturating_sub(1))
+                            });
+                        Outcome::Redraw
+                    }
+                    Some(super::hits::Hit::Row { column, row }) => {
+                        self.state.focus = model::Focus::Board;
+                        if self
+                            .board
+                            .columns
+                            .get(column)
+                            .is_some_and(|value| row < value.rows.len())
+                        {
+                            self.state.column = column;
+                            self.state.row = row;
+                        }
+                        Outcome::Redraw
+                    }
+                    Some(super::hits::Hit::Detail) => self.state.apply(Intent::Open),
+                    None => Outcome::Ignored,
+                }
+            }
+            _ => Outcome::Ignored,
+        }
+    }
+
+    /// Переключение доски на проект по номеру в панели.
+    ///
+    /// Тем же путём, что Enter на панели: курсор панели ставится на номер, дальше работает
+    /// модель. Свой код загрузки проекта здесь означал бы вторую копию переключения.
+    fn select_project(&mut self, index: usize) -> Outcome {
+        if index >= self.projects.len() {
+            return Outcome::Ignored;
+        }
+        self.state.active = index;
+        self.state.apply(Intent::ProjectOpen)
     }
 
     /// Записывает форму: создаёт узел, правит его или добавляет заметку/комментарий.
@@ -917,6 +998,26 @@ mod tests {
         }
     }
 
+    /// Клик левой кнопкой в точку экрана.
+    fn mouse_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Колесо: координаты не важны, важно направление.
+    fn mouse_wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn board(columns: Vec<(&str, Vec<&str>)>) -> Board {
         Board {
             project: "DEMO".to_string(),
@@ -979,20 +1080,166 @@ mod tests {
         assert_eq!(app.selected().map(|r| r.dot_id.as_str()), Some("DEMO-1"));
     }
 
-    /// Ресайз перерисовывает кадр, мышь игнорируется: мыши в первой версии нет, и событие о ней
-    /// не должно выглядеть как нажатие.
+    /// Ресайз перерисовывает кадр.
     #[test]
-    fn resize_redraws_and_mouse_is_ignored() {
+    fn resize_redraws() {
         let mut app = App::new(board(vec![("todo", vec!["DEMO-1"])]));
         assert_eq!(app.step(Event::Resize(120, 40)), Outcome::Redraw);
+    }
+
+    /// Клик без карты попаданий — не нажатие: кадр ещё не рисовался, и угадывать, куда пришёлся
+    /// клик, нельзя. Иначе первый клик после запуска открывал бы случайный узел.
+    #[test]
+    fn a_click_without_a_frame_does_nothing() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1", "DEMO-2"])]));
+        assert_eq!(app.step(Event::Mouse(mouse_click(3, 3))), Outcome::Ignored);
         assert_eq!(
-            app.step(Event::Mouse(ratatui::crossterm::event::MouseEvent {
-                kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
-                column: 1,
-                row: 1,
-                modifiers: KeyModifiers::NONE,
-            })),
-            Outcome::Ignored
+            app.selected().map(|row| row.dot_id.as_str()),
+            Some("DEMO-1")
+        );
+    }
+
+    /// Клик по строке ставит курсор на неё и забирает фокус у панели проектов: человек ткнул в
+    /// доску, значит работает с доской.
+    #[test]
+    fn a_click_selects_the_row_under_the_pointer() {
+        let mut app = App::new(board(vec![
+            ("todo", vec!["DEMO-1"]),
+            ("planned", vec!["DEMO-2", "DEMO-3"]),
+        ]));
+        app.state.focus = model::Focus::Projects;
+        app.hits.add(
+            ratatui::layout::Rect::new(0, 5, 40, 1),
+            super::super::hits::Hit::Row { column: 1, row: 1 },
+        );
+        assert_eq!(app.step(Event::Mouse(mouse_click(10, 5))), Outcome::Redraw);
+        assert_eq!(app.state.focus, model::Focus::Board);
+        assert_eq!(app.state.column, 1);
+        assert_eq!(app.state.row, 1);
+        assert_eq!(
+            app.selected().map(|row| row.dot_id.as_str()),
+            Some("DEMO-3")
+        );
+    }
+
+    /// Клик по карте в том месте, где строки нет (например, по рамке), ничего не меняет.
+    #[test]
+    fn a_click_between_rows_keeps_the_cursor() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1", "DEMO-2"])]));
+        app.hits.add(
+            ratatui::layout::Rect::new(0, 5, 40, 1),
+            super::super::hits::Hit::Row { column: 0, row: 1 },
+        );
+        assert_eq!(app.step(Event::Mouse(mouse_click(10, 9))), Outcome::Ignored);
+        assert_eq!(
+            app.selected().map(|row| row.dot_id.as_str()),
+            Some("DEMO-1")
+        );
+    }
+
+    /// Колесо двигает то же, что `j`/`k`, и по панели проектов тоже.
+    #[test]
+    fn the_wheel_moves_what_the_keys_move() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1", "DEMO-2", "DEMO-3"])]));
+        assert_eq!(
+            app.step(Event::Mouse(mouse_wheel(MouseEventKind::ScrollDown))),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            app.selected().map(|row| row.dot_id.as_str()),
+            Some("DEMO-2")
+        );
+        assert_eq!(
+            app.step(Event::Mouse(mouse_wheel(MouseEventKind::ScrollUp))),
+            Outcome::Redraw
+        );
+        assert_eq!(
+            app.selected().map(|row| row.dot_id.as_str()),
+            Some("DEMO-1")
+        );
+    }
+
+    /// Отпускание кнопки и правая кнопка не считаются нажатием: одно нажатие — одно действие.
+    #[test]
+    fn only_the_left_button_press_counts() {
+        use ratatui::crossterm::event::MouseButton;
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1", "DEMO-2"])]));
+        app.hits.add(
+            ratatui::layout::Rect::new(0, 5, 40, 1),
+            super::super::hits::Hit::Row { column: 0, row: 1 },
+        );
+        // Отпускание в той же точке, где было попадание.
+        let mut up = mouse_click(10, 5);
+        up.kind = MouseEventKind::Up(MouseButton::Left);
+        assert_eq!(app.step(Event::Mouse(up)), Outcome::Ignored);
+        // Правая кнопка.
+        let mut right = mouse_click(10, 5);
+        right.kind = MouseEventKind::Down(MouseButton::Right);
+        assert_eq!(app.step(Event::Mouse(right)), Outcome::Ignored);
+        assert_eq!(
+            app.selected().map(|row| row.dot_id.as_str()),
+            Some("DEMO-1")
+        );
+    }
+
+    /// Клик по панели текста задачи открывает карточку — это то действие, которого ждут от
+    /// нажатия на текст.
+    #[test]
+    fn a_click_on_the_task_text_opens_the_card() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1"])]));
+        app.hits.add(
+            ratatui::layout::Rect::new(0, 20, 60, 6),
+            super::super::hits::Hit::Detail,
+        );
+        // Открытие карточки в режиме доски — переход режима, а не просьба к библиотеке: за
+        // данными ходит не она, а экран.
+        assert_eq!(app.step(Event::Mouse(mouse_click(5, 22))), Outcome::Redraw);
+        assert_eq!(app.state.mode, Mode::Node);
+    }
+
+    /// Клик по проекту в панели переключает доску — тем же путём, что Enter на панели.
+    #[test]
+    fn a_click_on_a_project_switches_the_board() {
+        let mut app = App::new(board(vec![("todo", vec!["DEMO-1"])]));
+        let summary = |key: &str, nodes: i64| crate::project::Summary {
+            id: nodes,
+            key: key.to_string(),
+            name: format!("проект {key}"),
+            status: "active".to_string(),
+            nodes,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        app.projects = vec![summary("AAA", 1), summary("BBB", 2)];
+        app.state.projects = 2;
+        app.hits.add(
+            ratatui::layout::Rect::new(0, 2, 20, 1),
+            super::super::hits::Hit::Project(1),
+        );
+        assert_eq!(
+            app.step(Event::Mouse(mouse_click(3, 2))),
+            Outcome::Act(Intent::ProjectOpen)
+        );
+        assert_eq!(app.state.active, 1);
+    }
+
+    /// Клик по пустой части колонки канбана ставит курсор на колонку, не меняя строку за её
+    /// пределами.
+    #[test]
+    fn a_click_on_a_column_lands_on_it() {
+        let mut app = App::new(board(vec![
+            ("todo", vec!["DEMO-1", "DEMO-2"]),
+            ("planned", vec![]),
+        ]));
+        app.state.row = 1;
+        app.hits.add(
+            ratatui::layout::Rect::new(50, 4, 30, 20),
+            super::super::hits::Hit::Column(1),
+        );
+        assert_eq!(app.step(Event::Mouse(mouse_click(55, 10))), Outcome::Redraw);
+        assert_eq!(app.state.column, 1);
+        assert_eq!(
+            app.state.row, 0,
+            "в пустой колонке курсор обязан схлопнуться в ноль"
         );
     }
 

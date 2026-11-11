@@ -12,11 +12,13 @@
 
 pub mod actions;
 pub mod app;
+pub mod hits;
 pub mod model;
 pub mod theme;
 
 use std::time::Duration;
 
+use hits::{Hit, Hits};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{execute, terminal};
@@ -82,17 +84,27 @@ pub fn run(
         return Ok(());
     }
 
-    // `Error::Io` принимает `std::io::Error` через `#[from]`, поэтому `?` работает и на
-    // ошибках ratatui: они того же типа. А вот отсутствие терминала — отдельный код: без tty
-    // `enable_raw_mode` отдаёт `No such device or address`, и как `STORAGE_ERROR` это читалось
-    // как «проблема с диском или правами на файл».
-    terminal::enable_raw_mode().map_err(|err| crate::error::Error::NoTerminal {
-        reason: err.to_string(),
-    })?;
+    // Восстановление терминала живёт в сторожа внутри цикла, а обработчик паники — здесь:
+    // паника в `perform` (например, из библиотеки) не должна оставлять мышь захваченной и экран
+    // в чужом буфере. Прежний обработчик сохраняется и вызывается после восстановления — иначе
+    // сообщение о панике пропало бы, а вместе с ним и место, где искать причину.
+    //
+    // Прежний обработчик держится в `Arc`: его надо и вызвать из нового (иначе сообщение о
+    // панике пропало бы), и вернуть на место после выхода — а `Box` не даёт и то и другое сразу.
+    type Hook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync;
+    let previous: std::sync::Arc<Hook> = std::sync::Arc::from(std::panic::take_hook());
+    let chained = std::sync::Arc::clone(&previous);
+    std::panic::set_hook(Box::new(move |info| {
+        // Сначала терминал, потом сообщение: иначе текст паники приедет в чужой буфер и
+        // исчезнет вместе с ним при выходе из программы.
+        restore_terminal();
+        chained(info);
+    }));
     let outcome = event_loop(std::io::stdout(), conn, &mut app);
-    // raw mode снимается ДО возврата ошибки: иначе упавшая отрисовка оставит терминал в
-    // состоянии, где Enter не отправляет строку, и человеку придётся спасать сессию `reset`.
-    terminal::disable_raw_mode()?;
+    // Обработчик снимается при обычном выходе: иначе он остался бы висеть на процесс, который
+    // дальше живёт своей жизнью (MCP-сервер, тесты в одном бинаре).
+    let _ = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| previous(info)));
     outcome
 }
 
@@ -145,13 +157,31 @@ where
 {
     use ratatui::crossterm::event;
 
-    execute!(out, terminal::EnterAlternateScreen)?;
+    // Порядок важен: сначала терминал приводится в состояние «чужой экран, мышь наша», потом
+    // ставится сторож. Сторож снимает ЭТО состояние, поэтому он должен появиться после того, как
+    // что снимать, и исчезнуть раньше, чем состояние снимут вручную.
+    terminal::enable_raw_mode().map_err(|err| crate::error::Error::NoTerminal {
+        reason: err.to_string(),
+    })?;
+    let mut guard = ScreenGuard::enter(&mut out)?;
+    let signals = SignalWatch::install();
+
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
     let result = (|| -> Result<()> {
         loop {
-            terminal.draw(|frame| draw(frame, app))?;
+            // Карта попаданий строится там же, где кадр: отрисовка — единственное место, которое
+            // знает, сколько строк влезло и с каким смещением.
+            let mut hits = Hits::default();
+            terminal.draw(|frame| hits = draw(frame, app))?;
+            app.hits = hits;
+            // Сигнал `kill` или закрытие терминала не должны оставить мышь захваченной: флаг
+            // снимается здесь, а не в обработчике, потому что обработчик сигнала не имеет права
+            // ни печатать, ни брать блокировки.
+            if signals.received() {
+                break;
+            }
             if !event::poll(TICK)? {
                 // Пауза без событий: доска могла измениться извне, поэтому перечитываем её, а не
                 // перерисовываем тот же снимок. Ошибка чтения не выходит из цикла — она
@@ -185,10 +215,115 @@ where
         Ok(())
     })();
 
-    // Выход из альтернативного экрана — до возврата ошибки: иначе терминал останется в чужом
-    // буфере, и вывод упадёт поверх доски.
-    execute!(terminal.backend_mut(), terminal::LeaveAlternateScreen)?;
+    // Восстановление терминала идёт через сторожа, а не отдельным вызовом: так оно случается и
+    // при ошибке отрисовки, и при панике в `perform`, и при обычном выходе — один путь вместо
+    // трёх, где один из трёх забывают.
+    guard.restore();
+    drop(guard);
+    signals.remove();
     result
+}
+
+/// Восстановление терминала: мышь выключить, чужой экран покинуть, raw mode снять.
+///
+/// Отдельная функция от [`ScreenGuard`], потому что её вызывает ещё и обработчик паники, у
+/// которого нет доступа к сторожу. Ошибки намеренно глотаются: восстановление вызывается в том
+/// числе из места, где уже случилась беда, и вторая ошибка там только помешает прочитать первую.
+fn restore_terminal() {
+    let mut out = std::io::stdout();
+    let _ = restore_terminal_to(&mut out);
+}
+
+/// То же, но с явным приёмником — чтобы проверялось тестом, а не глазами в терминале.
+fn restore_terminal_to<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
+    use ratatui::crossterm::event;
+    // Мышь выключается ДО выхода из чужого экрана: иначе состояние «мышь наша» останется
+    // включённым уже в обычном экране оболочки, и человек получит вместо выделения текста
+    // последовательности `\x1b[<0;…M` в командной строке.
+    execute!(
+        out,
+        event::DisableMouseCapture,
+        terminal::LeaveAlternateScreen
+    )?;
+    terminal::disable_raw_mode()
+}
+
+/// Сторож терминала: возвращает его в нормальное состояние при выходе по любой причине.
+///
+/// `Drop` срабатывает и при обычном возврате, и при панике с размоткой стека; отдельный
+/// обработчик паники нужен для случая `panic = abort`, когда размотки нет вовсе. Оба пути ведут
+/// в одну функцию [`restore_terminal_to`], и оба идемпотентны: повторное выключение мыши, которой
+/// не пользуются, терминал не портит.
+struct ScreenGuard {
+    active: bool,
+}
+
+impl ScreenGuard {
+    fn enter<W: std::io::Write>(out: &mut W) -> Result<Self> {
+        // Мышь включается вместе с чужим экраном: пока экран жив, события мыши нужны, а в обычной
+        // оболочке они мешают выделять текст.
+        execute!(
+            out,
+            terminal::EnterAlternateScreen,
+            ratatui::crossterm::event::EnableMouseCapture
+        )?;
+        Ok(Self { active: true })
+    }
+
+    /// Снимает состояние сейчас. Повторный вызов ничего не делает.
+    fn restore(&mut self) {
+        if self.active {
+            restore_terminal();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Сторож сигналов: `SIGTERM`, `SIGINT`, `SIGHUP` просят цикл выйти штатно.
+///
+/// Без него `kill` оставлял бы терминал в raw mode с захваченной мышью: размотки стека при
+/// сигнале нет, `Drop` не вызывается, и человеку приходилось бы спасать сессию `reset`.
+struct SignalWatch {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ids: Vec<signal_hook::SigId>,
+}
+
+impl SignalWatch {
+    fn install() -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut ids = Vec::new();
+        for signal in [
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGHUP,
+        ] {
+            // Флаг вместо действия в обработчике: обработчик сигнала обязан быть
+            // async-signal-safe, и печатать escape-последовательности из него нельзя.
+            if let Ok(id) = signal_hook::flag::register(signal, Arc::clone(&flag)) {
+                ids.push(id);
+            }
+        }
+        Self { flag, ids }
+    }
+
+    fn received(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn remove(self) {
+        for id in self.ids {
+            signal_hook::low_level::unregister(id);
+        }
+    }
 }
 
 /// Ширина кадра для `--once`.
@@ -271,7 +406,9 @@ pub fn render_once_sized(app: &app::App, width: u16, color: bool) -> String {
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height))
         .expect("рисование в буфер памяти не может отказать");
     terminal
-        .draw(|frame| draw(frame, app))
+        .draw(|frame| {
+            draw(frame, app);
+        })
         .expect("рисование в буфер памяти не может отказать");
     let buffer = terminal.backend().buffer().clone();
     if color {
@@ -434,7 +571,8 @@ fn buffer_lines(buffer: &ratatui::buffer::Buffer, width: u16) -> String {
 ///
 /// Пометка курсора идёт ЗДЕСЬ, а не в модели: модель про вид ничего не знает, и это правильно —
 /// иначе вид стал бы частью решения.
-fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
+fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) -> Hits {
+    let mut hits = Hits::default();
     let [body, mode_line, hint_line] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
@@ -459,7 +597,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
         [panel, main, ratatui::layout::Rect::default()]
     };
 
-    draw_panel(frame, app, panel);
+    hits.extend(draw_panel(frame, app, panel));
     if sidebar {
         draw_sidebar(frame, app, side);
     }
@@ -483,6 +621,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
     // выглядит целым, поэтому заметить это можно только тестом на содержимое.
     let [header, content] =
         Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(main);
+    // Вся шапка — попадание «переключатель проекта»: клик по «проект: KEY ▾» переводит фокус на
+    // панель проектов, что и есть раскрытие выпадающего списка без мыши.
+    hits.add(header, Hit::Header);
     let theme = app.theme;
     frame.render_widget(
         Paragraph::new(vec![
@@ -501,13 +642,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
 
     // Форма, поиск и карточка занимают основную область: это временные режимы, и человек
     // смотрит в них, а не в доску. Доска остаётся под ними — Esc возвращает её же.
+    // Временные режимы попаданий не получают: клик по форме означает «поставить курсор в поле», а
+    // это отдельная работа с координатами ввода, и делать её наполовину хуже, чем не делать.
     match app.state.mode {
         model::Mode::Form | model::Mode::Note => draw_form(frame, app, content),
         model::Mode::Search => draw_search(frame, app, content),
         model::Mode::Node => draw_card(frame, app, content),
         _ => match app.state.view {
-            model::View::List => draw_list(frame, app, content),
-            model::View::Kanban => draw_kanban(frame, app, content),
+            model::View::List => hits.extend(draw_list(frame, app, content)),
+            model::View::Kanban => hits.extend(draw_kanban(frame, app, content)),
         },
     }
 
@@ -537,6 +680,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
         .style(theme.dim_style()),
         hint_line,
     );
+    hits
 }
 
 /// Строка режима: выбор статуса, подтверждение — или пусто.
@@ -558,10 +702,21 @@ fn mode_text(app: &app::App) -> String {
 }
 
 /// Панель проектов: ключ, счётчик узлов, пометка активного и курсора панели.
-fn draw_panel(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+fn draw_panel(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) -> Hits {
     let theme = app.theme;
+    let mut hits = Hits::default();
     let mut lines: Vec<Line<'_>> = Vec::new();
     for (index, project) in app.projects.iter().enumerate() {
+        // Попадание считается от первой строки внутри рамки: сверху рамка, дальше по строке на
+        // проект. Проекты, не влезшие в панель, попаданий не получают — кликнуть по ним нельзя,
+        // и «попадание в невидимое» было бы ложью.
+        let y = area.y + 1 + index as u16;
+        if y + 1 < area.y + area.height {
+            hits.add(
+                ratatui::layout::Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1),
+                Hit::Project(index),
+            );
+        }
         let active = index == app.state.active;
         let text = format!("{:<8} {:>4}", project.key, project.nodes);
         let mut line = Line::from(text);
@@ -586,6 +741,7 @@ fn draw_panel(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::lay
         ),
         area,
     );
+    hits
 }
 
 /// Рамка панели: в фокусе — акцент темы, без фокуса — обычная рамка.
@@ -769,8 +925,9 @@ fn draw_card(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
 }
 
 /// Доска списком: строка на узел.
-fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) -> Hits {
     let theme = app.theme;
+    let mut hits = Hits::default();
     let selected_flat = selected_index(&app.board, app.state.column, app.state.row);
     let mut rows: Vec<Row<'_>> = Vec::new();
     let mut offset = 0usize;
@@ -828,8 +985,25 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
     // синхронизировать два источника одного числа (смещение я считаю из курсора и высоты), а
     // рассинхрон здесь выглядит как «список уехал и курсора не видно».
     let visible = usize::from(area.height.saturating_sub(3)).max(1);
+    let scroll = scroll_offset(selected_flat.unwrap_or(0), visible);
+    // Строки экрана: первая — под рамкой (1) и шапкой таблицы (1), дальше по строке на узел.
+    // Плоский индекс переводится в пару «колонка, строка» той же нумерацией, что у `offset` выше,
+    // иначе клик открывал бы соседа из другой колонки.
+    for step in 0..visible {
+        let y = area.y + 2 + step as u16;
+        if y + 1 >= area.y + area.height {
+            break;
+        }
+        let Some((column, row)) = column_row_of(&app.board, scroll + step) else {
+            break;
+        };
+        hits.add(
+            ratatui::layout::Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1),
+            Hit::Row { column, row },
+        );
+    }
     let mut table_state = ratatui::widgets::TableState::default();
-    *table_state.offset_mut() = scroll_offset(selected_flat.unwrap_or(0), visible);
+    *table_state.offset_mut() = scroll;
 
     frame.render_stateful_widget(
         Table::new(
@@ -853,6 +1027,7 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
         area,
         &mut table_state,
     );
+    hits
 }
 
 /// Доска канбаном: колонки статусов рядом, узлы внутри колонки, внизу — текст задачи.
@@ -863,8 +1038,13 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
 ///
 /// Нижние 20 % экрана отданы тексту выбранной задачи. В колонке шириной в десять знаков от
 /// названия остаётся «TUI: инт…», и без панели канбан показывает адреса, а не работу.
-fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+fn draw_kanban(
+    frame: &mut ratatui::Frame<'_>,
+    app: &app::App,
+    area: ratatui::layout::Rect,
+) -> Hits {
     let theme = app.theme;
+    let mut hits = Hits::default();
     // Пять строк — минимум, при котором панель текста ещё что-то says: две строки под доску и
     // три под текст. Ниже этого делить экран бессмысленно, и панель не рисуется.
     let [board_area, detail_area] = if area.height >= 10 {
@@ -885,8 +1065,8 @@ fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
                 ),
             board_area,
         );
-        draw_detail(frame, app, detail_area);
-        return;
+        hits.extend(draw_detail(frame, app, detail_area));
+        return hits;
     }
 
     let constraints: Vec<Constraint> = app
@@ -902,6 +1082,32 @@ fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
         // меньше узлов, чем строк по высоте; две строки при этом заняты рамкой.
         let visible = (usize::from(chunks[column_index].height.saturating_sub(2)) / 2).max(1);
         let scroll = scroll_offset(app.state.row, visible);
+        // Вся колонка — попадание «колонка»: клик ниже последней карточки ставит на неё курсор.
+        // Карточки добавляются следом, поэтому клик по ним попадает в карточку, а не в колонку.
+        hits.add(chunks[column_index], Hit::Column(column_index));
+        for step in 0..visible {
+            let row_index = scroll + step;
+            if row_index >= column.rows.len() {
+                break;
+            }
+            // Внутри рамки по две строки на карточку: адрес и название.
+            let y = chunks[column_index].y + 1 + (step as u16) * 2;
+            if y + 2 > chunks[column_index].y + chunks[column_index].height - 1 {
+                break;
+            }
+            hits.add(
+                ratatui::layout::Rect::new(
+                    chunks[column_index].x + 1,
+                    y,
+                    chunks[column_index].width.saturating_sub(2),
+                    2,
+                ),
+                Hit::Row {
+                    column: column_index,
+                    row: row_index,
+                },
+            );
+        }
 
         let mut lines: Vec<Line<'_>> = Vec::new();
         for (row_index, row) in column.rows.iter().enumerate().skip(scroll).take(visible) {
@@ -949,17 +1155,26 @@ fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
         );
     }
 
-    draw_detail(frame, app, detail_area);
+    hits.extend(draw_detail(frame, app, detail_area));
+    hits
 }
 
 /// Панель текста выбранной задачи под канбаном.
 ///
 /// Описание берётся из базы (`App::detail`), а не из доски: в `overview::board` его нет вовсе, и
 /// панель, собранная из доски, показывала бы только заголовок — то же, что видно в колонке.
-fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+fn draw_detail(
+    frame: &mut ratatui::Frame<'_>,
+    app: &app::App,
+    area: ratatui::layout::Rect,
+) -> Hits {
+    let mut hits = Hits::default();
     if area.height == 0 {
-        return;
+        return hits;
     }
+    // Клик по панели открывает карточку узла: панель показывает текст, а карточка — всё
+    // остальное, и это то действие, которое человек ждёт от нажатия на текст задачи.
+    hits.add(area, Hit::Detail);
     let theme = app.theme;
     let mut lines: Vec<Line<'_>> = Vec::new();
     match app.selected() {
@@ -993,6 +1208,7 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
         ),
         area,
     );
+    hits
 }
 
 /// Смещение прокрутки, при котором выбранная строка видна.
@@ -1007,6 +1223,22 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
 fn scroll_offset(selected: usize, visible: usize) -> usize {
     let visible = visible.max(1);
     selected.saturating_sub(visible - 1)
+}
+
+/// Обратный перевод: плоский номер → колонка и строка в ней.
+///
+/// Нужен мыши: кадр знает, на какой высоте нарисована строка, а экран хранит курсор парой
+/// «колонка, строка». Без этого перевода клик приходилось бы считать второй раз, в другом месте и
+/// по-другому — и он попадал бы в соседа из следующей колонки.
+fn column_row_of(board: &overview::Board, flat: usize) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    for (column, value) in board.columns.iter().enumerate() {
+        if flat < offset + value.rows.len() {
+            return Some((column, flat - offset));
+        }
+        offset += value.rows.len();
+    }
+    None
 }
 
 /// Номер строки в плоском списке всех строк доски.
@@ -1064,7 +1296,11 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
         let app = app::App::new(board.clone());
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
 
@@ -1088,7 +1324,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("terminal");
         let app = app::App::new(board.clone());
         terminal
-            .draw(|frame| draw(frame, &app))
+            .draw(|frame| {
+                draw(frame, &app);
+            })
             .expect("кадр 1x1 должен рисоваться, а не падать на усечении");
     }
 
@@ -1247,7 +1485,11 @@ mod tests {
             let height = frame_height(board);
             let mut terminal =
                 Terminal::new(TestBackend::new(ONCE_WIDTH, height)).expect("terminal");
-            terminal.draw(|frame| draw(frame, &app)).expect("draw");
+            terminal
+                .draw(|frame| {
+                    draw(frame, &app);
+                })
+                .expect("draw");
             let buffer = terminal.backend().buffer().clone();
             let mut found: Vec<String> = Vec::new();
             // Выделение задаёт ТЕМА (цвет текста и фона), а не модификатор: иначе на терминале
@@ -1408,7 +1650,11 @@ mod tests {
         // Канбан выше списка: каждая строка занимает две строки (адрес и название).
         let height = frame_height(&app.board) + 4;
         let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, height)).expect("terminal");
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area().height {
@@ -1606,7 +1852,11 @@ mod tests {
 
         // Кадр на двенадцать строк: под таблицу остаётся девять — последняя видимая это 9-я.
         let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 14)).expect("terminal");
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area().height {
@@ -1627,7 +1877,11 @@ mod tests {
         // Курсор вернулся в начало — окно тоже.
         app.state.row = 0;
         let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 14)).expect("terminal");
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area().height {
@@ -1670,7 +1924,11 @@ mod tests {
         app.detail = "Подробности задачи: сроки, зависимости и договорённости.".to_string();
 
         let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 30)).expect("terminal");
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area().height {
@@ -1703,7 +1961,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 30)).expect("terminal");
         let mut app = app;
         app.state.view = model::View::Kanban;
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buffer.area().height {
@@ -1715,6 +1977,138 @@ mod tests {
         assert!(
             text.contains("узел не выбран"),
             "панель на пустой доске ничего не сказала:\n{text}"
+        );
+    }
+
+    /// Восстановление терминала: мышь выключается и чужой экран покидается, причём мышь — ПЕРВОЙ.
+    ///
+    /// Порядок проверяется не из любви к порядку: если выйти из чужого экрана, оставив мышь
+    /// включённой, оболочка получит поток `\x1b[<0;…M` вместо выделения текста, и человек решит,
+    /// что сломался терминал.
+    #[test]
+    fn the_restore_sequence_turns_the_mouse_off_first() {
+        let mut out: Vec<u8> = Vec::new();
+        restore_terminal_to(&mut out).expect("восстановление в буфер не может отказать");
+        let text = String::from_utf8_lossy(&out).to_string();
+        let mouse_off = text
+            .find("\x1b[?1006l")
+            .or_else(|| text.find("\x1b[?1000l"))
+            .expect("мышь не выключена");
+        let screen_left = text.find("\x1b[?1049l").expect("чужой экран не покинут");
+        assert!(
+            mouse_off < screen_left,
+            "мышь выключается после выхода из чужого экрана: {text:?}"
+        );
+    }
+
+    /// Сторож снимает состояние при выходе — и повторное снятие ничего не ломает.
+    ///
+    /// `Drop` вызывается и при обычном возврате, и при размотке стека; второй путь важен потому,
+    /// что паника в библиотеке не должна оставлять терминал в raw mode.
+    #[test]
+    fn the_guard_restores_once_and_is_idempotent() {
+        let mut guard = ScreenGuard { active: true };
+        guard.restore();
+        assert!(
+            !guard.active,
+            "сторож остался активным после восстановления"
+        );
+        // Повторный вызов не паникует и не включает состояние обратно.
+        guard.restore();
+        assert!(!guard.active);
+    }
+
+    /// Кадр размечен: клик по строке доски попадает в ту же строку, что нарисована.
+    ///
+    /// Проверяется связка «отрисовка → карта → попадание», а не каждая часть отдельно: ошибка
+    /// здесь не ломает ни сборку, ни модель — она просто заставляет клик открывать соседа.
+    #[test]
+    fn the_frame_map_points_at_the_drawn_rows() {
+        let board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: vec![overview::BoardColumn {
+                status: "todo".to_string(),
+                count: 2,
+                rows: vec![
+                    overview::BoardRow {
+                        dot_id: "DEMO-1".to_string(),
+                        title: "первый".to_string(),
+                        priority: "high".to_string(),
+                        due_date: None,
+                        days_overdue: 0,
+                        lease_holder: None,
+                        progress: "0%".to_string(),
+                    },
+                    overview::BoardRow {
+                        dot_id: "DEMO-2".to_string(),
+                        title: "второй".to_string(),
+                        priority: "low".to_string(),
+                        due_date: None,
+                        days_overdue: 0,
+                        lease_holder: None,
+                        progress: "0%".to_string(),
+                    },
+                ],
+            }],
+            overdue: 0,
+            leased: 0,
+            open: 2,
+            done: 0,
+        };
+        // Панель проектов рисуется, только когда проекты есть: без них размечать нечего.
+        let summary = |key: &str| crate::project::Summary {
+            id: 1,
+            key: key.to_string(),
+            name: format!("проект {key}"),
+            status: "active".to_string(),
+            nodes: 2,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let app = app::App::with_projects(
+            board,
+            "test",
+            vec![summary("DEMO"), summary("OTHER")],
+            0,
+            crate::project::Project {
+                id: 1,
+                key: "DEMO".to_string(),
+                name: "проект DEMO".to_string(),
+                status: "active".to_string(),
+                reopen: crate::status::Reopen::default(),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        let mut hits = Hits::default();
+        terminal
+            .draw(|frame| {
+                hits = draw(frame, &app);
+            })
+            .expect("draw");
+        assert!(
+            !hits.is_empty(),
+            "кадр не размечен: клик не найдёт ни строки, ни колонки"
+        );
+        // Первая строка таблицы — под рамкой доски (1), шапкой доски (3) и шапкой таблицы (1).
+        assert_eq!(
+            hits.find(60, 6),
+            Some(Hit::Row { column: 0, row: 0 }),
+            "первая строка доски не там, где нарисована"
+        );
+        assert_eq!(
+            hits.find(60, 7),
+            Some(Hit::Row { column: 0, row: 1 }),
+            "вторая строка доски не там, где нарисована"
+        );
+        // Панель проектов слева — попадание в проект, а не в доску: первая строка внутри рамки.
+        assert_eq!(
+            hits.find(3, 1),
+            Some(Hit::Project(0)),
+            "первая строка панели проектов не размечена"
+        );
+        assert_eq!(
+            hits.find(3, 2),
+            Some(Hit::Project(1)),
+            "вторая строка панели проектов не размечена"
         );
     }
 }
