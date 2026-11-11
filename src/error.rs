@@ -200,6 +200,14 @@ pub enum Error {
     #[error("invalid {field} value {value}")]
     InvalidValue { field: String, value: String },
 
+    /// Терминала нет: экран не на что рисовать.
+    ///
+    /// Отдельный код, а не `STORAGE_ERROR`: `enable_raw_mode` на входе без tty отдаёт
+    /// `No such device or address`, и в общем коде это читалось как «проблема с диском или
+    /// правами на файл». Причина другая и лечится другим действием.
+    #[error("no terminal to draw on: {reason}")]
+    NoTerminal { reason: String },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -247,6 +255,7 @@ impl Error {
             Error::MoveIntoSelf { .. } => "MOVE_INTO_SELF",
             Error::MigrationBroken { .. } => "MIGRATION_BROKEN",
             Error::InvalidValue { .. } => "INVALID_VALUE",
+            Error::NoTerminal { .. } => "NO_TERMINAL",
             Error::Io(_) | Error::Sqlite(_) => "STORAGE_ERROR",
         }
     }
@@ -333,6 +342,9 @@ impl Error {
                 "restore the database from a backup: the migration was rolled back untouched"
             }
             Error::InvalidValue { .. } => "check the allowed values with --help",
+            Error::NoTerminal { .. } => {
+                "run it from an interactive terminal, or use `tasq tui --once` to print one frame"
+            }
             Error::Io(_) | Error::Sqlite(_) => "check file permissions and disk space",
         }
     }
@@ -499,6 +511,9 @@ mod tests {
             Error::InvalidValue {
                 field: "priority".to_string(),
                 value: "urgent".to_string(),
+            },
+            Error::NoTerminal {
+                reason: "No such device or address".to_string(),
             },
             Error::Io(std::io::Error::other("disk on fire")),
             Error::Sqlite(rusqlite::Error::QueryReturnedNoRows),
