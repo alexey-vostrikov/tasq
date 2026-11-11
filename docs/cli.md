@@ -634,6 +634,7 @@ tasq tui [ОПЦИИ]
 | флаг | значение | по умолчанию | описание |
 | --- | --- | --- | --- |
 | `--once` | — | — | Draw one frame to standard output and exit (for CI and documentation) |
+| `--theme` | `NAME` | — | Colour theme: default, default-light, gruvbox, gruvbox-light, nord, nord-light |
 
 ## `mcp`
 

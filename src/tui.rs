@@ -13,6 +13,7 @@
 pub mod actions;
 pub mod app;
 pub mod model;
+pub mod theme;
 
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use rusqlite::Connection;
 
@@ -62,8 +63,13 @@ pub const PANEL_WIDTH: u16 = 24;
 /// Соединение берётся изменяемым: экран не только читает, но и пишет (аренда, статус), и второе
 /// соединение «на запись» рядом с читающим — это два разных представления об одной базе и лишний
 /// способ с ней разойтись. Запись идёт теми же транзакциями, что у CLI и MCP.
-pub fn run(conn: &mut Connection, start: Option<&str>, once: bool) -> Result<()> {
-    let mut app = build(conn, start)?;
+pub fn run(
+    conn: &mut Connection,
+    start: Option<&str>,
+    theme: Option<&str>,
+    once: bool,
+) -> Result<()> {
+    let mut app = build(conn, start, theme)?;
 
     if once {
         print!("{}", render_once(&app));
@@ -89,7 +95,7 @@ pub fn run(conn: &mut Connection, start: Option<&str>, once: bool) -> Result<()>
 /// `start` — ключ проекта из `--project` (или `TASQ_PROJECT`). Неизвестный ключ — отказ с
 /// названным полем, а не молчаливый переход на первый проект: молчание здесь означало бы «показал
 /// не то, что просили».
-fn build(conn: &Connection, start: Option<&str>) -> Result<app::App> {
+fn build(conn: &Connection, start: Option<&str>, theme: Option<&str>) -> Result<app::App> {
     let projects = crate::project::list(conn)?;
     if projects.is_empty() {
         return Err(crate::error::Error::NoProject);
@@ -113,6 +119,15 @@ fn build(conn: &Connection, start: Option<&str>) -> Result<app::App> {
     let board = overview::board(conn, &project)?;
     let session = actions::session_id()?;
     let mut app = app::App::with_projects(board, session, projects, index, project.clone());
+    // Неизвестное имя темы — отказ с названным полем, а не тихий переход на умолчание:
+    // «я просил nord, а получил gruvbox» — это ответ, которого человек не заметит.
+    if let Some(name) = theme.map(str::trim).filter(|name| !name.is_empty()) {
+        app.theme =
+            theme::Theme::by_name(name).ok_or_else(|| crate::error::Error::InvalidValue {
+                field: "theme".to_string(),
+                value: format!("{name} (allowed: {})", theme::Theme::names()),
+            })?;
+    }
     app.load_kinds(conn, &project)?;
     Ok(app)
 }
@@ -137,7 +152,7 @@ where
                 // показывается в строке состояния: база, запертая другим процессом, не повод
                 // терять экран.
                 if let Err(err) = app.refresh_active(&*conn) {
-                    app.say(err.to_string());
+                    app.fail(app::describe(&err));
                 }
                 continue;
             }
@@ -148,14 +163,14 @@ where
                 // знает, что такое аренда, он знает, что человек нажал `c`.
                 model::Outcome::Act(intent) => {
                     let Some(project) = app.project.clone() else {
-                        app.say("проект не загружен");
+                        app.fail("проект не загружен");
                         continue;
                     };
                     app.perform(conn, &project, intent);
                 }
                 model::Outcome::Redraw | model::Outcome::Ask(_) => {
                     if let Err(err) = app.refresh_active(&*conn) {
-                        app.say(err.to_string());
+                        app.fail(app::describe(&err));
                     }
                 }
                 model::Outcome::Ignored => {}
@@ -288,12 +303,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
     // выглядит целым, поэтому заметить это можно только тестом на содержимое.
     let [header, content] =
         Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(main);
+    let theme = app.theme;
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(counters),
-            Line::from(dropdown).style(Style::default().add_modifier(Modifier::BOLD)),
+            // Счётчики приглушены, переключатель — акцентом: числа читают, когда ищут, а
+            // переключатель ищут глазами всегда.
+            Line::from(counters).style(theme.dim_style()),
+            Line::from(dropdown).style(theme.focus_style().add_modifier(Modifier::BOLD)),
         ])
-        .block(Block::default().borders(Borders::ALL)),
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border_style()),
+        ),
         header,
     );
 
@@ -309,12 +331,30 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
         },
     }
 
-    frame.render_widget(Paragraph::new(Line::from(mode_text(app))), mode_line);
+    // Строка режима несёт отказ или подтверждение — и цвет здесь ЕДИНСТВЕННОЕ, что отличает
+    // одно от другого, пока человек не прочитал текст. Отказ красный, успех зелёный, подсказка
+    // приглушена: цвет — подсказка, смысл остаётся в словах.
+    let (mode_style, mode_text) = match &app.message {
+        Some(message) => (
+            match app.level {
+                app::Level::Error => theme.error_style(),
+                app::Level::Ok => theme.ok_style(),
+                app::Level::Info => theme.dim_style(),
+            },
+            message.clone(),
+        ),
+        None => (theme.text_style(), mode_text(app)),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(mode_text).style(mode_style)),
+        mode_line,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(format!(
-            "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, v — вид, q — выход",
+            "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, v — вид, T — тема, q — выход",
             app.state.mode.title()
-        ))),
+        )))
+        .style(theme.dim_style()),
         hint_line,
     );
 }
@@ -337,6 +377,46 @@ fn mode_text(app: &app::App) -> String {
     }
 }
 
+/// Панель проектов: ключ, счётчик узлов, пометка активного и курсора панели.
+fn draw_panel(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (index, project) in app.projects.iter().enumerate() {
+        let active = index == app.state.active;
+        let text = format!("{:<8} {:>4}", project.key, project.nodes);
+        let mut line = Line::from(text);
+        if active {
+            // Активный проект — акцентом; курсор панели — фоном выделения. Две разные вещи:
+            // «на какой доске я сейчас» и «на что переключит Enter».
+            line = line.style(theme.focus_style().add_modifier(Modifier::BOLD));
+        } else {
+            line = line.style(theme.dim_style());
+        }
+        if active && app.state.focus == model::Focus::Projects {
+            line = line.style(theme.selected_style());
+        }
+        lines.push(line);
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_for(app, model::Focus::Projects))
+                .title(" проекты "),
+        ),
+        area,
+    );
+}
+
+/// Рамка панели: в фокусе — акцент темы, без фокуса — обычная рамка.
+fn border_for(app: &app::App, panel: model::Focus) -> Style {
+    if app.state.focus == panel {
+        app.theme.focus_style()
+    } else {
+        app.theme.border_style()
+    }
+}
+
 /// Ширина боковой панели: цепочка контекста, заметки и комментарии.
 pub const SIDEBAR_WIDTH: u16 = 32;
 
@@ -345,25 +425,32 @@ pub const SIDEBAR_WIDTH: u16 = 32;
 /// Три раздела, а не один список: это разные вопросы («где я в дереве», «что решено», «что
 /// сказали»), и смешивать их значило бы заставить человека разбирать строки по виду.
 fn draw_sidebar(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
     let mut lines: Vec<Line<'_>> = Vec::new();
-    lines.push(Line::from("контекст").style(Style::default().add_modifier(Modifier::BOLD)));
+    let heading = |text: &'static str| Line::from(text).style(theme.header_style());
+    lines.push(heading("контекст"));
     for entry in &app.context {
-        lines.push(Line::from(format!("  {entry}")));
+        lines.push(Line::from(format!("  {entry}")).style(theme.text_style()));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("заметки").style(Style::default().add_modifier(Modifier::BOLD)));
+    lines.push(heading("заметки"));
     for note in &app.notes {
-        lines.push(Line::from(format!("  {note}")));
+        lines.push(Line::from(format!("  {note}")).style(theme.dim_style()));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("комментарии").style(Style::default().add_modifier(Modifier::BOLD)));
+    lines.push(heading("комментарии"));
     for comment in &app.comments {
-        lines.push(Line::from(format!("  {comment}")));
+        lines.push(Line::from(format!("  {comment}")).style(theme.dim_style()));
     }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(ratatui::widgets::Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(" узел ")),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border_style())
+                    .title(" узел "),
+            ),
         area,
     );
 }
@@ -373,6 +460,7 @@ fn draw_sidebar(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::l
 /// Показываются ВСЕ поля сразу, а не одно: человек должен видеть, что он уже ввёл, иначе
 /// исправление опечатки в третьем поле требует помнить первые два.
 fn draw_form(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
     let title = if app.state.editing.is_some() {
         " правка узла "
     } else {
@@ -382,45 +470,62 @@ fn draw_form(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
     for (index, field) in app.state.fields.iter().enumerate() {
         let marker = if index == app.state.field { ">" } else { " " };
         let mut line = Line::from(format!("{marker} {:<11} {}", field.label, field.value));
-        if index == app.state.field {
-            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
-        }
+        line = if index == app.state.field {
+            line.style(theme.selected_style())
+        } else {
+            line.style(theme.text_style())
+        };
         lines.push(line);
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(
-        "Tab — следующее поле, Enter — записать, Esc — отменить",
-    ));
+    lines.push(
+        Line::from("Tab — следующее поле, Enter — записать, Esc — отменить")
+            .style(theme.dim_style()),
+    );
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.focus_style())
+                .title(title),
+        ),
         area,
     );
 }
 
 /// Поиск: строка запроса и результаты.
 fn draw_search(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
     let [query, results] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
     frame.render_widget(
-        Paragraph::new(Line::from(format!("/{}", app.state.input)))
-            .block(Block::default().borders(Borders::ALL).title(" поиск ")),
+        Paragraph::new(Line::from(format!("/{}", app.state.input)).style(theme.text_style()))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.focus_style())
+                    .title(" поиск "),
+            ),
         query,
     );
     let mut lines: Vec<Line<'_>> = Vec::new();
     for (index, (dot_id, title)) in app.state.results.iter().enumerate() {
         let mut line = Line::from(format!("{:<14} {title}", dot_id));
-        if index == app.state.result {
-            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
-        }
+        line = if index == app.state.result {
+            line.style(theme.selected_style())
+        } else {
+            line.style(theme.text_style())
+        };
         lines.push(line);
     }
     if lines.is_empty() {
-        lines.push(Line::from("  введите запрос"));
+        lines.push(Line::from("  введите запрос").style(theme.dim_style()));
     }
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(theme.border_style())
                 .title(" результат (Enter — открыть, Esc — назад) "),
         ),
         results,
@@ -429,79 +534,95 @@ fn draw_search(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
 
 /// Карточка узла: заголовок, поля и подсказка.
 fn draw_card(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
     let Some(row) = app.selected() else {
         frame.render_widget(
             Paragraph::new("узел не выбран")
-                .block(Block::default().borders(Borders::ALL).title(" карточка ")),
+                .style(theme.dim_style())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(theme.border_style())
+                        .title(" карточка "),
+                ),
             area,
         );
         return;
     };
+    let status = app.selected_status().unwrap_or("-");
+    let status_line = Line::from(format!(
+        "статус {}   приоритет {}   прогресс {}",
+        status, row.priority, row.progress
+    ))
+    .style(Style::default().fg(theme.status(status)));
+    let lease = match &row.lease_holder {
+        Some(holder) => {
+            Line::from(format!("держатель {holder}")).style(Style::default().fg(theme.leased))
+        }
+        None => Line::from("держатель -").style(theme.dim_style()),
+    };
     let lines = vec![
-        Line::from(row.dot_id.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
-        Line::from(row.title.clone()),
+        Line::from(row.dot_id.clone()).style(theme.header_style()),
+        Line::from(row.title.clone()).style(theme.text_style()),
         Line::from(""),
+        status_line,
         Line::from(format!(
-            "статус {}   приоритет {}   прогресс {}",
-            app.selected_status().unwrap_or("-"),
-            row.priority,
-            row.progress
-        )),
-        Line::from(format!(
-            "срок {}   держатель {}",
-            row.due_date.as_deref().unwrap_or("-"),
-            row.lease_holder.as_deref().unwrap_or("-")
-        )),
+            "покрыто {}   срок {}",
+            row.progress,
+            row.due_date.as_deref().unwrap_or("-")
+        ))
+        .style(theme.dim_style()),
+        lease,
         Line::from(""),
-        Line::from("m — комментарий, n — заметка, e — правка, Esc — назад"),
+        Line::from("m — комментарий, n — заметка, e — правка, Esc — назад")
+            .style(theme.dim_style()),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" карточка ")),
-        area,
-    );
-}
-
-/// Панель проектов: ключ, счётчик узлов, пометка активного и курсора панели.
-fn draw_panel(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
-    let mut lines: Vec<Line<'_>> = Vec::new();
-    for (index, project) in app.projects.iter().enumerate() {
-        let active = index == app.state.active;
-        let text = format!("{:<8} {:>4}", project.key, project.nodes);
-        let mut line = Line::from(text);
-        if active {
-            line = line.style(Style::default().add_modifier(Modifier::BOLD));
-        }
-        // Курсор панели виден только когда панель в фокусе: две одновременные пометки человек
-        // читает как «активны оба», и непонятно, что сдвинет `j`.
-        if active && app.state.focus == model::Focus::Projects {
-            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
-        }
-        lines.push(line);
-    }
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" проекты ")),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.focus_style())
+                .title(" карточка "),
+        ),
         area,
     );
 }
 
 /// Доска списком: строка на узел.
 fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
     let selected_flat = selected_index(&app.board, app.state.column, app.state.row);
     let mut rows: Vec<Row<'_>> = Vec::new();
     let mut offset = 0usize;
     for column in &app.board.columns {
         for (index, row) in column.rows.iter().enumerate() {
-            let holder = row.lease_holder.as_deref().unwrap_or("-");
+            let holder = match &row.lease_holder {
+                Some(holder) => Cell::from(holder.clone()).style(Style::default().fg(theme.leased)),
+                None => Cell::from("-").style(theme.dim_style()),
+            };
+            // Просрочка — отдельным флагом в названии: цвет строки уже занят статусом, и
+            // второй цвет на той же строке читался бы как «и то, и это».
+            let mut title = row.title.clone();
+            if row.days_overdue > 0 {
+                title.push_str(&format!("  просрочено {}", row.days_overdue));
+            }
             let mut line = Row::new(vec![
-                Cell::from(column.status.clone()),
-                Cell::from(row.dot_id.clone()),
-                Cell::from(row.priority.clone()),
-                Cell::from(row.progress.clone()),
-                Cell::from(holder.to_string()),
-                Cell::from(row.title.clone()),
+                Cell::from(column.status.clone())
+                    .style(Style::default().fg(theme.status(&column.status))),
+                Cell::from(row.dot_id.clone()).style(theme.text_style()),
+                Cell::from(row.priority.clone()).style(theme.dim_style()),
+                Cell::from(row.progress.clone()).style(theme.dim_style()),
+                holder,
+                Cell::from(title).style(if row.days_overdue > 0 {
+                    Style::default().fg(theme.overdue)
+                } else {
+                    theme.text_style()
+                }),
             ]);
+            // Зебра от фона темы: у светлых тем полосы светлее основы, у тёмных — темнее.
+            line = line.style(Style::default().bg(theme.zebra(index)));
             if Some(offset + index) == selected_flat {
-                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                line = line.style(theme.selected_style());
             }
             rows.push(line);
         }
@@ -516,7 +637,7 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
         "держатель",
         "название",
     ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(theme.header_style());
 
     frame.render_widget(
         Table::new(
@@ -531,7 +652,12 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
             ],
         )
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" доска ")),
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_for(app, model::Focus::Board))
+                .title(" доска "),
+        ),
         area,
     );
 }
@@ -542,10 +668,17 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
 /// нескольких колонках это единственное осмысленное соответствие, и оно делает переключение вида
 /// безболезненным — курсор остаётся на том же узле.
 fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let theme = app.theme;
     if app.board.columns.is_empty() {
         frame.render_widget(
             Paragraph::new("в проекте нет узлов")
-                .block(Block::default().borders(Borders::ALL).title(" канбан ")),
+                .style(theme.dim_style())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(theme.border_style())
+                        .title(" канбан "),
+                ),
             area,
         );
         return;
@@ -565,24 +698,41 @@ fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
                 Some(holder) => format!(" [{holder}]"),
                 None => String::new(),
             };
+            let selected = column_index == app.state.column && row_index == app.state.row;
             let mut line = Line::from(format!("{}{holder}", row.dot_id));
-            if column_index == app.state.column && row_index == app.state.row {
-                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
-            }
+            line = if selected {
+                line.style(theme.selected_style())
+            } else {
+                line.style(theme.text_style())
+            };
             lines.push(line);
             // Название — второй строкой: в колонке шириной в десять знаков оно не влезает рядом
             // с адресом, а обрезать название до «TUI: инт…» бессмысленно.
             let mut title = Line::from(format!("  {}", row.title));
-            if column_index == app.state.column && row_index == app.state.row {
-                title = title.style(Style::default().add_modifier(Modifier::REVERSED));
-            }
+            title = if selected {
+                title.style(theme.selected_style())
+            } else if row.days_overdue > 0 {
+                title.style(Style::default().fg(theme.overdue))
+            } else {
+                title.style(theme.dim_style())
+            };
             lines.push(title);
         }
         frame.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" {} ({}) ", column.status, column.count)),
+                    .border_style(if column_index == app.state.column {
+                        Style::default().fg(theme.status(&column.status))
+                    } else {
+                        theme.border_style()
+                    })
+                    .title(Span::styled(
+                        format!(" {} ({}) ", column.status, column.count),
+                        Style::default()
+                            .fg(theme.status(&column.status))
+                            .add_modifier(Modifier::BOLD),
+                    )),
             ),
             chunks[column_index],
         );
@@ -769,7 +919,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tasq-tui-run-{nanos}"));
         let outcome = crate::db::init(&dir, "RUN", "run").expect("init");
         let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-        run(&mut conn, None, true).expect("один кадр в обычный вывод без --project");
+        run(&mut conn, None, None, true).expect("один кадр в обычный вывод без --project");
     }
 
     /// Курсор ВИДЕН: строка под ним помечена реверсом, и помечена ровно одна.
@@ -830,17 +980,21 @@ mod tests {
             terminal.draw(|frame| draw(frame, &app)).expect("draw");
             let buffer = terminal.backend().buffer().clone();
             let mut found: Vec<String> = Vec::new();
+            // Выделение задаёт ТЕМА (цвет текста и фона), а не модификатор: иначе на терминале
+            // без поддержки реверса курсор был бы невидим, а на цветной теме — неотличим от
+            // обычной строки. Поэтому ищем строки с фоном выделения.
+            let selected_bg = app.theme.selected_bg;
             for y in 0..buffer.area().height {
                 let mut line = String::new();
-                let mut reversed = false;
+                let mut marked = false;
                 for x in 0..ONCE_WIDTH {
                     let cell = &buffer[(x, y)];
                     line.push_str(cell.symbol());
-                    if cell.style().add_modifier.contains(Modifier::REVERSED) {
-                        reversed = true;
+                    if cell.style().bg == Some(selected_bg) {
+                        marked = true;
                     }
                 }
-                if reversed {
+                if marked {
                     found.push(line);
                 }
             }

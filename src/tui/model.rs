@@ -146,6 +146,8 @@ pub enum Intent {
     ProjectDown,
     /// Переключиться на выбранный проект.
     ProjectOpen,
+    /// Следующая цветовая тема.
+    NextTheme,
     /// Запустить поиск по введённому запросу.
     SearchRun,
     /// Открыть найденный узел.
@@ -259,6 +261,7 @@ pub fn intent(mode: Mode, key: Key) -> Option<Intent> {
         K::Char('m') => Some(I::AddComment),
         K::Char('/') => Some(I::Search),
         K::Char('v') => Some(I::ToggleView),
+        K::Char('T') => Some(I::NextTheme),
         K::Tab => Some(I::FocusNext),
         K::Char('q') => Some(I::Quit),
         _ => None,
@@ -546,6 +549,7 @@ impl State {
                     O::Ignored
                 }
             }
+            I::NextTheme => O::Act(I::NextTheme),
             I::ToggleView => {
                 self.view = match self.view {
                     View::List => View::Kanban,

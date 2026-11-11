@@ -21,6 +21,18 @@ use crate::lease::Outcome as LeaseOutcome;
 use crate::overview;
 
 /// Экран целиком: данные и положение курсора.
+/// Уровень сообщения в строке состояния.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Level {
+    /// Справка: что произошло, но ни хорошо, ни плохо.
+    #[default]
+    Info,
+    /// Действие удалось.
+    Ok,
+    /// Отказ: действие не выполнено.
+    Error,
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     /// Доска в том виде, в каком её отдал `overview::board`.
@@ -29,12 +41,20 @@ pub struct App {
     pub state: State,
     /// Что сказать человеку в строке состояния (отказ последнего действия).
     pub message: Option<String>,
+    /// Чем это сообщение является: отказом, подтверждением или справкой.
+    ///
+    /// Уровень ХРАНИТСЯ, а не выводится из текста: попытка угадать его по двоеточию в строке
+    /// («тема: gruvbox» тоже с двоеточием) покрасила бы справку в цвет отказа — и человек,
+    /// увидев красное, искал бы поломку там, где её нет.
+    pub level: Level,
     /// Идентификатор сессии экрана: `TASQ_SESSION`, если задан, иначе свой.
     pub session: String,
     /// Все проекты базы — панель слева и переключатель в шапке.
     pub projects: Vec<crate::project::Summary>,
     /// Проект, который показан на доске. `None` — доска не загружена (экран только собран).
     pub project: Option<crate::project::Project>,
+    /// Цветовая тема: её переключает `T`, и она живёт на экране, а не в константе.
+    pub theme: crate::tui::theme::Theme,
     /// Боковая панель: цепочка контекста, заметки и комментарии выбранного узла.
     pub context: Vec<String>,
     pub notes: Vec<String>,
@@ -66,9 +86,11 @@ impl App {
             board,
             state: State::new(rows),
             message: None,
+            level: Level::default(),
             session: String::new(),
             projects: Vec::new(),
             project: None,
+            theme: crate::tui::theme::Theme::default(),
             context: Vec::new(),
             notes: Vec::new(),
             comments: Vec::new(),
@@ -256,6 +278,13 @@ impl App {
         Ok(())
     }
 
+    /// Следующая тема по кругу и запоминание выбора в строке состояния.
+    pub fn next_theme(&mut self) {
+        self.theme = self.theme.next();
+        let name = self.theme.name;
+        self.info(format!("тема: {name}"));
+    }
+
     /// Открывает форму создания узла.
     ///
     /// Поля фиксированы и идут в порядке, в котором человек о них думает: название, описание,
@@ -295,7 +324,7 @@ impl App {
         project: &crate::project::Project,
     ) -> crate::Result<()> {
         let Some(reference) = self.selected().map(|row| row.dot_id.clone()) else {
-            self.say("под курсором нет узла");
+            self.fail("под курсором нет узла");
             return Ok(());
         };
         let node = crate::node::resolve(conn, project, &reference)?;
@@ -326,7 +355,7 @@ impl App {
     /// Открывает ввод заметки или комментария к выбранному узлу.
     pub fn open_note(&mut self, kind: &str) {
         let Some(reference) = self.selected().map(|row| row.dot_id.clone()) else {
-            self.say("под курстором нет узла");
+            self.fail("под курсором нет узла");
             return;
         };
         self.state.fields = vec![model::Field {
@@ -552,17 +581,17 @@ impl App {
                     }
                 }
                 if self.state.results.is_empty() {
-                    self.say("ничего не найдено");
+                    self.info("ничего не найдено");
                 }
             }
-            Err(err) => self.say(describe(&err)),
+            Err(err) => self.fail(describe(&err)),
         }
     }
 
     /// Открывает найденный узел: переключает проект, если узел в чужом, и ставит на него курсор.
     fn open_result(&mut self, conn: &rusqlite::Connection, project: &crate::project::Project) {
         let Some((dot_id, _)) = self.state.results.get(self.state.result).cloned() else {
-            self.say("в результатах ничего не выбрано");
+            self.fail("в результатах ничего не выбрано");
             return;
         };
         // Ключ проекта — часть адреса: `TASQDEV-6` означает проект TASQDEV. Искать по нему, а не
@@ -571,20 +600,20 @@ impl App {
         match self.projects.iter().position(|summary| summary.key == key) {
             Some(index) if index != self.state.active => {
                 if let Err(err) = self.switch_project(conn, index) {
-                    self.say(describe(&err));
+                    self.fail(describe(&err));
                     return;
                 }
             }
             Some(_) => {}
             None => {
-                self.say(format!("проект {key} не найден в базе"));
+                self.fail(format!("проект {key} не найден в базе"));
                 return;
             }
         }
         if !self.select_by_id(&dot_id) {
             // Узел в другом проекте уже перечитан; если и теперь его нет — он вне доски
             // (закрыт фильтром доски, например), и об этом говорим прямо.
-            self.say(format!("{dot_id} нет на доске этого проекта"));
+            self.fail(format!("{dot_id} нет на доске этого проекта"));
             return;
         }
         self.state.mode = Mode::Node;
@@ -592,7 +621,7 @@ impl App {
         self.state.results.clear();
         let project = self.project.clone().unwrap_or_else(|| project.clone());
         if let Err(err) = self.reload_sidebar(conn, &project) {
-            self.say(describe(&err));
+            self.fail(describe(&err));
         }
     }
 
@@ -603,6 +632,19 @@ impl App {
     /// успешным действием.
     pub fn say(&mut self, text: impl Into<String>) {
         self.message = Some(text.into());
+        self.level = Level::Ok;
+    }
+
+    /// Справка: сообщение, которое не хвалит и не ругает.
+    pub fn info(&mut self, text: impl Into<String>) {
+        self.message = Some(text.into());
+        self.level = Level::Info;
+    }
+
+    /// Отказ: действие не выполнено.
+    pub fn fail(&mut self, text: impl Into<String>) {
+        self.message = Some(text.into());
+        self.level = Level::Error;
     }
 
     /// Снимает сообщение: следующий кадр его уже не показывает.
@@ -628,11 +670,11 @@ impl App {
         self.state.chosen_status = None;
         self.state.statuses.clear();
         let Some(current) = self.selected_status().map(str::to_string) else {
-            self.say("под курсором нет узла");
+            self.fail("под курсором нет узла");
             return;
         };
         let Some(from) = crate::status::Status::parse(&current) else {
-            self.say(format!("неизвестный статус на доске: {current}"));
+            self.fail(format!("неизвестный статус на доске: {current}"));
             return;
         };
         // Текущий статус из списка убирается: `can_transition(x, x, kind)` истинно по построению
@@ -673,7 +715,7 @@ impl App {
             return match self.switch_project(&*conn, index) {
                 Ok(()) => Outcome::Redraw,
                 Err(err) => {
-                    self.say(describe(&err));
+                    self.fail(describe(&err));
                     Outcome::Redraw
                 }
             };
@@ -686,7 +728,7 @@ impl App {
             }
             Intent::Edit => {
                 if let Err(err) = self.open_edit(&*conn, project) {
-                    self.say(describe(&err));
+                    self.fail(describe(&err));
                 }
                 return Outcome::Redraw;
             }
@@ -696,6 +738,10 @@ impl App {
             }
             Intent::AddComment => {
                 self.open_note("comment");
+                return Outcome::Redraw;
+            }
+            Intent::NextTheme => {
+                self.next_theme();
                 return Outcome::Redraw;
             }
             Intent::SearchRun => {
@@ -723,7 +769,7 @@ impl App {
         let reference = match self.selected() {
             Some(row) => row.dot_id.clone(),
             None => {
-                self.say("под курсором нет узла");
+                self.fail("под курсором нет узла");
                 return Outcome::Redraw;
             }
         };
@@ -763,6 +809,10 @@ impl App {
                         "статус изменён"
                     })
             }
+            Intent::NextTheme => {
+                self.next_theme();
+                Ok("")
+            }
             Intent::SubmitForm => self.submit(conn, project),
             Intent::SearchRun | Intent::SearchOpen | Intent::ResultDown | Intent::ResultUp => {
                 Ok("")
@@ -781,7 +831,7 @@ impl App {
             Err(err) => {
                 // Подсказка идёт рядом с отказом: в терминале нет места на два экрана, а без
                 // подсказки `UNMET_PREREQUISITES` читается как «нельзя» без «что сделать».
-                self.say(describe(&err));
+                self.fail(describe(&err));
             }
         }
         // Перечитывание обязательно: иначе строка аренды останется на экране после отпускания,
@@ -789,7 +839,7 @@ impl App {
         // возвращается на тот же УЗЕЛ, а не на те же координаты: действие могло переехать его в
         // другую колонку.
         if let Err(err) = self.refresh(conn, project) {
-            self.say(describe(&err));
+            self.fail(describe(&err));
         } else {
             self.select_by_id(&reference);
         }
@@ -803,7 +853,7 @@ impl App {
 /// обрезка справа была безопасной: код различает отказы машинно, текст называет поле, подсказка
 /// говорит, что делать. Показывать только код с подсказкой (как было) значило терять имя поля —
 /// и `INVALID_VALUE` на пустом названии читался как «что-то не так с каким-то значением».
-fn describe(err: &crate::error::Error) -> String {
+pub fn describe(err: &crate::error::Error) -> String {
     format!("{}: {err} — {}", err.code(), err.hint())
 }
 

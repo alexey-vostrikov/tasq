@@ -419,6 +419,9 @@ enum Command {
         /// Draw one frame to standard output and exit (for CI and documentation)
         #[arg(long)]
         once: bool,
+        /// Colour theme: default, default-light, gruvbox, gruvbox-light, nord, nord-light
+        #[arg(long, value_name = "NAME", env = "TASQ_THEME")]
+        theme: Option<String>,
     },
     /// Run the MCP server over stdio
     Mcp {
@@ -2405,14 +2408,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Tui { once } => {
+        Command::Tui { once, theme } => {
             // Проект здесь не обязателен: `open` требует `--project` при нескольких проектах, а
             // экран сам показывает все и даёт переключатель. База находится там же, где у
             // остальных команд.
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
             let mut conn = db::open_checked(&path)?;
-            tui::run(&mut conn, cli.project.as_deref(), *once)?;
+            tui::run(&mut conn, cli.project.as_deref(), theme.as_deref(), *once)?;
             Ok(ExitCode::SUCCESS)
         }
 
