@@ -25,6 +25,8 @@ pub enum Mode {
     Node,
     /// Выбор исхода работы: завершена, снята, провалена.
     Outcome,
+    /// Выбор нового статуса из того, что разрешает матрица.
+    Status,
     /// Подтверждение опасного действия.
     Confirm,
     /// Форма узла: создание или правка.
@@ -42,6 +44,7 @@ impl Mode {
             Mode::Board => "доска",
             Mode::Node => "узел",
             Mode::Outcome => "исход работы",
+            Mode::Status => "новый статус",
             Mode::Confirm => "подтверждение",
             Mode::Form => "форма",
             Mode::Search => "поиск",
@@ -100,6 +103,10 @@ pub enum Intent {
     ReleaseWork,
     /// Работа провалена: узел возвращается в `todo`, причина в чекпойнте.
     FailWork,
+    /// Выбран статус под номером: буква — это позиция в списке допустимых.
+    ChooseStatus(char),
+    /// Подтверждённый переход в выбранный статус.
+    ApplyStatus,
 }
 
 /// Намерение по режиму и клавише; `None` — клавиша здесь ничего не значит.
@@ -121,6 +128,15 @@ pub fn intent(mode: Mode, key: Key) -> Option<Intent> {
                 K::Tab | K::Down => Some(I::FieldNext),
                 K::BackTab | K::Up => Some(I::FieldPrev),
                 K::Enter => Some(I::Confirm),
+                K::Esc => Some(I::Cancel),
+                _ => None,
+            };
+        }
+        Mode::Status => {
+            // Номера, а не буквы: список допустимых переходов приходит из матрицы и меняется от
+            // узла к узлу, поэтому фиксированной таблицы клавиш здесь быть не может.
+            return match key {
+                K::Char(c @ '1'..='9') => Some(I::ChooseStatus(c)),
                 K::Esc => Some(I::Cancel),
                 _ => None,
             };
@@ -208,6 +224,13 @@ pub struct State {
     pub back_to: Option<Mode>,
     /// Что подтверждают, пока экран `Confirm`.
     pub pending: Option<Intent>,
+    /// Допустимые переходы из текущего статуса — их нумерует экран выбора.
+    ///
+    /// Заполняется вызывающим перед открытием выбора: матрица и вид узла живут в библиотеке, и
+    /// второй их экземпляр в модели разошёлся бы с первым.
+    pub statuses: Vec<String>,
+    /// Статус, выбранный под номером и ждущий подтверждения.
+    pub chosen_status: Option<String>,
 }
 
 impl State {
@@ -323,22 +346,38 @@ impl State {
                 O::Ask(intent)
             }
             I::ChangeStatus => {
-                self.back_to = Some(self.mode);
-                self.pending = Some(intent);
+                // Не свободный ввод, а список из матрицы: набрать недопустимый статус руками
+                // нельзя, и отказ приходит не из глубины SQL.
+                // Пустой список — это «отсюда никуда нельзя»: экран выбора не открывается, а
+                // что сказать человеку, решает вызывающий (у модели нет строки состояния).
+                if self.statuses.is_empty() {
+                    return O::Ignored;
+                }
+                self.mode = Mode::Status;
+                O::Redraw
+            }
+            I::ChooseStatus(digit) => {
+                let index = (digit as u8).wrapping_sub(b'1') as usize;
+                let Some(status) = self.statuses.get(index).cloned() else {
+                    return O::Ignored;
+                };
+                self.chosen_status = Some(status);
+                self.pending = Some(I::ApplyStatus);
+                self.back_to = Some(Mode::Board);
                 self.mode = Mode::Confirm;
-                O::Ask(intent)
+                O::Ask(I::ApplyStatus)
             }
             I::Cancel => {
-                // Отмена в выборе исхода возвращает на доску: иначе экран остаётся в режиме,
-                // из которого нет выхода, кроме выбора.
-                if self.mode == Mode::Outcome {
+                // Отмена в выборе (исхода или статуса) возвращает на доску: иначе экран остаётся
+                // в режиме, из которого нет выхода, кроме выбора.
+                if matches!(self.mode, Mode::Outcome | Mode::Status) {
                     self.mode = Mode::Board;
                     O::Redraw
                 } else {
                     O::Ignored
                 }
             }
-            I::Confirm => O::Ignored,
+            I::Confirm | I::ApplyStatus => O::Ignored,
             I::Claim | I::Create | I::Edit | I::AddNote | I::AddComment => O::Act(intent),
         }
     }
@@ -544,21 +583,20 @@ mod tests {
     /// Опасные действия спрашивают подтверждение, безопасные — нет.
     #[test]
     fn risky_actions_ask_and_safe_ones_do_not() {
-        // Смена статуса спрашивает сразу; отпускание сперва спросит ИСХОД, а подтверждение —
-        // после него (см. `releasing_asks_for_the_outcome_first`).
+        // Смена статуса открывает ВЫБОР из матрицы, а подтверждение спрашивается после выбора
+        // (см. `status_choice_lists_the_matrix_and_confirms`). Пустой список допустимых —
+        // «отсюда никуда», и экран не открывается.
         let mut state = State::new(vec![1]);
-        assert_eq!(state.apply(I::ChangeStatus), Outcome::Ask(I::ChangeStatus));
+        assert_eq!(state.apply(I::ChangeStatus), Outcome::Ignored);
         assert_eq!(
-            state.pending,
-            Some(I::ChangeStatus),
-            "не записано, что подтверждают"
+            state.mode,
+            Mode::Board,
+            "открылся выбор без допустимых статусов"
         );
-        assert_eq!(state.mode, Mode::Confirm);
-        assert_eq!(
-            state.apply(I::Confirm),
-            Outcome::Act(I::ChangeStatus),
-            "не подтвердилось"
-        );
+
+        state.statuses = vec!["todo".to_string(), "in_progress".to_string()];
+        assert_eq!(state.apply(I::ChangeStatus), Outcome::Redraw);
+        assert_eq!(state.mode, Mode::Status);
         for intent in [I::Claim, I::Create, I::Edit, I::AddNote, I::AddComment] {
             let mut state = State::new(vec![1]);
             assert_eq!(
@@ -682,5 +720,89 @@ mod tests {
         assert_eq!(state.apply(I::Cancel), Outcome::Redraw);
         assert_eq!(state.mode, Mode::Board);
         assert_eq!(state.pending, None);
+    }
+
+    /// Выбор статуса: список приходит из матрицы, номер выбирает, подтверждение — после.
+    #[test]
+    fn status_choice_lists_the_matrix_and_confirms() {
+        let mut state = State::new(vec![1]);
+        state.statuses = vec![
+            "todo".to_string(),
+            "in_progress".to_string(),
+            "done".to_string(),
+        ];
+        assert_eq!(state.apply(I::ChangeStatus), Outcome::Redraw);
+        assert_eq!(state.mode, Mode::Status);
+
+        assert_eq!(
+            intent(Mode::Status, K::Char('2')),
+            Some(I::ChooseStatus('2'))
+        );
+        assert_eq!(
+            state.apply(I::ChooseStatus('2')),
+            Outcome::Ask(I::ApplyStatus)
+        );
+        assert_eq!(state.chosen_status.as_deref(), Some("in_progress"));
+        assert_eq!(state.mode, Mode::Confirm);
+
+        assert_eq!(state.apply(I::Confirm), Outcome::Act(I::ApplyStatus));
+        assert_eq!(
+            state.mode,
+            Mode::Board,
+            "после подтверждения экран не вернулся на доску"
+        );
+        assert_eq!(
+            state.chosen_status.as_deref(),
+            Some("in_progress"),
+            "выбранный статус потерян до записи"
+        );
+    }
+
+    /// Номер за пределами списка ничего не выбирает: иначе `9` при двух допустимых переходах
+    /// подставил бы несуществующий статус.
+    #[test]
+    fn a_number_outside_the_list_chooses_nothing() {
+        let mut state = State::new(vec![1]);
+        state.statuses = vec!["todo".to_string()];
+        state.apply(I::ChangeStatus);
+        assert_eq!(state.apply(I::ChooseStatus('5')), Outcome::Ignored);
+        assert_eq!(state.chosen_status, None);
+        assert_eq!(state.mode, Mode::Status, "выбор закрылся без выбора");
+    }
+
+    /// В выборе статуса работают только цифры и Esc: `q` не выходит, `j` не двигает курсор —
+    /// иначе случайное нажатие сменило бы статус узла.
+    #[test]
+    fn only_digits_and_escape_in_the_status_chooser() {
+        for key in [K::Char('q'), K::Char('j'), K::Enter, K::Tab, K::Char('0')] {
+            assert_eq!(intent(Mode::Status, key), None, "{key:?} принята как выбор");
+        }
+        assert_eq!(intent(Mode::Status, K::Esc), Some(I::Cancel));
+        assert_eq!(
+            intent(Mode::Status, K::Char('1')),
+            Some(I::ChooseStatus('1'))
+        );
+        assert_eq!(
+            intent(Mode::Status, K::Char('9')),
+            Some(I::ChooseStatus('9'))
+        );
+    }
+
+    /// Отмена после выбранного статуса его не применяет: экран возвращается на доску, а узел
+    /// остаётся как был.
+    #[test]
+    fn cancelling_the_confirmation_drops_the_chosen_status() {
+        let mut state = State::new(vec![1]);
+        state.statuses = vec!["in_progress".to_string()];
+        state.apply(I::ChangeStatus);
+        state.apply(I::ChooseStatus('1'));
+        assert_eq!(state.mode, Mode::Confirm);
+        assert_eq!(state.apply(I::Cancel), Outcome::Redraw);
+        assert_eq!(state.mode, Mode::Board);
+        assert_eq!(
+            state.apply(I::ApplyStatus),
+            Outcome::Ignored,
+            "отменённый переход всё равно применился"
+        );
     }
 }

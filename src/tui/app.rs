@@ -31,6 +31,9 @@ pub struct App {
     pub message: Option<String>,
     /// Идентификатор сессии экрана: `TASQ_SESSION`, если задан, иначе свой.
     pub session: String,
+    /// Вид узла по адресу: от него зависит, какие статусы матрица разрешает (эпик не бывает
+    /// `todo`, задача не бывает `planned`). Читается вместе с доской одним запросом.
+    pub kinds: HashMap<String, crate::status::Kind>,
     /// Токены аренды по адресам узлов: без них `release` ответит `NOT_YOUR_ATTEMPT`.
     ///
     /// Живут в памяти и теряются при выходе — что честно: аренда всё равно истечёт, и узел
@@ -56,6 +59,7 @@ impl App {
             state: State::new(rows),
             message: None,
             session: String::new(),
+            kinds: HashMap::new(),
             tokens: HashMap::new(),
         }
     }
@@ -89,6 +93,7 @@ impl App {
             .iter()
             .map(|column| column.rows.len())
             .collect();
+        self.load_kinds(conn, project)?;
         // Курсор после перечитывания может оказаться за концом колонки: узлы закрывают, колонки
         // исчезают. Без подтягивания `Enter` открыл бы пустоту.
         if self.state.column >= self.state.rows.len() {
@@ -106,6 +111,39 @@ impl App {
             self.select_by_id(&reference);
         }
         Ok(())
+    }
+
+    /// Перечитывает виды узлов проекта одним запросом.
+    ///
+    /// Отдельным запросом, а не полем в `BoardRow`: доска — публичный формат `tasq board --json`,
+    /// и добавлять в него поле ради экрана значило бы менять контракт ради удобства одного
+    /// потребителя.
+    pub fn load_kinds(
+        &mut self,
+        conn: &rusqlite::Connection,
+        project: &crate::project::Project,
+    ) -> crate::Result<()> {
+        let mut stmt = conn
+            .prepare("SELECT path, kind FROM nodes WHERE project_id = ?1 AND deleted_at IS NULL")?;
+        let rows = stmt.query_map([project.id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut kinds = HashMap::new();
+        for row in rows {
+            let (path, kind) = row?;
+            if let Some(kind) = crate::status::Kind::parse(&kind) {
+                kinds.insert(project.dot_id(&path), kind);
+            }
+        }
+        self.kinds = kinds;
+        Ok(())
+    }
+
+    /// Вид узла под курсором (по умолчанию — задача: неизвестный вид не должен запрещать выбор).
+    pub fn kind_here(&self) -> crate::status::Kind {
+        self.selected()
+            .and_then(|row| self.kinds.get(&row.dot_id).copied())
+            .unwrap_or(crate::status::Kind::Task)
     }
 
     /// Ставит курсор на узел с этим адресом, если он ещё на доске.
@@ -157,7 +195,12 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Press => Outcome::Ignored,
             Event::Key(key) => match key_of(key) {
                 Some(key) => match model::intent(self.state.mode, key) {
-                    Some(intent) => self.state.apply(intent),
+                    Some(intent) => {
+                        if intent == Intent::ChangeStatus {
+                            self.prepare_statuses();
+                        }
+                        self.state.apply(intent)
+                    }
                     None => Outcome::Ignored,
                 },
                 None => Outcome::Ignored,
@@ -188,6 +231,41 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Заполняет список допустимых переходов для текущего узла.
+    ///
+    /// Список берётся из матрицы (`status::allowed_next`) и вида узла: экран не решает сам, куда
+    /// можно перейти, он показывает то, что разрешено. Пустой список означает «отсюда никуда» —
+    /// и тогда говорим об этом прямо, вместо того чтобы открыть пустой экран.
+    fn prepare_statuses(&mut self) {
+        self.state.chosen_status = None;
+        self.state.statuses.clear();
+        let Some(current) = self.selected_status().map(str::to_string) else {
+            self.say("под курсором нет узла");
+            return;
+        };
+        let Some(from) = crate::status::Status::parse(&current) else {
+            self.say(format!("неизвестный статус на доске: {current}"));
+            return;
+        };
+        // Текущий статус из списка убирается: `can_transition(x, x, kind)` истинно по построению
+        // (это «перехода нет», а не переход), и на экране выбора он был бы строкой, которая ничего
+        // не меняет. Правило матрицы при этом не трогается — фильтр живёт в интерфейсе.
+        let next: Vec<_> = crate::status::allowed_next(from, self.kind_here())
+            .into_iter()
+            .filter(|status| *status != from)
+            .collect();
+        if next.is_empty() {
+            self.say(format!(
+                "из статуса {current} матрица не разрешает переходов"
+            ));
+            return;
+        }
+        self.state.statuses = next
+            .iter()
+            .map(|status| status.as_str().to_string())
+            .collect();
     }
 
     /// Выполняет просьбу модели против базы и перечитывает доску.
@@ -231,10 +309,21 @@ impl App {
                     None => Err(crate::error::Error::NotYourAttempt),
                 }
             }
-            Intent::ChangeStatus => Err(crate::error::Error::InvalidValue {
-                field: "status".to_string(),
-                value: "выбор статуса — отдельное действие".to_string(),
-            }),
+            Intent::ApplyStatus => {
+                let Some(status) = self.state.chosen_status.clone() else {
+                    return Outcome::Redraw;
+                };
+                let kind = self.kind_here();
+                actions::next_status(self.selected_status().unwrap_or_default(), kind, &status)
+                    .and_then(|status| actions::set_status(conn, project, &reference, status))
+                    .map(|()| {
+                        // Пометка в памяти: имя статуса нужно и после записи, а `chosen_status`
+                        // забирается ниже.
+                        self.state.chosen_status = None;
+                        "статус изменён"
+                    })
+            }
+            Intent::ChangeStatus | Intent::ChooseStatus(_) => Ok(""),
             _ => Ok(""),
         };
 
@@ -798,5 +887,134 @@ mod tests {
                 .expect("статус")
             });
         assert_eq!(status, "done", "узел не закрыт: {status}");
+    }
+
+    /// `s` на живой доске: список из матрицы, номер, подтверждение, запись в базу.
+    ///
+    /// Проверяется и то, что статус узла ЭПИКА не получает `todo`: вид узла приходит из базы
+    /// отдельным запросом, и ошибка в нём дала бы список, которого матрица не разрешает.
+    #[test]
+    fn the_status_key_writes_the_chosen_status() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-status-key-{nanos}"));
+        let outcome = crate::db::init(&dir, "STK", "stk").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        let created = crate::node::create(
+            &mut conn,
+            &project,
+            crate::node::NewNode {
+                parent: None,
+                title: "узел со статусом",
+                kind: None,
+                description: None,
+                priority: None,
+                due_date: None,
+                estimated_hours: None,
+                weight: None,
+                source_ref: None,
+                branch: None,
+            },
+        )
+        .expect("node");
+
+        let board = crate::overview::board(&conn, &project).expect("board");
+        let mut app = App::with_session(board, "sess-status");
+        app.load_kinds(&conn, &project).expect("виды узлов");
+        assert_eq!(
+            app.kind_here(),
+            crate::status::Kind::Epic,
+            "корневой узел должен быть эпиком"
+        );
+
+        // Открыли выбор.
+        assert_eq!(app.step(key(KeyCode::Char('s'))), Outcome::Redraw);
+        assert_eq!(app.state.mode, Mode::Status);
+        assert!(
+            !app.state.statuses.is_empty(),
+            "список допустимых переходов пуст"
+        );
+        // Список совпадает с матрицей минус текущий статус: экран показывает то, что разрешено
+        // библиотекой, и не добавляет от себя ни одного перехода.
+        let expected: Vec<String> =
+            crate::status::allowed_next(crate::status::Status::Idea, crate::status::Kind::Epic)
+                .into_iter()
+                .filter(|status| *status != crate::status::Status::Idea)
+                .map(|status| status.as_str().to_string())
+                .collect();
+        assert_eq!(
+            app.state.statuses, expected,
+            "список экрана разошёлся с матрицей"
+        );
+
+        // Выбрали первый и подтвердили.
+        let first = app.state.statuses[0].clone();
+        assert_eq!(
+            app.step(key(KeyCode::Char('1'))),
+            Outcome::Ask(Intent::ApplyStatus)
+        );
+        assert_eq!(
+            app.step(key(KeyCode::Char('y'))),
+            Outcome::Act(Intent::ApplyStatus)
+        );
+        app.perform(&mut conn, &project, Intent::ApplyStatus);
+        assert_eq!(app.message.as_deref(), Some("статус изменён"));
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM nodes WHERE id = ?1",
+                [created.id],
+                |row| row.get(0),
+            )
+            .expect("статус");
+        assert_eq!(status, first, "записан не выбранный статус");
+    }
+
+    /// Отказ перехода уходит в строку состояния, а не выходит из цикла: недопустимая пара
+    /// набирается и через номер, если список устарел между чтением и нажатием.
+    #[test]
+    fn a_refused_transition_explains_itself() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-status-refuse-{nanos}"));
+        let outcome = crate::db::init(&dir, "STR", "str").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let project = crate::project::first_project(&conn).expect("project");
+        crate::node::create(
+            &mut conn,
+            &project,
+            crate::node::NewNode {
+                parent: None,
+                title: "узел",
+                kind: None,
+                description: None,
+                priority: None,
+                due_date: None,
+                estimated_hours: None,
+                weight: None,
+                source_ref: None,
+                branch: None,
+            },
+        )
+        .expect("node");
+        let board = crate::overview::board(&conn, &project).expect("board");
+        let mut app = App::with_session(board, "sess-refuse");
+        // Список, которого матрица не даёт: переход `idea → done` недопустим.
+        app.state.chosen_status = Some("done".to_string());
+        app.perform(&mut conn, &project, Intent::ApplyStatus);
+        let message = app.message.clone().unwrap_or_default();
+        assert!(
+            message.starts_with("INVALID_TRANSITION"),
+            "отказ не назван кодом: {message}"
+        );
+        assert!(
+            message.len() > "INVALID_TRANSITION".len() + 2,
+            "у отказа нет подсказки: {message}"
+        );
     }
 }

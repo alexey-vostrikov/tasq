@@ -26,6 +26,8 @@ use crate::error::Result;
 use crate::overview;
 use crate::project::Project;
 
+use model::Mode;
+
 /// Ширина кадра в режиме `--once`.
 ///
 /// Фиксированная, а не по размеру терминала: у CI и у файла с картинкой размера нет, а кадр,
@@ -57,6 +59,9 @@ pub fn run(conn: &mut Connection, project: &Project, once: bool) -> Result<()> {
     }
 
     let mut app = app::App::new(board);
+    // Вид узлов читается сразу: от него зависит список допустимых статусов, а первое нажатие `s`
+    // может прийти раньше первого тика.
+    app.load_kinds(&*conn, project)?;
     // `Error::Io` принимает `std::io::Error` через `#[from]`, поэтому `?` работает и на
     // ошибках ratatui: они того же типа. А вот отсутствие терминала — отдельный код: без tty
     // `enable_raw_mode` отдаёт `No such device or address`, и как `STORAGE_ERROR` это читалось
@@ -231,6 +236,22 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
         "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, q — выход",
         app.state.mode.title()
     );
+    // Экран выбора статуса показывает САМ список: номера без подписей ничего не значат, а держать
+    // их в голове человек не обязан.
+    let mode_text = match app.state.mode {
+        Mode::Status => {
+            let mut text = String::from("новый статус:  ");
+            for (index, status) in app.state.statuses.iter().enumerate() {
+                text.push_str(&format!("{} {status}   ", index + 1));
+            }
+            text.push_str("Esc — отмена");
+            text
+        }
+        _ => match app.pending() {
+            Some(intent) => format!("подтвердить {intent:?}?  y / n"),
+            None => String::new(),
+        },
+    };
 
     // Четыре полосы: счётчики (3), таблица (всё остальное), строка режима и подсказка (по 1).
     let [top, body, mode_line, hint_line] = Layout::vertical([
@@ -262,13 +283,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
         body,
     );
     frame.render_widget(Paragraph::new(Line::from(hint)), hint_line);
-    frame.render_widget(
-        Paragraph::new(Line::from(match app.pending() {
-            Some(intent) => format!("подтвердить {intent:?}?  y / n"),
-            None => String::new(),
-        })),
-        mode_line,
-    );
+    frame.render_widget(Paragraph::new(Line::from(mode_text)), mode_line);
 }
 
 /// Номер строки в плоском списке всех строк доски.
