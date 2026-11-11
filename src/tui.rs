@@ -819,7 +819,19 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
     ])
     .style(theme.header_style());
 
-    frame.render_widget(
+    // Прокрутка: до этого таблица рисовала ВСЕ строки, и на доске длиннее экрана курсор уходил
+    // за нижний край — клавиши двигали его, а видно было только начало. `visible` — сколько строк
+    // влезает: рамка сверху и снизу плюс строка шапки.
+    //
+    // `Table` сам окно не двигает: смещение живёт в `TableState`, поэтому таблица рисуется
+    // состоятельной. Состояние создаётся на каждый кадр — держать его в `App` значило бы
+    // синхронизировать два источника одного числа (смещение я считаю из курсора и высоты), а
+    // рассинхрон здесь выглядит как «список уехал и курсора не видно».
+    let visible = usize::from(area.height.saturating_sub(3)).max(1);
+    let mut table_state = ratatui::widgets::TableState::default();
+    *table_state.offset_mut() = scroll_offset(selected_flat.unwrap_or(0), visible);
+
+    frame.render_stateful_widget(
         Table::new(
             rows,
             [
@@ -839,16 +851,28 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
                 .title(" доска "),
         ),
         area,
+        &mut table_state,
     );
 }
 
-/// Доска канбаном: колонки статусов рядом, узлы внутри колонки.
+/// Доска канбаном: колонки статусов рядом, узлы внутри колонки, внизу — текст задачи.
 ///
 /// Тот же курсор, что у списка: `h`/`l` ходят по колонкам, `j`/`k` — по строкам внутри. На
 /// нескольких колонках это единственное осмысленное соответствие, и оно делает переключение вида
 /// безболезненным — курсор остаётся на том же узле.
+///
+/// Нижние 20 % экрана отданы тексту выбранной задачи. В колонке шириной в десять знаков от
+/// названия остаётся «TUI: инт…», и без панели канбан показывает адреса, а не работу.
 fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
     let theme = app.theme;
+    // Пять строк — минимум, при котором панель текста ещё что-то says: две строки под доску и
+    // три под текст. Ниже этого делить экран бессмысленно, и панель не рисуется.
+    let [board_area, detail_area] = if area.height >= 10 {
+        Layout::vertical([Constraint::Percentage(80), Constraint::Percentage(20)]).areas(area)
+    } else {
+        [area, ratatui::layout::Rect::default()]
+    };
+
     if app.board.columns.is_empty() {
         frame.render_widget(
             Paragraph::new("в проекте нет узлов")
@@ -859,21 +883,28 @@ fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
                         .border_style(theme.border_style())
                         .title(" канбан "),
                 ),
-            area,
+            board_area,
         );
+        draw_detail(frame, app, detail_area);
         return;
     }
+
     let constraints: Vec<Constraint> = app
         .board
         .columns
         .iter()
         .map(|_| Constraint::Ratio(1, app.board.columns.len() as u32))
         .collect();
-    let chunks = Layout::horizontal(constraints).split(area);
+    let chunks = Layout::horizontal(constraints).split(board_area);
 
     for (column_index, column) in app.board.columns.iter().enumerate() {
+        // В колонке на узел приходится ДВЕ строки (адрес и название), поэтому влезает вдвое
+        // меньше узлов, чем строк по высоте; две строки при этом заняты рамкой.
+        let visible = (usize::from(chunks[column_index].height.saturating_sub(2)) / 2).max(1);
+        let scroll = scroll_offset(app.state.row, visible);
+
         let mut lines: Vec<Line<'_>> = Vec::new();
-        for (row_index, row) in column.rows.iter().enumerate() {
+        for (row_index, row) in column.rows.iter().enumerate().skip(scroll).take(visible) {
             let holder = match row.lease_holder.as_deref() {
                 Some(holder) => format!(" [{holder}]"),
                 None => String::new(),
@@ -917,6 +948,65 @@ fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::la
             chunks[column_index],
         );
     }
+
+    draw_detail(frame, app, detail_area);
+}
+
+/// Панель текста выбранной задачи под канбаном.
+///
+/// Описание берётся из базы (`App::detail`), а не из доски: в `overview::board` его нет вовсе, и
+/// панель, собранная из доски, показывала бы только заголовок — то же, что видно в колонке.
+fn draw_detail(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let theme = app.theme;
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    match app.selected() {
+        Some(row) => {
+            lines.push(
+                Line::from(format!(
+                    "{}   {}   {}",
+                    row.dot_id, row.priority, row.progress
+                ))
+                .style(theme.header_style()),
+            );
+            lines.push(Line::from(row.title.clone()).style(theme.text_style()));
+            if app.detail.trim().is_empty() {
+                lines.push(Line::from("описания нет").style(theme.dim_style()));
+            } else {
+                // Описание многострочное: каждая строка отдельной `Line`, иначе переносы съест
+                // `Paragraph` и абзацы склеятся в один.
+                for line in app.detail.lines() {
+                    lines.push(Line::from(line.to_string()).style(theme.dim_style()));
+                }
+            }
+        }
+        None => lines.push(Line::from("узел не выбран").style(theme.dim_style())),
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.border_style())
+                .title(" задача "),
+        ),
+        area,
+    );
+}
+
+/// Смещение прокрутки, при котором выбранная строка видна.
+///
+/// Правило простое: пока курсор влезает, список не двигается (иначе он «дёргается» на каждом
+/// шаге); как только он уходит за нижний край, прокрутка держит его последней видимой строкой.
+/// Отдельная функция, потому что проверяется арифметикой, а не глазами на экране.
+///
+/// Сверху запас не делается осознанно: `ratatui::Table::offset` двигает окно вниз и возвращает
+/// его к нулю, когда курсор возвращается — контекст над строкой появляется сам, без второго
+/// правила в коде.
+fn scroll_offset(selected: usize, visible: usize) -> usize {
+    let visible = visible.max(1);
+    selected.saturating_sub(visible - 1)
 }
 
 /// Номер строки в плоском списке всех строк доски.
@@ -1464,5 +1554,167 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Смещение прокрутки: пока курсор влезает — ноль, дальше держим его последней видимой
+    /// строкой.
+    #[test]
+    fn the_scroll_keeps_the_cursor_visible() {
+        // Курсор среди первых видимых строк — список не двигается.
+        assert_eq!(scroll_offset(0, 10), 0);
+        assert_eq!(scroll_offset(9, 10), 0);
+        // Шаг за нижний край — окно сдвигается ровно на столько, чтобы строка попала внутрь.
+        assert_eq!(scroll_offset(10, 10), 1);
+        assert_eq!(scroll_offset(25, 10), 16);
+        // Последняя строка списка видна: выше неё ровно `visible - 1` строк.
+        assert_eq!(scroll_offset(999, 10), 990);
+        // Вырожденные случаи: одна видимая строка и нулевая высота не дают деления на ноль.
+        assert_eq!(scroll_offset(5, 1), 5);
+        assert_eq!(scroll_offset(5, 0), 5);
+    }
+
+    /// Длинный список: прокрутка реально применяется, и выбранная строка попадает в кадр.
+    ///
+    /// Проверяется по буферу, а не по числу: ошибка здесь не ломает ни модель, ни сборку — она
+    /// просто перестаёт показывать строку, которую человек выбрал.
+    #[test]
+    fn a_long_list_scrolls_to_the_selected_row() {
+        let rows: Vec<overview::BoardRow> = (1..=40)
+            .map(|n| overview::BoardRow {
+                dot_id: format!("LONG-{n}"),
+                title: format!("задача {n}"),
+                priority: "medium".to_string(),
+                due_date: None,
+                days_overdue: 0,
+                lease_holder: None,
+                progress: "0%".to_string(),
+            })
+            .collect();
+        let mut app = app::App::new(overview::Board {
+            project: "LONG".to_string(),
+            columns: vec![overview::BoardColumn {
+                status: "todo".to_string(),
+                count: rows.len(),
+                rows,
+            }],
+            overdue: 0,
+            leased: 0,
+            open: 40,
+            done: 0,
+        });
+        app.state.row = 35;
+
+        // Кадр на двенадцать строк: под таблицу остаётся девять — последняя видимая это 9-я.
+        let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 14)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area().height {
+            for x in 0..ONCE_WIDTH {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("LONG-36"),
+            "выбранная строка не попала в кадр:\n{text}"
+        );
+        assert!(
+            !text.contains("LONG-1 "),
+            "первая строка осталась на экране, прокрутки нет:\n{text}"
+        );
+
+        // Курсор вернулся в начало — окно тоже.
+        app.state.row = 0;
+        let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 14)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area().height {
+            for x in 0..ONCE_WIDTH {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("LONG-1 "),
+            "список не вернулся к началу:\n{text}"
+        );
+    }
+
+    /// Канбан: нижние 20 % экрана — текст задачи, и это описание из базы, а не заголовок.
+    #[test]
+    fn the_kanban_shows_the_task_text_at_the_bottom() {
+        let board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: vec![overview::BoardColumn {
+                status: "todo".to_string(),
+                count: 1,
+                rows: vec![overview::BoardRow {
+                    dot_id: "DEMO-1".to_string(),
+                    title: "короткое имя".to_string(),
+                    priority: "high".to_string(),
+                    due_date: None,
+                    days_overdue: 0,
+                    lease_holder: None,
+                    progress: "0%".to_string(),
+                }],
+            }],
+            overdue: 0,
+            leased: 0,
+            open: 1,
+            done: 0,
+        };
+        let mut app = app::App::new(board);
+        app.state.view = model::View::Kanban;
+        app.detail = "Подробности задачи: сроки, зависимости и договорённости.".to_string();
+
+        let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 30)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area().height {
+            for x in 0..ONCE_WIDTH {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("задача"), "панели текста задачи нет:\n{text}");
+        assert!(
+            text.contains("Подробности задачи"),
+            "описание не показано:\n{text}"
+        );
+        // Колонка канбана на месте: панель не вытеснила доску.
+        assert!(text.contains("todo (1)"), "колонка пропала:\n{text}");
+        assert!(text.contains("DEMO-1"), "адрес узла пропал:\n{text}");
+    }
+
+    /// Пустая доска в канбане тоже рисует панель: «узел не выбран» — это ответ, а не пустота.
+    #[test]
+    fn the_kanban_detail_panel_survives_an_empty_board() {
+        let app = app::App::new(overview::Board {
+            project: "DEMO".to_string(),
+            columns: Vec::new(),
+            overdue: 0,
+            leased: 0,
+            open: 0,
+            done: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 30)).expect("terminal");
+        let mut app = app;
+        app.state.view = model::View::Kanban;
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area().height {
+            for x in 0..ONCE_WIDTH {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("узел не выбран"),
+            "панель на пустой доске ничего не сказала:\n{text}"
+        );
     }
 }

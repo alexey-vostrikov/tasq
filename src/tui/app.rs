@@ -55,6 +55,11 @@ pub struct App {
     pub project: Option<crate::project::Project>,
     /// Цветовая тема: её переключает `T`, и она живёт на экране, а не в константе.
     pub theme: crate::tui::theme::Theme,
+    /// Описание выбранного узла: текст задачи для панели под канбаном.
+    ///
+    /// Читается из базы отдельным запросом при каждом перечитывании: в `overview::BoardRow`
+    /// описания нет, и на доске его взять негде.
+    pub detail: String,
     /// Боковая панель: цепочка контекста, заметки и комментарии выбранного узла.
     pub context: Vec<String>,
     pub notes: Vec<String>,
@@ -91,6 +96,7 @@ impl App {
             projects: Vec::new(),
             project: None,
             theme: crate::tui::theme::Theme::default(),
+            detail: String::new(),
             context: Vec::new(),
             notes: Vec::new(),
             comments: Vec::new(),
@@ -250,9 +256,15 @@ impl App {
         self.context.clear();
         self.notes.clear();
         self.comments.clear();
+        self.detail.clear();
         let Some(reference) = self.selected().map(|row| row.dot_id.clone()) else {
             return Ok(());
         };
+        // Описание — отдельным чтением: доска его не отдаёт, а панель под канбаном без него
+        // показывает то же, что и колонка, то есть ничего нового.
+        if let Ok(node) = crate::node::resolve(conn, project, &reference) {
+            self.detail = node.description.unwrap_or_default();
+        }
         // Ошибка чтения панели не должна ломать доску: панель — удобство, а доска — работа.
         if let Ok(chain) = crate::overview::context(conn, project, &reference) {
             for entry in chain {
