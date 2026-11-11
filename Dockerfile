@@ -56,14 +56,22 @@ RUN apt-get -o Acquire::Check-Valid-Until=false update \
       build-essential pkg-config ca-certificates git \
  && rm -rf /var/lib/apt/lists/*
 
-# Политика зависимостей и покрытие. Оба установщика качают статические (musl) бинари, поэтому
-# на bullseye они запускаются без требования к glibc; версии и хеши закреплены в скриптах,
-# чтобы локальные гейты и CI ставили одно и то же.
+# Политика зависимостей, покрытие и мутации.
+#
+# `cargo-deny` и `cargo-llvm-cov` качаются готовыми статическими (musl) бинарями — у них есть
+# скрипты, потому что там есть что проверять: архитектура, закреплённый хеш, отсутствие файла
+# контрольных сумм у проекта.
+#
+# `cargo-mutants` так поставить нельзя: в релизе нет musl-сборки, а gnu-вариант собран на свежем
+# Ubuntu и требует GLIBC_2.39 при базе 2.31 — на bullseye он не запустится. Поэтому он собирается
+# из исходников здесь же (порог совпадает с порогом tasq — оба 2.30), и вся установка — одна
+# команда, а не скрипт.
 COPY scripts/install-cargo-deny.sh /usr/local/bin/install-cargo-deny
 COPY scripts/install-cargo-llvm-cov.sh /usr/local/bin/install-cargo-llvm-cov
 
 RUN sh /usr/local/bin/install-cargo-deny \
- && sh /usr/local/bin/install-cargo-llvm-cov
+ && sh /usr/local/bin/install-cargo-llvm-cov \
+ && cargo install cargo-mutants --version 27.1.0 --locked
 
 # Гейты утверждают наличие инструментов, а не обнаруживают в момент отчёта, что rustfmt
 # не было и проверка молча ничего не делала. `llvm-cov` проверяется ДВУМЯ способами: командой
@@ -71,10 +79,12 @@ RUN sh /usr/local/bin/install-cargo-deny \
 # плагин уходит качать компонент из сети). Отсутствие любого из них роняет сборку образа, а не
 # откладывается до первого `make cov`.
 #
-# `cargo-deny` и `cargo-mutants` здесь НЕ проверяются намеренно: они живут не в образе, а в томе
-# cargo (`CARGO_HOME=/cargo` при запуске `make`), и в CI ставятся отдельными шагами. Утверждать
-# в образе то, чего он не несёт, — значит либо ложно падать, либо (как было) не проверять вовсе.
+# Про `cargo-deny` и `cargo-mutants`: в CI они ставятся отдельными шагами (раннер не наш образ),
+# а в образе проверяются здесь же — иначе пересборка образа теряет инструмент незаметно, что уже
+# случилось однажды: `cargo-mutants` был поставлен руками, при пересборке исчез, и мутационный
+# гейт восемь раз отрапортовал «убито 0, выжило 0» вместо отказа.
 RUN rustc --version && cargo --version && rustfmt --version && cargo clippy --version \
+ && cargo deny --version && cargo mutants --version \
  && cargo llvm-cov --version \
  && llvm_cov="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-cov" \
  && test -x "$llvm_cov" \

@@ -23,11 +23,33 @@
 #   scripts/mutants-parallel.sh 8                       весь набор
 #   scripts/mutants-parallel.sh 8 -- -f src/project.rs  один файл
 #   scripts/mutants-parallel.sh 4 -- --in-diff /tmp/x.diff
+#   scripts/mutants-parallel.sh 8 -- -f src/status.rs -- --test status
+#
+# Второй `--` делит вызов на опции cargo-mutants и аргументы ТЕСТОВ. Без него аргументы тестов
+# уходят в опции и разбор падает: `--test` не опция cargo-mutants, и воркеры завершаются кодом 1,
+# а итог печатается как «убито 0, выжило 0» — то есть ноль проверки, неотличимый от честного нуля.
 set -uo pipefail
 
 WORKERS="${1:-4}"
 shift || true
 [ "${1:-}" = "--" ] && shift
+
+# Разделение: до второго `--` — опции mutator'а, после — аргументы тестов. Массивы в bash, а не
+# в sh: скрипт запускается через `bash`, и `${arr[@]}` в dash дал бы синтаксическую ошибку.
+MUT_OPTS=()
+TEST_ARGS=()
+seen_sep=0
+for arg in "$@"; do
+  if [ "$seen_sep" -eq 0 ] && [ "$arg" = "--" ]; then
+    seen_sep=1
+    continue
+  fi
+  if [ "$seen_sep" -eq 1 ]; then
+    TEST_ARGS+=("$arg")
+  else
+    MUT_OPTS+=("$arg")
+  fi
+done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WT="$ROOT/.mutwt"
@@ -47,9 +69,16 @@ mkdir -p "$WT"
 # в память — замер с 6 воркерами и `--all-targets` был убит сигналом 9 (код 137) через 405 с.
 # Поэтому по умолчанию 4 воркера, а полный набор гоняется на 2: узкая команда тестов
 # (`TEST_ARGS='--test mcp_tools'`) позволяет и 8.
+#
+# Раньше здесь было предупреждение и продолжение: прогон печатал «может быть убит по памяти» и
+# через семь минут действительно получал 137 — то есть отчёт «убито 0, выжило 0» с безвестной
+# причиной. Предупреждение, после которого случается ровно то, о чём предупредили, — это не
+# проверка, а извинение: отказ сразу называет и число, и выход.
 if [ "$WORKERS" -gt 4 ] && [ -z "${MUT_MEMORY_OK:-}" ]; then
-  echo "!! $WORKERS воркеров: если тесты гоняются полным набором, прогон может быть убит по памяти" >&2
-  echo "!! (проверено: 6 воркеров × --all-targets = код 137). Узкие тесты — MUT_MEMORY_OK=1." >&2
+  echo "TOO_MANY_WORKERS: $WORKERS воркеров × сборка каждого не укладываются в память" >&2
+  echo "hint: возьми 2–4 воркера (по умолчанию 4) или подтверди осознанно: MUT_MEMORY_OK=1" >&2
+  echo "      (замер: 6 воркеров × --all-targets = код 137 через 405 с)" >&2
+  exit 1
 fi
 
 prepare() {
@@ -75,13 +104,26 @@ prepare() {
 }
 
 pids=()
+# Остатки прошлых прогонов: убитый замер оставляет деревья воркеров, и они копятся — 8 воркеров
+# это 23 ГБ, обнаружено на этой машине. Удаляются деревья с номерами больше текущего их числа:
+# свои всё равно пересоздаются в `prepare`.
+for stale in "$WT"/w*; do
+  [ -d "$stale" ] || continue
+  idx=${stale##*/w}
+  case "$idx" in
+    ''|*[!0-9]*) continue ;;
+  esac
+  [ "$idx" -gt "$WORKERS" ] && rm -rf "$stale"
+done
+
 for i in $(seq 1 "$WORKERS"); do
   prepare "$i" || exit 1
   (
     cd "$WT/w$i" || exit 1
     CARGO_TARGET_DIR="$WT/w$i/target/mut" \
       cargo mutants --in-place --baseline skip --timeout "${MUT_TIMEOUT:-120}" \
-        --shard "$((i - 1))/$WORKERS" "$@" \
+        --shard "$((i - 1))/$WORKERS" "${MUT_OPTS[@]}" \
+        ${TEST_ARGS:+-- "${TEST_ARGS[@]}"} \
       > "log.txt" 2>&1
     echo $? > "rc.txt"
   ) &
@@ -113,7 +155,63 @@ for i in $(seq 1 "$WORKERS"); do
   fi
 done
 
+# Деревья сборки воркеров удаляются по завершении — на любом пути, включая отказ порога: `trap`
+# на EXIT, а не `rm` перед каждым `exit`. Логи и `mutants.out` остаются, чтобы выжившие и
+# таймауты можно было разобрать; `MUT_KEEP=1` сохраняет и сборку (нужна, если разбирать
+# отдельного мутанта руками). Без этого каждый прогон оставлял 9–23 ГБ.
+cleanup_workers() {
+  [ -n "${MUT_KEEP:-}" ] && return 0
+  for i in $(seq 1 "$WORKERS"); do
+    rm -rf "$WT/w$i/target" 2>/dev/null || true
+  done
+}
+trap cleanup_workers EXIT
+
 echo "== всего: убито $caught, выжило $missed, таймаут $timeout, нежизнеспособно $unviable"
+
+# Пороги. Без них отчёт «убито 56, выжило 0» — это информация, а не гейт: прогон с 40 выжившими
+# тоже завершился бы кодом 0 и ничего бы не остановил. Два числа, потому что они отвечают на
+# разные вопросы:
+#
+#   score            = убито / (убито + выжило + таймаут)
+#                      «из тех мутантов, которых вообще можно было судить, сколько тесты поймали»
+#   unverified share = (выжило + таймаут + нежизнеспособно) / всего
+#                      «какая доля мутаций осталась без проверки»: выжившие и таймауты — тесты не
+#                      справились, нежизнеспособные — мутация не собралась, то есть и этот путь
+#                      никем не проверен.
+#
+# Порог по score считается БЕЗ нежизнеспособных намеренно: мутация, которая не компилируется, не
+# свойство тестов, и подмешивать её в знаменатель значило бы поощрять непроверяемый код.
+#
+# Значения — из первого успешного замера (src/status.rs: 63 мутанта, 56 убито, 0 выжило,
+# 7 нежизнеспособно → score 100 %, unverified 11 %), с запасом вниз: порог, который красный
+# с первого прогона на историческом долге, отключают, и он перестаёт что-либо значить.
+MUT_MIN_SCORE="${MUT_MIN_SCORE:-90}"
+MUT_MAX_UNVERIFIED="${MUT_MAX_UNVERIFIED:-20}"
+
+viable=$((caught + missed + timeout))
+total=$((viable + unviable))
+if [ "$viable" -gt 0 ]; then
+  score=$((caught * 100 / viable))
+  unverified=$(( (missed + timeout + unviable) * 100 / total ))
+  echo "== score: $score % (порог $MUT_MIN_SCORE %), без проверки: $unverified % (порог $MUT_MAX_UNVERIFIED %)"
+  gate_failed=0
+  if [ "$score" -lt "$MUT_MIN_SCORE" ]; then
+    echo "MUTATION_SCORE_BELOW: $score % < $MUT_MIN_SCORE %: тесты пропускают мутации" >&2
+    gate_failed=1
+  fi
+  if [ "$unverified" -gt "$MUT_MAX_UNVERIFIED" ]; then
+    echo "MUTATION_UNVERIFIED_ABOVE: $unverified % > $MUT_MAX_UNVERIFIED %: мутации остаются без проверки" >&2
+    gate_failed=1
+  fi
+  [ "$gate_failed" -eq 1 ] && exit 3
+else
+  # Ноль судимых мутантов — это не «всё отлично», а «замер ничего не проверил»: выбранный файл
+  # не содержит мутируемых мест или мутатор их все отсёк. Молча вернуть 0 значило бы выдать
+  # отсутствие проверки за успех.
+  echo "MUTATION_NOTHING_TESTED: ни один мутант не был проверен ($total нежизнеспособно(ых))" >&2
+  exit 3
+fi
 
 if [ "$missed" -gt 0 ]; then
   echo "== выжившие:"

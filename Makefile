@@ -19,9 +19,16 @@
 IMAGE       ?= rust:1.99.1-bullseye
 CARGO_VOL   ?= rrl-cargo-bullseye
 UID_GID     := $(shell id -u):$(shell id -g)
+# PATH включает `$(CARGO_HOME)/bin` — иначе инструменты, поставленные в том (`cargo-deny`,
+# `cargo-mutants`), не находятся: `cargo mutants` отвечает «no such command: mutants», хотя
+# бинарь лежит рядом в томе. Так уже было: у цели `deny` PATH расширялся ВНУТРИ рецепта, а у
+# `mutants`/`mutants-file` — нет, и мутационный гейт молча не работал (8 воркеров с rc=101 и
+# итог «убито 0, выжило 0» — то есть ноль проверки, а не ноль мутантов). Расширение PATH здесь,
+# в одном месте, распространяется на все цели разом.
 DOCKER_FILE  = --rm -v $(CURDIR):/src -v $(CARGO_VOL):/cargo \
                -u $(UID_GID) -w /src \
-               -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/cargo/target-tasq -e HOME=/cargo/home
+               -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/cargo/target-tasq -e HOME=/cargo/home \
+               -e PATH=/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 TARGET_DIR    = /cargo/target-tasq
 RUN          = docker run $(DOCKER_FILE) $(IMAGE)
 
@@ -126,20 +133,36 @@ MUT_JOBS ?= 8
 # сборки на каждого мутанта, а `--in-place` с `-j` несовместим. Скрипт делит набор на шарды,
 # каждому воркеру даёт своё дерево и свой кэш, связанный с базовым жёсткими ссылками.
 MUT_WORKERS ?= 8
+# Страж: без него отсутствие `cargo-mutants` в томе выясняется не отказом, а отчётом
+# «убито 0, выжило 0» — то есть ноль проверки, замаскированный под успешный замер.
+# Ровно так и случилось: все восемь воркеров завершались с rc=101 и «no such command: mutants»,
+# а итоговая строка выглядела как «мутантов не найдено».
+define require_mutants
+	@$(RUN) sh -c 'command -v cargo-mutants >/dev/null || { \
+	  echo "CARGO_MUTANTS_MISSING: cargo-mutants нет в PATH; он в образе — пересобери: make image" >&2; \
+	  exit 1; }' || exit 1
+endef
 mutants: cache-init
+	$(require_mutants)
 	$(RUN) bash scripts/mutants-parallel.sh $(MUT_WORKERS)
 
 # Один файл: так сайты разбираются пачками, и замер стоит секунды, а не минуты.
 # Для файла, чьи проверки живут в интеграционных наборах, команду можно сузить явно:
 #   make mutants-file FILE=src/mcp/tools.rs TEST_ARGS='--test mcp_tools'
+#
+# `$(TEST_ARGS)` уходит за вторым `--`: это аргументы ТЕСТОВ, а не опции mutator'а. Без разделителя
+# `--test` попадает в опции, разбор падает с кодом 1, а итог печатается как «убито 0, выжило 0» —
+# ноль проверки, который неотличим от честного нуля.
 FILE ?= src/project.rs
 TEST_ARGS ?=
 mutants-file: cache-init
-	$(RUN) bash scripts/mutants-parallel.sh $(MUT_WORKERS) -- -f $(FILE) $(TEST_ARGS)
+	$(require_mutants)
+	$(RUN) bash scripts/mutants-parallel.sh $(MUT_WORKERS) -- -f $(FILE) $(if $(strip $(TEST_ARGS)),-- $(TEST_ARGS))
 
 # Только изменённое относительно базовой ветки: гейт для повседневной работы.
 BASE ?= origin/main
 mutants-diff: cache-init
+	$(require_mutants)
 	$(RUN) sh -c 'git diff $(BASE) > /tmp/mutants.diff && bash scripts/mutants-parallel.sh $(MUT_WORKERS) -- --in-diff /tmp/mutants.diff'
 
 # Справочник в docs/ снимается с бинаря; правка руками ловится гейтом.
