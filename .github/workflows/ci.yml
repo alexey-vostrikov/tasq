@@ -80,10 +80,13 @@ jobs:
           work="$(mktemp -d)"
           cd "$work"
           "$bin" init --key TUI --name "tui smoke" > /dev/null
-          "$bin" --project TUI add "узел для кадра" > /dev/null
-          frame="$("$bin" --project TUI tui --once)"
-          printf '%s\n' "$frame" | grep -q 'TUI-1' || { printf '%s\n' "$frame" >&2; echo "TUI_FRAME_MISSING_NODE: узел не попал в кадр" >&2; exit 1; }
-          printf '%s\n' "$frame" | grep -q 'доска' || { printf '%s\n' "$frame" >&2; echo "TUI_FRAME_MISSING_TABLE: таблица не нарисована" >&2; exit 1; }
+          "$bin" add "узел для кадра" > /dev/null
+          # Без --project: экран показывает все проекты базы и даёт переключатель.
+          frame="$("$bin" tui --once)"
+          for expected in 'TUI-1' 'доска' 'проекты' 'проект: TUI'; do
+            printf '%s\n' "$frame" | grep -q "$expected" \
+              || { printf '%s\n' "$frame" >&2; echo "TUI_FRAME_MISSING: в кадре нет '$expected'" >&2; exit 1; }
+          done
 
       - name: glibc floor of the artifact
         # Вторая половина — негативный контроль: предел 2.9 ниже реального порога по значению,
