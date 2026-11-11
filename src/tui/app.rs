@@ -501,10 +501,6 @@ impl App {
                 // рисовался), клик ничего не делает: угадывать, куда он пришёлся, нельзя.
                 match self.hits.find(mouse.column, mouse.row) {
                     Some(super::hits::Hit::Project(index)) => self.select_project(index),
-                    Some(super::hits::Hit::Header) => {
-                        self.state.focus = model::Focus::Projects;
-                        Outcome::Redraw
-                    }
                     Some(super::hits::Hit::Column(column)) => {
                         self.state.focus = model::Focus::Board;
                         self.state.column = column.min(self.board.columns.len().saturating_sub(1));
