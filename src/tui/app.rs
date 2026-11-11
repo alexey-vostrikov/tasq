@@ -31,6 +31,10 @@ pub struct App {
     pub message: Option<String>,
     /// Идентификатор сессии экрана: `TASQ_SESSION`, если задан, иначе свой.
     pub session: String,
+    /// Все проекты базы — панель слева и переключатель в шапке.
+    pub projects: Vec<crate::project::Summary>,
+    /// Проект, который показан на доске. `None` — доска не загружена (экран только собран).
+    pub project: Option<crate::project::Project>,
     /// Вид узла по адресу: от него зависит, какие статусы матрица разрешает (эпик не бывает
     /// `todo`, задача не бывает `planned`). Читается вместе с доской одним запросом.
     pub kinds: HashMap<String, crate::status::Kind>,
@@ -59,6 +63,8 @@ impl App {
             state: State::new(rows),
             message: None,
             session: String::new(),
+            projects: Vec::new(),
+            project: None,
             kinds: HashMap::new(),
             tokens: HashMap::new(),
         }
@@ -69,6 +75,68 @@ impl App {
         let mut app = Self::new(board);
         app.session = session.into();
         app
+    }
+
+    /// Экран с панелью проектов: доска активного проекта и список всех остальных.
+    pub fn with_projects(
+        board: overview::Board,
+        session: impl Into<String>,
+        projects: Vec<crate::project::Summary>,
+        active: usize,
+        project: crate::project::Project,
+    ) -> Self {
+        let mut app = Self::new(board);
+        app.session = session.into();
+        app.state.projects = projects.len();
+        app.state.active = active;
+        app.projects = projects;
+        app.project = Some(project);
+        app
+    }
+
+    /// Переключает доску на проект с этим номером и перечитывает её.
+    ///
+    /// Перечитывание обязательно и немедленное: показать чужую доску со старыми счётчиками значит
+    /// выдать данные одного проекта за другой — ровно та ошибка, из-за которой проект и перестал
+    /// быть «текущим каталогом» в CLI.
+    pub fn switch_project(
+        &mut self,
+        conn: &rusqlite::Connection,
+        index: usize,
+    ) -> crate::Result<()> {
+        let Some(summary) = self.projects.get(index) else {
+            return Ok(());
+        };
+        let key = summary.key.clone();
+        let project = crate::project::select(conn, Some(&key))?;
+        self.state.active = index;
+        // Курсор сбрасывается: в другом проекте те же координаты — другой узел, и «оставить как
+        // было» значило бы показать курсор на случайной строке чужой доски.
+        self.state.column = 0;
+        self.state.row = 0;
+        self.tokens.clear();
+        self.project = Some(project.clone());
+        self.state.rows = Vec::new();
+        self.refresh(conn, &project)
+    }
+
+    /// Перечитывает активный проект: то же, что `refresh`, но проект берётся у экрана.
+    ///
+    /// Экран без загруженного проекта (собранный тестом вокруг доски) перечитывать нечего, и это
+    /// не ошибка: `--once` рисует кадр один раз, без цикла.
+    pub fn refresh_active(&mut self, conn: &rusqlite::Connection) -> crate::Result<()> {
+        let Some(project) = self.project.clone() else {
+            return Ok(());
+        };
+        self.refresh(conn, &project)
+    }
+
+    /// Ключ активного проекта — для шапки и для `--once`.
+    pub fn project_key(&self) -> &str {
+        self.projects
+            .get(self.state.active)
+            .map(|summary| summary.key.as_str())
+            .unwrap_or(&self.board.project)
     }
 
     /// Перечитывает доску и подтягивает курсор в её новые границы.
@@ -194,6 +262,14 @@ impl App {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Press => Outcome::Ignored,
             Event::Key(key) => match key_of(key) {
+                // Панель проектов перехватывает движение: её `j`/`k` листают проекты, а не узлы.
+                // Проверка стоит ПЕРЕД общей таблицей, иначе одно нажатие делало бы два дела.
+                Some(key) if self.state.focus == model::Focus::Projects => {
+                    match model::panel_intent(key) {
+                        Some(intent) => self.state.apply(intent),
+                        None => Outcome::Ignored,
+                    }
+                }
                 Some(key) => match model::intent(self.state.mode, key) {
                     Some(intent) => {
                         if intent == Intent::ChangeStatus {
@@ -280,6 +356,18 @@ impl App {
         intent: Intent,
     ) -> Outcome {
         self.clear_message();
+        // Переключение проекта — не действие над узлом: ссылки под курсором тут нет и быть не
+        // должно, поэтому оно обрабатывается до выбора строки.
+        if intent == Intent::ProjectOpen {
+            let index = self.state.active;
+            return match self.switch_project(&*conn, index) {
+                Ok(()) => Outcome::Redraw,
+                Err(err) => {
+                    self.say(format!("{}: {}", err.code(), err.hint()));
+                    Outcome::Redraw
+                }
+            };
+        }
         let reference = match self.selected() {
             Some(row) => row.dot_id.clone(),
             None => {
@@ -323,7 +411,7 @@ impl App {
                         "статус изменён"
                     })
             }
-            Intent::ChangeStatus | Intent::ChooseStatus(_) => Ok(""),
+            Intent::ChangeStatus | Intent::ChooseStatus(_) | Intent::ProjectOpen => Ok(""),
             _ => Ok(""),
         };
 
@@ -1016,5 +1104,145 @@ mod tests {
             message.len() > "INVALID_TRANSITION".len() + 2,
             "у отказа нет подсказки: {message}"
         );
+    }
+
+    /// Переключение проекта на экране: доска, счётчики и вид узлов становятся чужими.
+    ///
+    /// Проверяется на базе из ДВУХ проектов: на одном переключение нечем проверить — любая
+    /// ошибка «взять первый» даёт верный ответ.
+    #[test]
+    fn switching_the_project_changes_the_board() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-switch-{nanos}"));
+        let outcome = crate::db::init(&dir, "ONE", "one").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let one = crate::project::first_project(&conn).expect("project");
+        create(&mut conn, &one, "узел первого");
+        let second = crate::project::create(&mut conn, "TWO", Some("второй")).expect("create");
+        create(&mut conn, &second, "узел второго А");
+        create(&mut conn, &second, "узел второго Б");
+
+        let projects = crate::project::list(&conn).expect("projects");
+        assert_eq!(projects.len(), 2, "фикстура не из двух проектов");
+        let board = crate::overview::board(&conn, &one).expect("board");
+        let mut app = App::with_projects(board, "sess", projects, 0, one.clone());
+        assert_eq!(app.project_key(), "ONE");
+        assert_eq!(app.state.rows_here(), 1, "в первом проекте один узел");
+
+        app.switch_project(&conn, 1).expect("switch");
+        assert_eq!(app.project_key(), "TWO");
+        assert_eq!(app.state.active, 1);
+        assert_eq!(
+            app.state.rows_here(),
+            2,
+            "доска второго проекта не перечитана: строк {}",
+            app.state.rows_here()
+        );
+        assert_eq!(app.board.project, "TWO", "шапка показывает чужой проект");
+        assert!(
+            app.kinds.keys().all(|key| key.starts_with("TWO-")),
+            "виды узлов остались от первого проекта: {:?}",
+            app.kinds.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            app.tokens.is_empty(),
+            "аренды первого проекта уехали во второй"
+        );
+        assert_eq!(
+            (app.state.column, app.state.row),
+            (0, 0),
+            "курсор перенесён на прежние координаты чужой доски"
+        );
+    }
+
+    fn create(conn: &mut rusqlite::Connection, project: &crate::project::Project, title: &str) {
+        crate::node::create(
+            conn,
+            project,
+            crate::node::NewNode {
+                parent: None,
+                title,
+                kind: None,
+                description: None,
+                priority: None,
+                due_date: None,
+                estimated_hours: None,
+                weight: None,
+                source_ref: None,
+                branch: None,
+            },
+        )
+        .expect("node");
+    }
+
+    /// Переключение на несуществующий номер ничего не ломает: экран остаётся на месте.
+    #[test]
+    fn switching_to_a_missing_index_changes_nothing() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-switch2-{nanos}"));
+        let outcome = crate::db::init(&dir, "SOLO", "solo").expect("init");
+        let conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let solo = crate::project::first_project(&conn).expect("project");
+        let projects = crate::project::list(&conn).expect("projects");
+        let board = crate::overview::board(&conn, &solo).expect("board");
+        let mut app = App::with_projects(board, "sess", projects, 0, solo);
+        app.switch_project(&conn, 7)
+            .expect("переключение на пустой номер");
+        assert_eq!(
+            app.project_key(),
+            "SOLO",
+            "проект сменился на несуществующий"
+        );
+        assert_eq!(app.state.active, 0);
+    }
+
+    /// Цепочка переключения проекта клавишами: `Tab` → `j` → `Enter` → `Act` → новая доска.
+    ///
+    /// Проверяется именно цепочка: `switch_project` сам по себе работает (тест выше), а вот
+    /// доводит ли до него нажатие — вопрос отдельный. В живом прогоне ответ был «нет», и по
+    /// кадру это не видно: экран оставался на прежнем проекте без единого сообщения.
+    #[test]
+    fn the_key_chain_switches_the_project() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-switch-chain-{nanos}"));
+        let outcome = crate::db::init(&dir, "AAA", "aaa").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let first = crate::project::first_project(&conn).expect("project");
+        create(&mut conn, &first, "узел первого");
+        let second = crate::project::create(&mut conn, "BBB", Some("второй")).expect("create");
+        create(&mut conn, &second, "узел второго");
+
+        let projects = crate::project::list(&conn).expect("projects");
+        let board = crate::overview::board(&conn, &first).expect("board");
+        let mut app = App::with_projects(board, "sess", projects, 0, first);
+
+        assert_eq!(app.step(key(KeyCode::Tab)), Outcome::Redraw);
+        assert_eq!(
+            app.state.focus,
+            model::Focus::Projects,
+            "Tab не перевёл фокус"
+        );
+        assert_eq!(app.step(key(KeyCode::Char('j'))), Outcome::Redraw);
+        assert_eq!(app.state.active, 1, "j не сдвинул выбор проекта");
+
+        let act = app.step(key(KeyCode::Enter));
+        assert_eq!(
+            act,
+            Outcome::Act(Intent::ProjectOpen),
+            "Enter на панели не попросил переключение"
+        );
+        let project = app.project.clone().expect("проект");
+        app.perform(&mut conn, &project, Intent::ProjectOpen);
+        assert_eq!(app.project_key(), "BBB", "проект не переключился");
+        assert_eq!(app.board.project, "BBB");
     }
 }

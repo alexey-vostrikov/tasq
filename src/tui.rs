@@ -1,8 +1,11 @@
 //! TUI: доска в терминале.
 //!
-//! Здесь пока только кадр: экран целиком и решения по клавишам — предмет следующих шагов
-//! (`TASQDEV-6.3`…`6.5`). Файл заведён на шаге замера (`TASQDEV-6.2`), потому что цена
-//! ratatui в артефакте измеряется только настоящим кодом, а не оценкой по документации.
+//! Экран не зависит от `--project`: слева панель со всеми проектами базы, в шапке доски —
+//! переключатель, и переключение не требует выхода. `--project` остался подсказкой «с какого
+//! проекта открыться» — то же правило, что у остальных команд обзора.
+//!
+//! Два вида одной доски: список (таблица) и канбан (колонки статусов рядом). Данные у них одни
+//! и те же — `overview::board`, — поэтому переключение вида не перечитывает базу.
 //!
 //! Источник данных — `overview::board`, то же, что у `tasq board`: экран не имеет права
 //! считать статусы, аренды и просрочку по-своему, иначе доска и TUI разойдутся в числах.
@@ -24,9 +27,6 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::overview;
-use crate::project::Project;
-
-use model::Mode;
 
 /// Ширина кадра в режиме `--once`.
 ///
@@ -41,27 +41,33 @@ pub const ONCE_WIDTH: u16 = 100;
 /// доска меняется и без нажатий (истекает аренда, другой агент закрывает узел). Четверть
 /// секунды — цена одного чтения доски на машине, где их тысячи, и заметная глазом задержка.
 const TICK: Duration = Duration::from_millis(250);
-
-/// Рисует доску и возвращает управление.
+/// Ширина панели проектов.
 ///
-/// `once` — один кадр в обычный вывод и выход: так TUI проверяется в CI, где нет терминала,
-/// и так же снимается картинка для документации. Без `once` экран занимает терминал целиком и
-/// живёт в цикле до `q`.
-/// Соединение берётся изменяемым: экран не только читает, но и пишет (аренда, статус, заметка),
-/// и второе соединение «на запись» рядом с читающим — это два разных представления об одной базе
-/// и лишний способ разойтись с ней. Запись идёт той же транзакцией, что у CLI.
-pub fn run(conn: &mut Connection, project: &Project, once: bool) -> Result<()> {
-    let board = overview::board(conn, project)?;
+/// Двадцать четыре знака: ключ проекта до восьми (таков предел в схеме), остальное — счётчик
+/// узлов. Шире не нужно, уже начинает резать длинные ключи.
+pub const PANEL_WIDTH: u16 = 24;
+
+/// Экран без `--project`.
+///
+/// Проект больше не аргумент, а состояние экрана: слева панель со всеми проектами базы, в шапке
+/// доски — переключатель. `start` — необязательный НАЧАЛЬНЫЙ выбор (`--project` остался, но стал
+/// подсказкой «с какого проекта открыться», а не требованием). Это то же правило, что у остальных
+/// команд обзора: работа по всем проектам без селектора.
+///
+/// `once` — один кадр в обычный вывод и выход: так TUI проверяется в CI, где нет терминала, и так
+/// же снимается картинка для документации.
+///
+/// Соединение берётся изменяемым: экран не только читает, но и пишет (аренда, статус), и второе
+/// соединение «на запись» рядом с читающим — это два разных представления об одной базе и лишний
+/// способ с ней разойтись. Запись идёт теми же транзакциями, что у CLI и MCP.
+pub fn run(conn: &mut Connection, start: Option<&str>, once: bool) -> Result<()> {
+    let mut app = build(conn, start)?;
 
     if once {
-        print!("{}", render_once(&board));
+        print!("{}", render_once(&app));
         return Ok(());
     }
 
-    let mut app = app::App::new(board);
-    // Вид узлов читается сразу: от него зависит список допустимых статусов, а первое нажатие `s`
-    // может прийти раньше первого тика.
-    app.load_kinds(&*conn, project)?;
     // `Error::Io` принимает `std::io::Error` через `#[from]`, поэтому `?` работает и на
     // ошибках ratatui: они того же типа. А вот отсутствие терминала — отдельный код: без tty
     // `enable_raw_mode` отдаёт `No such device or address`, и как `STORAGE_ERROR` это читалось
@@ -69,20 +75,48 @@ pub fn run(conn: &mut Connection, project: &Project, once: bool) -> Result<()> {
     terminal::enable_raw_mode().map_err(|err| crate::error::Error::NoTerminal {
         reason: err.to_string(),
     })?;
-    let outcome = event_loop(std::io::stdout(), conn, project, &mut app);
+    let outcome = event_loop(std::io::stdout(), conn, &mut app);
     // raw mode снимается ДО возврата ошибки: иначе упавшая отрисовка оставит терминал в
     // состоянии, где Enter не отправляет строку, и человеку придётся спасать сессию `reset`.
     terminal::disable_raw_mode()?;
     outcome
 }
 
+/// Собирает экран: список проектов, доска активного, виды узлов.
+///
+/// `start` — ключ проекта из `--project` (или `TASQ_PROJECT`). Неизвестный ключ — отказ с
+/// названным полем, а не молчаливый переход на первый проект: молчание здесь означало бы «показал
+/// не то, что просили».
+fn build(conn: &Connection, start: Option<&str>) -> Result<app::App> {
+    let projects = crate::project::list(conn)?;
+    if projects.is_empty() {
+        return Err(crate::error::Error::NoProject);
+    }
+    let index = match start.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) if key.eq_ignore_ascii_case("all") => 0,
+        Some(key) => projects
+            .iter()
+            .position(|summary| summary.key == key)
+            .ok_or_else(|| crate::error::Error::ProjectNotFound {
+                key: key.to_string(),
+                known: projects
+                    .iter()
+                    .map(|summary| summary.key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })?,
+        None => 0,
+    };
+    let project = crate::project::select(conn, Some(&projects[index].key))?;
+    let board = overview::board(conn, &project)?;
+    let session = actions::session_id()?;
+    let mut app = app::App::with_projects(board, session, projects, index, project.clone());
+    app.load_kinds(conn, &project)?;
+    Ok(app)
+}
+
 /// Цикл: кадр → событие → решение. Тело решения в `App::step`, здесь только ввод-вывод.
-fn event_loop<W>(
-    mut out: W,
-    conn: &mut Connection,
-    project: &Project,
-    app: &mut app::App,
-) -> Result<()>
+fn event_loop<W>(mut out: W, conn: &mut Connection, app: &mut app::App) -> Result<()>
 where
     W: std::io::Write,
 {
@@ -100,7 +134,7 @@ where
                 // перерисовываем тот же снимок. Ошибка чтения не выходит из цикла — она
                 // показывается в строке состояния: база, запертая другим процессом, не повод
                 // терять экран.
-                if let Err(err) = app.refresh(&*conn, project) {
+                if let Err(err) = app.refresh_active(&*conn) {
                     app.say(err.to_string());
                 }
                 continue;
@@ -111,10 +145,14 @@ where
                 // `Act` — просьба модели. Здесь она превращается в вызов библиотеки: экран не
                 // знает, что такое аренда, он знает, что человек нажал `c`.
                 model::Outcome::Act(intent) => {
-                    app.perform(conn, project, intent);
+                    let Some(project) = app.project.clone() else {
+                        app.say("проект не загружен");
+                        continue;
+                    };
+                    app.perform(conn, &project, intent);
                 }
                 model::Outcome::Redraw | model::Outcome::Ask(_) => {
-                    if let Err(err) = app.refresh(&*conn, project) {
+                    if let Err(err) = app.refresh_active(&*conn) {
                         app.say(err.to_string());
                     }
                 }
@@ -135,18 +173,15 @@ where
 /// Рисуется в буфер памяти (`TestBackend`), а не в stdout: у `--once` нет терминала, из которого
 /// можно взять размер, и ждать `tty` от CI нечего. Заодно это единственный способ проверить
 /// вывод кадра тестом — сравнить строки, а не перехватывать поток.
-pub fn render_once(board: &overview::Board) -> String {
-    let height = frame_height(board);
+pub fn render_once(app: &app::App) -> String {
+    let height = frame_height(&app.board);
     // Буфер в памяти отказать не может: его `Error` — `Infallible`. Поэтому `render_once` не
     // возвращает `Result`: ошибка, которой нельзя случиться, в подписи была бы ложью, и
     // вызывающий писал бы `?` там, где нечего обрабатывать.
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(ONCE_WIDTH, height))
         .expect("рисование в буфер памяти не может отказать");
-    // Через `App`, а не через доску: кадр в CI обязан быть ТЕМ ЖЕ кадром, что видит человек,
-    // включая пометку курсора и строку подсказки. Иначе `--once` проверяет другой экран.
-    let app = app::App::new(board.clone());
     terminal
-        .draw(|frame| draw(frame, &app))
+        .draw(|frame| draw(frame, app))
         .expect("рисование в буфер памяти не может отказать");
     let buffer = terminal.backend().buffer().clone();
     buffer_lines(&buffer, ONCE_WIDTH)
@@ -160,8 +195,9 @@ pub fn render_once(board: &overview::Board) -> String {
 /// рамки, и узел пропал из кадра, оставаясь в данных.
 fn frame_height(board: &overview::Board) -> u16 {
     let rows: usize = board.columns.iter().map(|column| column.rows.len()).sum();
-    // 3 — блок счётчиков, 2 — рамка таблицы, 1 — её заголовок, 2 — строка режима и подсказка.
-    let height = 3 + 2 + 1 + rows + 2;
+    // 4 — шапка (счётчики и переключатель), 2 — рамка таблицы, 1 — её заголовок, 2 — строка
+    // режима и подсказка.
+    let height = 4 + 2 + 1 + rows + 2;
     u16::try_from(height).unwrap_or(u16::MAX)
 }
 
@@ -183,20 +219,113 @@ fn buffer_lines(buffer: &ratatui::buffer::Buffer, width: u16) -> String {
     text
 }
 
-/// Кадр: строка состояния, таблица узлов по статусам и строка подсказки.
+/// Кадр: панель проектов слева, доска справа, строки режима и подсказки внизу.
 ///
-/// Строка под курсором помечена реверсом. Пометка идёт ЗДЕСЬ, а не в модели: модель про вид
-/// ничего не знает, и это правильно — иначе вид стал бы частью решения.
+/// Пометка курсора идёт ЗДЕСЬ, а не в модели: модель про вид ничего не знает, и это правильно —
+/// иначе вид стал бы частью решения.
 fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
-    let board = &app.board;
-    // Строка под курсором — её номер в ПЛОСКОМ списке всех строк, а не в колонке: таблица
-    // рисуется одним списком, и номер колонки ей ничего не говорит. Считается по индексам, а не
-    // счётчиком в замыкании: `map(move |…| …)` копирует `flat` в каждое замыкание, и счётчик
-    // молча перестаёт расти — тогда подсвечена либо каждая строка, либо ни одна.
-    let selected_flat = selected_index(board, app.state.column, app.state.row);
+    let [body, mode_line, hint_line] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+
+    let [panel, main] =
+        Layout::horizontal([Constraint::Length(PANEL_WIDTH), Constraint::Min(20)]).areas(body);
+
+    draw_panel(frame, app, panel);
+
+    // Шапка: переключатель проекта (тот самый «дропдаун») и счётчики. Один и тот же вид у списка
+    // и у канбана: переключение вида не должно менять место, где проект выбирается.
+    let dropdown = format!(
+        " проект: {} ▾   [Tab — панель, v — {}] ",
+        app.project_key(),
+        match app.state.view {
+            model::View::List => "канбан",
+            model::View::Kanban => "список",
+        }
+    );
+    let counters = format!(
+        "открыто {}  закрыто {}  просрочено {}  в аренде {}",
+        app.board.open, app.board.done, app.board.overdue, app.board.leased
+    );
+    // Четыре строки, а не три: счётчики и переключатель — две строки текста внутри рамки.
+    // В три они не влезают, и вторая (переключатель) просто не рисуется — кадр при этом
+    // выглядит целым, поэтому заметить это можно только тестом на содержимое.
+    let [header, content] =
+        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(main);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(counters),
+            Line::from(dropdown).style(Style::default().add_modifier(Modifier::BOLD)),
+        ])
+        .block(Block::default().borders(Borders::ALL)),
+        header,
+    );
+
+    match app.state.view {
+        model::View::List => draw_list(frame, app, content),
+        model::View::Kanban => draw_kanban(frame, app, content),
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(mode_text(app))), mode_line);
+    frame.render_widget(
+        Paragraph::new(Line::from(format!(
+            "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, v — вид, q — выход",
+            app.state.mode.title()
+        ))),
+        hint_line,
+    );
+}
+
+/// Строка режима: выбор статуса, подтверждение — или пусто.
+fn mode_text(app: &app::App) -> String {
+    match app.state.mode {
+        model::Mode::Status => {
+            let mut text = String::from("новый статус:  ");
+            for (index, status) in app.state.statuses.iter().enumerate() {
+                text.push_str(&format!("{} {status}   ", index + 1));
+            }
+            text.push_str("Esc — отмена");
+            text
+        }
+        _ => match app.pending() {
+            Some(intent) => format!("подтвердить {intent:?}?  y / n"),
+            None => String::new(),
+        },
+    }
+}
+
+/// Панель проектов: ключ, счётчик узлов, пометка активного и курсора панели.
+fn draw_panel(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    for (index, project) in app.projects.iter().enumerate() {
+        let active = index == app.state.active;
+        let text = format!("{:<8} {:>4}", project.key, project.nodes);
+        let mut line = Line::from(text);
+        if active {
+            line = line.style(Style::default().add_modifier(Modifier::BOLD));
+        }
+        // Курсор панели виден только когда панель в фокусе: две одновременные пометки человек
+        // читает как «активны оба», и непонятно, что сдвинет `j`.
+        if active && app.state.focus == model::Focus::Projects {
+            line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        lines.push(line);
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" проекты ")),
+        area,
+    );
+}
+
+/// Доска списком: строка на узел.
+fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    let selected_flat = selected_index(&app.board, app.state.column, app.state.row);
     let mut rows: Vec<Row<'_>> = Vec::new();
     let mut offset = 0usize;
-    for column in &board.columns {
+    for column in &app.board.columns {
         for (index, row) in column.rows.iter().enumerate() {
             let holder = row.lease_holder.as_deref().unwrap_or("-");
             let mut line = Row::new(vec![
@@ -225,47 +354,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let status_line = match &app.message {
-        Some(message) => message.to_string(),
-        None => format!(
-            "{}  открыто {}  закрыто {}  просрочено {}  в аренде {}",
-            board.project, board.open, board.done, board.overdue, board.leased
-        ),
-    };
-    let hint = format!(
-        "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, q — выход",
-        app.state.mode.title()
-    );
-    // Экран выбора статуса показывает САМ список: номера без подписей ничего не значат, а держать
-    // их в голове человек не обязан.
-    let mode_text = match app.state.mode {
-        Mode::Status => {
-            let mut text = String::from("новый статус:  ");
-            for (index, status) in app.state.statuses.iter().enumerate() {
-                text.push_str(&format!("{} {status}   ", index + 1));
-            }
-            text.push_str("Esc — отмена");
-            text
-        }
-        _ => match app.pending() {
-            Some(intent) => format!("подтвердить {intent:?}?  y / n"),
-            None => String::new(),
-        },
-    };
-
-    // Четыре полосы: счётчики (3), таблица (всё остальное), строка режима и подсказка (по 1).
-    let [top, body, mode_line, hint_line] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    frame.render_widget(
-        Paragraph::new(Line::from(status_line)).block(Block::default().borders(Borders::ALL)),
-        top,
-    );
     frame.render_widget(
         Table::new(
             rows,
@@ -275,15 +363,66 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) {
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(12),
-                Constraint::Min(20),
+                Constraint::Min(10),
             ],
         )
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(" доска ")),
-        body,
+        area,
     );
-    frame.render_widget(Paragraph::new(Line::from(hint)), hint_line);
-    frame.render_widget(Paragraph::new(Line::from(mode_text)), mode_line);
+}
+
+/// Доска канбаном: колонки статусов рядом, узлы внутри колонки.
+///
+/// Тот же курсор, что у списка: `h`/`l` ходят по колонкам, `j`/`k` — по строкам внутри. На
+/// нескольких колонках это единственное осмысленное соответствие, и оно делает переключение вида
+/// безболезненным — курсор остаётся на том же узле.
+fn draw_kanban(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layout::Rect) {
+    if app.board.columns.is_empty() {
+        frame.render_widget(
+            Paragraph::new("в проекте нет узлов")
+                .block(Block::default().borders(Borders::ALL).title(" канбан ")),
+            area,
+        );
+        return;
+    }
+    let constraints: Vec<Constraint> = app
+        .board
+        .columns
+        .iter()
+        .map(|_| Constraint::Ratio(1, app.board.columns.len() as u32))
+        .collect();
+    let chunks = Layout::horizontal(constraints).split(area);
+
+    for (column_index, column) in app.board.columns.iter().enumerate() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        for (row_index, row) in column.rows.iter().enumerate() {
+            let holder = match row.lease_holder.as_deref() {
+                Some(holder) => format!(" [{holder}]"),
+                None => String::new(),
+            };
+            let mut line = Line::from(format!("{}{holder}", row.dot_id));
+            if column_index == app.state.column && row_index == app.state.row {
+                line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            lines.push(line);
+            // Название — второй строкой: в колонке шириной в десять знаков оно не влезает рядом
+            // с адресом, а обрезать название до «TUI: инт…» бессмысленно.
+            let mut title = Line::from(format!("  {}", row.title));
+            if column_index == app.state.column && row_index == app.state.row {
+                title = title.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            lines.push(title);
+        }
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {} ({}) ", column.status, column.count)),
+            ),
+            chunks[column_index],
+        );
+    }
 }
 
 /// Номер строки в плоском списке всех строк доски.
@@ -401,7 +540,7 @@ mod tests {
         .expect("node");
 
         let board = overview::board(&conn, &project).expect("board");
-        let frame = render_once(&board);
+        let frame = render_once(&app::App::new(board.clone()));
 
         assert!(
             frame.contains("SMOKE"),
@@ -445,7 +584,7 @@ mod tests {
                 })
                 .collect(),
         });
-        let frame = render_once(&board);
+        let frame = render_once(&app::App::new(board.clone()));
         for n in 1..=5 {
             assert!(
                 frame.contains(&format!("DEMO-{n}")),
@@ -466,8 +605,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tasq-tui-run-{nanos}"));
         let outcome = crate::db::init(&dir, "RUN", "run").expect("init");
         let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-        let project = crate::project::first_project(&conn).expect("project");
-        run(&mut conn, &project, true).expect("один кадр в обычный вывод");
+        run(&mut conn, None, true).expect("один кадр в обычный вывод без --project");
     }
 
     /// Курсор ВИДЕН: строка под ним помечена реверсом, и помечена ровно одна.
@@ -565,6 +703,147 @@ mod tests {
         assert!(
             highlighted(&board, 1, 0).is_none(),
             "в пустой колонке что-то помечено"
+        );
+    }
+
+    /// Кадр без `--project`: панель со ВСЕМИ проектами и переключатель в шапке.
+    ///
+    /// Проверяется по буферу: ключи обоих проектов, метка активного и слово «проект» в шапке —
+    /// то, без чего человек не поймёт, что можно переключиться.
+    #[test]
+    fn the_frame_shows_the_panel_and_the_switcher() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tasq-panel-{nanos}"));
+        let outcome = crate::db::init(&dir, "FIRST", "first").expect("init");
+        let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
+        let first = crate::project::first_project(&conn).expect("project");
+        let second = crate::project::create(&mut conn, "SECOND", Some("второй")).expect("create");
+        for (project, title) in [(&first, "узел первого"), (&second, "узел второго")]
+        {
+            crate::node::create(
+                &mut conn,
+                project,
+                crate::node::NewNode {
+                    parent: None,
+                    title,
+                    kind: None,
+                    description: None,
+                    priority: None,
+                    due_date: None,
+                    estimated_hours: None,
+                    weight: None,
+                    source_ref: None,
+                    branch: None,
+                },
+            )
+            .expect("node");
+        }
+
+        let projects = crate::project::list(&conn).expect("projects");
+        let board = overview::board(&conn, &first).expect("board");
+        let app = app::App::with_projects(board, "sess", projects, 0, first);
+        let frame = render_once(&app);
+
+        assert!(frame.contains("проекты"), "панели проектов нет:\n{frame}");
+        assert!(
+            frame.contains("FIRST"),
+            "первый проект не в панели:\n{frame}"
+        );
+        assert!(
+            frame.contains("SECOND"),
+            "второй проект не в панели — переключаться не на что:\n{frame}"
+        );
+        assert!(
+            frame.contains("проект: FIRST"),
+            "в шапке нет переключателя проекта:\n{frame}"
+        );
+        assert!(
+            frame.contains("узел первого") && !frame.contains("узел второго"),
+            "на доске узлы чужого проекта:\n{frame}"
+        );
+    }
+
+    /// Канбан: колонки статусов рядом, узлы внутри, курсор на выбранном узле.
+    #[test]
+    fn the_kanban_view_draws_one_column_per_status() {
+        let board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: vec![
+                overview::BoardColumn {
+                    status: "todo".to_string(),
+                    count: 2,
+                    rows: vec![
+                        overview::BoardRow {
+                            dot_id: "DEMO-1".to_string(),
+                            title: "первая".to_string(),
+                            priority: "medium".to_string(),
+                            due_date: None,
+                            days_overdue: 0,
+                            lease_holder: None,
+                            progress: "0%".to_string(),
+                        },
+                        overview::BoardRow {
+                            dot_id: "DEMO-2".to_string(),
+                            title: "вторая".to_string(),
+                            priority: "medium".to_string(),
+                            due_date: None,
+                            days_overdue: 0,
+                            lease_holder: None,
+                            progress: "0%".to_string(),
+                        },
+                    ],
+                },
+                overview::BoardColumn {
+                    status: "done".to_string(),
+                    count: 1,
+                    rows: vec![overview::BoardRow {
+                        dot_id: "DEMO-3".to_string(),
+                        title: "третья".to_string(),
+                        priority: "medium".to_string(),
+                        due_date: None,
+                        days_overdue: 0,
+                        lease_holder: None,
+                        progress: "100%".to_string(),
+                    }],
+                },
+            ],
+            overdue: 0,
+            leased: 0,
+            open: 2,
+            done: 1,
+        };
+        let mut app = app::App::new(board);
+        app.state.view = model::View::Kanban;
+        // Канбан выше списка: каждая строка занимает две строки (адрес и название).
+        let height = frame_height(&app.board) + 4;
+        let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, height)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area().height {
+            for x in 0..ONCE_WIDTH {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+
+        assert!(
+            text.contains("todo (2)"),
+            "нет заголовка колонки todo:\n{text}"
+        );
+        assert!(
+            text.contains("done (1)"),
+            "нет заголовка колонки done:\n{text}"
+        );
+        for id in ["DEMO-1", "DEMO-3"] {
+            assert!(text.contains(id), "узел {id} не попал в канбан:\n{text}");
+        }
+        assert!(
+            text.contains("первая") && text.contains("третья"),
+            "названия не показаны вторыми строками:\n{text}"
         );
     }
 }

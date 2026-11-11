@@ -15,6 +15,36 @@
 //!   не как `return` из середины обработчика: иначе ветку нельзя вынести в функцию, не меняя
 //!   поведения.
 
+/// Как показана доска: списком строк или колонками статусов.
+///
+/// Два вида одной и той же доски, а не два экрана: данные те же (`overview::board`), отличается
+/// только раскладка. Поэтому переключение не перечитывает базу и не сбрасывает курсор.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum View {
+    /// Таблица: строка на узел, статус колонкой.
+    #[default]
+    List,
+    /// Канбан: колонки статусов рядом, узлы внутри.
+    Kanban,
+}
+
+impl View {
+    pub fn title(self) -> &'static str {
+        match self {
+            View::List => "список",
+            View::Kanban => "канбан",
+        }
+    }
+}
+
+/// Куда направлены клавиши движения: на список узлов или на панель проектов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Board,
+    Projects,
+}
+
 /// Экран, на котором находится человек.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -103,6 +133,16 @@ pub enum Intent {
     ReleaseWork,
     /// Работа провалена: узел возвращается в `todo`, причина в чекпойнте.
     FailWork,
+    /// Фокус на панель проектов и обратно.
+    FocusNext,
+    /// Другой вид доски: список или канбан.
+    ToggleView,
+    /// Проект выше в панели.
+    ProjectUp,
+    /// Проект ниже в панели.
+    ProjectDown,
+    /// Переключиться на выбранный проект.
+    ProjectOpen,
     /// Выбран статус под номером: буква — это позиция в списке допустимых.
     ChooseStatus(char),
     /// Подтверждённый переход в выбранный статус.
@@ -184,7 +224,25 @@ pub fn intent(mode: Mode, key: Key) -> Option<Intent> {
         K::Char('n') => Some(I::AddNote),
         K::Char('m') => Some(I::AddComment),
         K::Char('/') => Some(I::Search),
+        K::Char('v') => Some(I::ToggleView),
+        K::Tab => Some(I::FocusNext),
         K::Char('q') => Some(I::Quit),
+        _ => None,
+    }
+}
+
+/// Клавиши панели проектов.
+///
+/// Отдельная таблица, а не ветка в общей: на панели `j`/`k` двигают проекты, а не узлы, и путать
+/// эти два движения нельзя — иначе человек переключает проект, думая, что листает задачи.
+pub fn panel_intent(key: Key) -> Option<Intent> {
+    use Intent as I;
+    use Key as K;
+    match key {
+        K::Char('j') | K::Down => Some(I::ProjectDown),
+        K::Char('k') | K::Up => Some(I::ProjectUp),
+        K::Enter => Some(I::ProjectOpen),
+        K::Esc | K::Tab => Some(I::FocusNext),
         _ => None,
     }
 }
@@ -231,6 +289,14 @@ pub struct State {
     pub statuses: Vec<String>,
     /// Статус, выбранный под номером и ждущий подтверждения.
     pub chosen_status: Option<String>,
+    /// Вид доски: список или канбан.
+    pub view: View,
+    /// Что получает движение: узлы или панель проектов.
+    pub focus: Focus,
+    /// Сколько проектов в базе — граница движения по панели.
+    pub projects: usize,
+    /// Номер проекта, который показан на доске.
+    pub active: usize,
 }
 
 impl State {
@@ -377,8 +443,51 @@ impl State {
                     O::Ignored
                 }
             }
+            I::ToggleView => {
+                self.view = match self.view {
+                    View::List => View::Kanban,
+                    View::Kanban => View::List,
+                };
+                O::Redraw
+            }
+            I::FocusNext => {
+                // Без проектов панель пуста, и фокус на ней означал бы, что клавиши движения
+                // перестали двигать то, что видно.
+                if self.projects == 0 {
+                    return O::Ignored;
+                }
+                self.focus = match self.focus {
+                    Focus::Board => Focus::Projects,
+                    Focus::Projects => Focus::Board,
+                };
+                O::Redraw
+            }
+            I::ProjectUp => self.step_project(-1),
+            I::ProjectDown => self.step_project(1),
+            I::ProjectOpen => {
+                self.focus = Focus::Board;
+                O::Act(I::ProjectOpen)
+            }
             I::Confirm | I::ApplyStatus => O::Ignored,
             I::Claim | I::Create | I::Edit | I::AddNote | I::AddComment => O::Act(intent),
+        }
+    }
+
+    /// Движение по панели проектов.
+    ///
+    /// Курсор проекта НЕ подтягивается к границам молча: на панели из одного проекта движение
+    /// ничего не меняет и отвечает «нечего делать», а не перерисовывает тот же кадр.
+    fn step_project(&mut self, delta: isize) -> Outcome {
+        if self.projects == 0 {
+            return Outcome::Ignored;
+        }
+        let next = self.active as isize + delta;
+        let clamped = next.clamp(0, self.projects as isize - 1) as usize;
+        if clamped == self.active {
+            Outcome::Ignored
+        } else {
+            self.active = clamped;
+            Outcome::Redraw
         }
     }
 
@@ -493,9 +602,64 @@ mod tests {
     /// Неизвестная клавиша молчит, а не делает что-то «по умолчанию».
     #[test]
     fn an_unbound_key_does_nothing() {
-        for key in [K::Char('z'), K::Char('ы'), K::Tab, K::Backspace] {
+        for key in [K::Char('z'), K::Char('ы'), K::Backspace] {
             assert_eq!(intent(Mode::Board, key), None, "{key:?}");
         }
+    }
+
+    /// Панель проектов и второй вид доски привязаны к клавишам, и это проверяется отдельно:
+    /// пока клавиша не привязана, о ней молчат и тест «неизвестная молчит», и тест таблицы —
+    /// получается функция, которой нет.
+    #[test]
+    fn the_project_panel_and_the_view_switch_have_their_keys() {
+        assert_eq!(intent(Mode::Board, K::Tab), Some(I::FocusNext));
+        assert_eq!(intent(Mode::Board, K::Char('v')), Some(I::ToggleView));
+
+        assert_eq!(panel_intent(K::Char('j')), Some(I::ProjectDown));
+        assert_eq!(panel_intent(K::Down), Some(I::ProjectDown));
+        assert_eq!(panel_intent(K::Char('k')), Some(I::ProjectUp));
+        assert_eq!(panel_intent(K::Enter), Some(I::ProjectOpen));
+        assert_eq!(panel_intent(K::Tab), Some(I::FocusNext));
+        assert_eq!(panel_intent(K::Esc), Some(I::FocusNext));
+        // На панели `q` не выходит: выход — общая клавиша, и панель её не перехватывает.
+        assert_eq!(panel_intent(K::Char('q')), None);
+    }
+
+    /// `v` переключает вид и обратно, `Tab` — фокус; без проектов фокус на панель не уходит.
+    #[test]
+    fn the_view_switches_and_focus_needs_projects() {
+        let mut state = State::new(vec![1]);
+        assert_eq!(state.view, View::List);
+        assert_eq!(state.apply(I::ToggleView), Outcome::Redraw);
+        assert_eq!(state.view, View::Kanban);
+        assert_eq!(state.apply(I::ToggleView), Outcome::Redraw);
+        assert_eq!(state.view, View::List);
+
+        // Проектов нет — панели нет, и фокус остался бы на пустоте.
+        assert_eq!(state.apply(I::FocusNext), Outcome::Ignored);
+        assert_eq!(state.focus, Focus::Board);
+
+        state.projects = 3;
+        assert_eq!(state.apply(I::FocusNext), Outcome::Redraw);
+        assert_eq!(state.focus, Focus::Projects);
+        assert_eq!(state.apply(I::FocusNext), Outcome::Redraw);
+        assert_eq!(state.focus, Focus::Board);
+    }
+
+    /// Курсор панели ходит по проектам и не выходит за границы; `Enter` просит переключение.
+    #[test]
+    fn the_project_cursor_stays_within_the_panel() {
+        let mut state = State::new(vec![1]);
+        state.projects = 3;
+        assert_eq!(state.apply(I::ProjectUp), Outcome::Ignored, "уже на первом");
+        assert_eq!(state.apply(I::ProjectDown), Outcome::Redraw);
+        assert_eq!(state.active, 1);
+        assert_eq!(state.apply(I::ProjectDown), Outcome::Redraw);
+        assert_eq!(state.active, 2);
+        assert_eq!(state.apply(I::ProjectDown), Outcome::Ignored, "край панели");
+
+        assert_eq!(state.apply(I::ProjectOpen), Outcome::Act(I::ProjectOpen));
+        assert_eq!(state.focus, Focus::Board, "после выбора фокус не вернулся");
     }
 
     /// Курсор не выходит за список ни вверх, ни вниз, и на пустой колонке не двигается.
