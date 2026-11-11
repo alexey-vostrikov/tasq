@@ -121,8 +121,9 @@ smoke: build
 	  frame=$$($(TARGET_DIR)/release/tasq tui --once); \
 	  printf "%s\n" "$$frame" | grep -q "TASQ-1"; \
 	  printf "%s\n" "$$frame" | grep -q "доска"; \
-	  printf "%s\n" "$$frame" | grep -q "проект: TASQ"; \
-	  echo "tui --once: кадр без --project, узел и переключатель на месте"' 
+	  printf "%s\n" "$$frame" | grep -q "открыто"; \
+	  ! printf "%s\n" "$$frame" | grep -q "проект:"; \
+	  echo "tui --once: кадр без --project, узел и счётчики на месте, переключателя в шапке нет"' 
 
 # Гейт бюджета схем MCP: тот же порог, что в CI.
 tokens: build

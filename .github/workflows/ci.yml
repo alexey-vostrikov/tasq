@@ -81,12 +81,18 @@ jobs:
           cd "$work"
           "$bin" init --key TUI --name "tui smoke" > /dev/null
           "$bin" add "узел для кадра" > /dev/null
-          # Без --project: экран показывает все проекты базы и даёт переключатель.
+          # Без --project: экран показывает все проекты базы и счётчики доски.
           frame="$("$bin" tui --once)"
-          for expected in 'TUI-1' 'доска' 'проекты' 'проект: TUI'; do
+          for expected in 'TUI-1' 'доска' 'проекты' 'открыто'; do
             printf '%s\n' "$frame" | grep -q "$expected" \
               || { printf '%s\n' "$frame" >&2; echo "TUI_FRAME_MISSING: в кадре нет '$expected'" >&2; exit 1; }
           done
+          # Переключателя проекта в шапке нет: проект выбирается панелью слева.
+          if printf '%s\n' "$frame" | grep -q 'проект:'; then
+            printf '%s\n' "$frame" >&2
+            echo "TUI_FRAME_EXTRA: в шапке остался переключатель проекта" >&2
+            exit 1
+          fi
 
       - name: glibc floor of the artifact
         # Вторая половина — негативный контроль: предел 2.9 ниже реального порога по значению,
