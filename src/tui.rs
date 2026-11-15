@@ -1008,9 +1008,24 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
     let mut offset = 0usize;
     for column in &app.board.columns {
         for (index, row) in column.rows.iter().enumerate() {
+            // Выделение красит ЯЧЕЙКИ, а не только строку: `Cell::style` заменяет `Row::style`
+            // для занятых знаком мест, поэтому фон выделения сам по себе оставлял у текста
+            // прежний цвет — в gruvbox адрес и название совпадали с фоном (контраст 1.0),
+            // приглушённые колонки давали 3:1. Смысловые цвета на выделенной строке уступают
+            // читаемости: статус в ней всё равно написан словом.
+            let selected = Some(offset + index) == selected_flat;
+            let paint = |style: Style| {
+                if selected {
+                    theme.selected_style()
+                } else {
+                    style
+                }
+            };
             let holder = match &row.lease_holder {
-                Some(holder) => Cell::from(holder.clone()).style(Style::default().fg(theme.leased)),
-                None => Cell::from("-").style(theme.dim_style()),
+                Some(holder) => {
+                    Cell::from(holder.clone()).style(paint(Style::default().fg(theme.leased)))
+                }
+                None => Cell::from("-").style(paint(theme.dim_style())),
             };
             // Просрочка — отдельным флагом в названии: цвет строки уже занят статусом, и
             // второй цвет на той же строке читался бы как «и то, и это».
@@ -1020,22 +1035,24 @@ fn draw_list(frame: &mut ratatui::Frame<'_>, app: &app::App, area: ratatui::layo
             }
             let mut line = Row::new(vec![
                 Cell::from(column.status.clone())
-                    .style(Style::default().fg(theme.status(&column.status))),
-                Cell::from(row.dot_id.clone()).style(theme.text_style()),
-                Cell::from(row.priority.clone()).style(theme.dim_style()),
-                Cell::from(row.progress.clone()).style(theme.dim_style()),
+                    .style(paint(Style::default().fg(theme.status(&column.status)))),
+                Cell::from(row.dot_id.clone()).style(paint(theme.text_style())),
+                Cell::from(row.priority.clone()).style(paint(theme.dim_style())),
+                Cell::from(row.progress.clone()).style(paint(theme.dim_style())),
                 holder,
-                Cell::from(title).style(if row.days_overdue > 0 {
+                Cell::from(title).style(paint(if row.days_overdue > 0 {
                     Style::default().fg(theme.overdue)
                 } else {
                     theme.text_style()
-                }),
+                })),
             ]);
             // Зебра от фона темы: у светлых тем полосы светлее основы, у тёмных — темнее.
-            line = line.style(Style::default().bg(theme.zebra(index)));
-            if Some(offset + index) == selected_flat {
-                line = line.style(theme.selected_style());
-            }
+            // Фон выделенной строки закрашивает её целиком — до края, за последнюю колонку.
+            line = line.style(Style::default().bg(if selected {
+                theme.selected_bg
+            } else {
+                theme.zebra(index)
+            }));
             rows.push(line);
         }
         offset += column.rows.len();
@@ -1589,6 +1606,20 @@ mod tests {
                     line.push_str(cell.symbol());
                     if cell.style().bg == Some(selected_bg) {
                         marked = true;
+                        // И текст под курсором — цветом выделения. Проставленный на `Cell`
+                        // цвет статуса перекрывает строку (`Cell::style` сильнее `Row::style`),
+                        // и раньше в gruvbox адрес узла совпадал с фоном выделения: строка
+                        // находилась, но прочитать её было нельзя.
+                        if cell.symbol().trim().is_empty() {
+                            continue;
+                        }
+                        assert_eq!(
+                            cell.style().fg,
+                            Some(app.theme.selected_fg),
+                            "символ {:?} на строке курсора окрашен в {:?}, а не в цвет выделения",
+                            cell.symbol(),
+                            cell.style().fg
+                        );
                     }
                 }
                 if marked {
@@ -1618,6 +1649,92 @@ mod tests {
         assert!(
             highlighted(&board, 1, 0).is_none(),
             "в пустой колонке что-то помечено"
+        );
+    }
+
+    /// Канбан красит карточку под курсором той же парой «текст + фон», что и список:
+    /// читаемость не должна зависеть от вида доски.
+    #[test]
+    fn the_kanban_card_under_the_cursor_is_readable() {
+        let board = overview::Board {
+            project: "DEMO".to_string(),
+            columns: vec![
+                overview::BoardColumn {
+                    status: "todo".to_string(),
+                    count: 2,
+                    rows: (1..=2)
+                        .map(|n| overview::BoardRow {
+                            dot_id: format!("DEMO-{n}"),
+                            title: format!("задача {n}"),
+                            priority: "medium".to_string(),
+                            due_date: None,
+                            days_overdue: 0,
+                            lease_holder: None,
+                            progress: "0%".to_string(),
+                        })
+                        .collect(),
+                },
+                overview::BoardColumn {
+                    status: "done".to_string(),
+                    count: 1,
+                    rows: vec![overview::BoardRow {
+                        dot_id: "DEMO-3".to_string(),
+                        title: "задача 3".to_string(),
+                        priority: "medium".to_string(),
+                        due_date: None,
+                        days_overdue: 0,
+                        lease_holder: None,
+                        progress: "100%".to_string(),
+                    }],
+                },
+            ],
+            overdue: 0,
+            leased: 0,
+            open: 2,
+            done: 1,
+        };
+        let mut app = app::App::new(board);
+        app.state.view = model::View::Kanban;
+        app.state.column = 0;
+        app.state.row = 1;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area().height {
+            for x in 0..buffer.area().width {
+                let cell = &buffer[(x, y)];
+                if cell.style().bg != Some(app.theme.selected_bg) {
+                    continue;
+                }
+                text.push_str(cell.symbol());
+                if cell.symbol().trim().is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    cell.style().fg,
+                    Some(app.theme.selected_fg),
+                    "канбан: {:?} на карточке курсора окрашен в {:?}",
+                    cell.symbol(),
+                    cell.style().fg
+                );
+            }
+        }
+        assert!(
+            text.contains("DEMO-2"),
+            "в канбане помечена не та карточка: {text:?}"
+        );
+        assert!(
+            text.contains("задача 2"),
+            "название карточки не выделено: {text:?}"
+        );
+        assert!(
+            !text.contains("DEMO-1"),
+            "выделены две карточки сразу: {text:?}"
         );
     }
 

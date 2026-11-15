@@ -205,8 +205,10 @@ impl Theme {
         border: Color::Rgb(180, 190, 205),
         focus: Color::Rgb(94, 129, 172),
         header: Color::Rgb(94, 129, 172),
-        selected_fg: Color::Rgb(245, 245, 245),
-        selected_bg: Color::Rgb(94, 129, 172),
+        // Фон выделения — polar night 3, а не frost `#5E81AC`: на светлом фоне frost
+        // слишком близок к зебре, и светлый текст давал контраст 3.7 при норме 4.5.
+        selected_fg: Color::Rgb(236, 239, 244),
+        selected_bg: Color::Rgb(76, 86, 106),
         background: Color::Rgb(236, 239, 244),
         fresh: Color::Rgb(94, 129, 172),
         active: Color::Rgb(163, 122, 30),
@@ -446,6 +448,72 @@ mod tests {
             ];
             for (what, left, right) in pairs {
                 assert_ne!(left, right, "{}: {what} одного цвета с соседом", theme.name);
+            }
+        }
+    }
+
+    /// Относительная яркость цвета по WCAG 2.x: `(0.2126 R + 0.7152 G + 0.0722 B)` по
+    /// линеаризованным каналам.
+    fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.039_28 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+
+    /// Контраст двух цветов: от 1.0 (неразличимы) до 21.0 (чёрный на белом).
+    fn contrast(left: (u8, u8, u8), right: (u8, u8, u8)) -> f64 {
+        let (a, b) = (luminance(left), luminance(right));
+        let (high, low) = if a > b { (a, b) } else { (b, a) };
+        (high + 0.05) / (low + 0.05)
+    }
+
+    /// Выделенная строка читается: текст на фоне выделения даёт не меньше 4.5:1, и сам фон
+    /// отличается от зебры. Порог — не украшение: в gruvbox текст на выделении совпадал с
+    /// фоном (1.0), приглушённые колонки давали 2.7, а в nord-light светлый текст на frost —
+    /// 3.7. Курсор, на котором нельзя прочитать адрес узла, бесполезен, и глазами такой
+    /// дефект видно как «контраст слабоват», а не как поломку.
+    ///
+    /// Темы на именованных цветах (`default`, `default-light`) пропускаются: оттенок задаёт
+    /// терминал, и замерить его здесь нечем — там проверяется только, что текст и фон
+    /// выделения не один цвет.
+    #[test]
+    fn the_selected_row_stays_readable() {
+        for theme in Theme::all() {
+            assert_ne!(
+                theme.selected_fg, theme.selected_bg,
+                "{}: текст выделения одного цвета с фоном",
+                theme.name
+            );
+            let (Color::Rgb(fg_r, fg_g, fg_b), Color::Rgb(bg_r, bg_g, bg_b)) =
+                (theme.selected_fg, theme.selected_bg)
+            else {
+                continue;
+            };
+            let text = contrast((fg_r, fg_g, fg_b), (bg_r, bg_g, bg_b));
+            assert!(
+                text >= 4.5,
+                "{}: текст на выделении {text:.2}:1 — ниже нормы 4.5",
+                theme.name
+            );
+
+            // Курсор должен быть виден как полоса, а не «чуть темнее полосы зебры»: фон
+            // выделения отличается от обеих полос чередования.
+            for index in [0, 1] {
+                let Color::Rgb(z_r, z_g, z_b) = theme.zebra(index) else {
+                    continue;
+                };
+                let stripe = contrast((bg_r, bg_g, bg_b), (z_r, z_g, z_b));
+                assert!(
+                    stripe >= 1.5,
+                    "{}: выделение почти сливается с зеброй (полоса {index}): {stripe:.2}:1",
+                    theme.name
+                );
             }
         }
     }
