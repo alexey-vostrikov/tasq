@@ -308,10 +308,13 @@ pub fn unlink(
     // Ждёт всегда `from`, поэтому проверяется именно он.
     if kind.is_blocking() {
         let remaining: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM edges e
-             JOIN nodes b ON b.id = e.to_node
-             WHERE e.from_node = ?1 AND e.kind = 'blocks' AND b.deleted_at IS NULL
-               AND b.status NOT IN ('done', 'cancelled')",
+            &format!(
+                "SELECT COUNT(*) FROM edges e
+                 JOIN nodes b ON b.id = e.to_node
+                 WHERE e.from_node = ?1 AND e.kind = 'blocks' AND b.deleted_at IS NULL
+                   AND {}",
+                crate::status::not_terminal_sql("b.status")
+            ),
             params![from.id],
             |row| row.get(0),
         )?;
@@ -413,6 +416,15 @@ pub struct Graph {
     pub related: Vec<Edge>,
 }
 
+/// Закрыт ли узел — по справочнику, а не по паре литералов.
+///
+/// Список закрытых статусов живёт в базе (`statuses.terminal`) и сверяется с кодом тестом;
+/// здесь только чтение. Неизвестный статус считается незакрытым: лучше показать узел
+/// работающим, чем молча спрятать.
+fn is_terminal(status: &str) -> bool {
+    crate::status::Status::parse(status).is_some_and(crate::status::Status::is_terminal)
+}
+
 /// Сосед в графе: dot-ID, заголовок, статус и глубина по отношению к исходному узлу.
 #[derive(Debug, Clone, Serialize)]
 pub struct Neighbour {
@@ -451,7 +463,7 @@ fn neighbours(
             title,
             status: status.clone(),
             distance: 1,
-            terminal: matches!(status.as_str(), "done" | "cancelled"),
+            terminal: is_terminal(&status),
         });
     }
     Ok(out)
@@ -501,7 +513,7 @@ pub fn graph(conn: &Connection, project: &Project, reference: &str, depth: i64) 
                 title,
                 status: status.clone(),
                 distance: distance + 1,
-                terminal: matches!(status.as_str(), "done" | "cancelled"),
+                terminal: is_terminal(&status),
             });
             frontier.push((id, distance + 1));
         }
@@ -561,7 +573,7 @@ fn incoming(
             title,
             status: status.clone(),
             distance: 1,
-            terminal: matches!(status.as_str(), "done" | "cancelled"),
+            terminal: is_terminal(&status),
         });
     }
     Ok(out)
@@ -678,7 +690,7 @@ pub fn clear_stale_blocked(conn: &mut Connection, project: &Project) -> Result<u
                AND NOT EXISTS (
                  SELECT 1 FROM edges e JOIN nodes b ON b.id = e.to_node
                  WHERE e.from_node = n.id AND e.kind = 'blocks' AND b.deleted_at IS NULL
-                   AND b.status NOT IN ('done', 'cancelled'))",
+                   AND b.status NOT IN (SELECT name FROM statuses WHERE terminal = 1))",
         )?;
         stmt.query_map(params![project.id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -770,11 +782,13 @@ pub fn next_candidates(
 /// Все кандидаты проекта, без обрезки: обрезка — дело вызывающего, потому что при работе по
 /// нескольким проектам резать надо ПОСЛЕ склейки.
 fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>> {
-    let mut stmt = conn.prepare(
+    let unfinished_blockers = crate::status::not_terminal_sql("b.status");
+    let unfinished_children = crate::status::not_terminal_sql("c.status");
+    let mut stmt = conn.prepare(&format!(
         "SELECT e.id, e.path, e.title, e.effective_status, e.priority, e.due_date, e.depth,
                 COALESCE((SELECT COUNT(*) FROM edges x JOIN nodes b ON b.id = x.to_node
                           WHERE x.from_node = e.id AND x.kind = 'blocks'
-                            AND b.deleted_at IS NULL AND b.status NOT IN ('done','cancelled')), 0)
+                            AND b.deleted_at IS NULL AND {unfinished_blockers}), 0)
                     AS blockers,
                 CAST(julianday(date('now')) - julianday(e.due_date) AS INTEGER) AS overdue
          FROM v_node_effective e
@@ -785,8 +799,8 @@ fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>>
            AND e.effective_status IN ('todo', 'planned', 'review')
            AND NOT EXISTS (
              SELECT 1 FROM nodes c WHERE c.parent_id = e.id AND c.deleted_at IS NULL
-               AND c.status NOT IN ('done', 'cancelled'))",
-    )?;
+               AND {unfinished_children})"
+    ))?;
     let rows = stmt.query_map(params![project.id], |row| {
         Ok((
             row.get::<_, i64>(0)?,

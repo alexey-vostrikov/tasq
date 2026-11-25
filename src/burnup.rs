@@ -136,10 +136,13 @@ fn day_key(moment: &str) -> Option<Date> {
 fn project_deadline(conn: &Connection, project: &Project) -> Result<Option<(Date, String)>> {
     let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT due_date, path FROM nodes
-             WHERE project_id = ?1 AND due_date IS NOT NULL AND deleted_at IS NULL
-               AND archived_at IS NULL AND status NOT IN ('done', 'cancelled')
-             ORDER BY due_date LIMIT 1",
+            &format!(
+                "SELECT due_date, path FROM nodes
+                 WHERE project_id = ?1 AND due_date IS NOT NULL AND deleted_at IS NULL
+                   AND archived_at IS NULL AND {} 
+                 ORDER BY due_date LIMIT 1",
+                crate::status::not_terminal_sql("status")
+            ),
             params![project.id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -540,15 +543,16 @@ pub struct AtRisk {
 /// Узлы с риском срыва: времени прошло заметно больше, чем сделано.
 pub fn at_risk(conn: &Connection, project: &Project, threshold: f64) -> Result<Vec<AtRisk>> {
     let today = today(conn)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT e.path, e.title, e.due_date, e.created_at, e.status, e.effective_status,
                 COALESCE(p.done_weight, 0), COALESCE(p.total_weight, 0)
          FROM v_node_effective e
          LEFT JOIN v_node_progress p ON p.node_id = e.id
          WHERE e.project_id = ?1 AND e.deleted_at IS NULL AND e.archived_at IS NULL
            AND e.due_date IS NOT NULL
-           AND e.effective_status NOT IN ('done', 'cancelled')",
-    )?;
+           AND {}",
+        crate::status::not_terminal_sql("e.effective_status")
+    ))?;
     let rows = stmt.query_map(params![project.id], |row| {
         Ok((
             row.get::<_, String>(0)?,

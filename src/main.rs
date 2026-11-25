@@ -1026,8 +1026,14 @@ fn print_candidates(candidates: &[edge::Candidate], origin: &[(String, edge::Ori
 /// Печать одной доски. Отдельно от `Command::Board`, потому что тем же видом печатаются
 /// секции обзора по всем проектам — иначе два вида «одного и того же» расходятся.
 fn print_board(board: &overview::Board) {
+    // «Не доведено» печатается только когда оно есть: строка с постоянным нулём — шум.
+    let incomplete_note = if board.incomplete > 0 {
+        format!("  incomplete {}", board.incomplete)
+    } else {
+        String::new()
+    };
     println!(
-        "{}  open {}  done {}  overdue {}  leased {}",
+        "{}  open {}  done {}{incomplete_note}  overdue {}  leased {}",
         board.project, board.open, board.done, board.overdue, board.leased
     );
     for column in &board.columns {
@@ -1657,6 +1663,19 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     actor: None,
                 },
             )?;
+            // Замена цели `done` → `incomplete` — не ошибка, но и не то, о чём просили.
+            // Молча отдать другой статус значило бы заставить человека гадать, почему узел
+            // не закрыт как выполненный.
+            if status == Some(tasq::status::Status::Done)
+                && updated.status == "incomplete"
+                && !cli.json
+            {
+                eprintln!(
+                    "note: {} closed as incomplete: it still has unfinished children; \
+                     `--force` writes done",
+                    updated.dot_id
+                );
+            }
             if cli.json {
                 print_json(&updated);
             } else {
