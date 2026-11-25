@@ -286,8 +286,12 @@ fn release_outcomes_drive_the_node_status() {
     assert_eq!(err.code(), "NOT_YOUR_ATTEMPT");
 }
 
+/// Сдача работы с открытыми детьми: без `force` — `incomplete`, с `force` — `done`.
+///
+/// Отказа здесь быть не должно: раньше это был `CHILDREN_UNFINISHED`, и человек, решивший
+/// прекратить работу, не мог закрыть узел вовсе, а `--force` писал ложное `done`.
 #[test]
-fn completing_with_open_children_needs_force() {
+fn completing_with_open_children_gives_incomplete_and_force_gives_done() {
     let (_dir, mut conn, project, task) = fixture("children");
     node::create(
         &mut conn,
@@ -308,7 +312,7 @@ fn completing_with_open_children_needs_force() {
     .expect("subtask");
 
     let lease = claim(&mut conn, &project, &task.dot_id, "agent").expect("claim");
-    let err = lease::release(
+    let undendum = lease::release(
         &mut conn,
         &project,
         &lease.token,
@@ -316,9 +320,30 @@ fn completing_with_open_children_needs_force() {
         None,
         false,
     )
-    .unwrap_err();
-    assert_eq!(err.code(), "CHILDREN_UNFINISHED");
+    .expect("сдача с хвостами — не отказ");
+    assert_eq!(undendum.status, "incomplete");
+    assert_eq!(undendum.effective_status, "incomplete");
 
+    // Вторая попытка: узел уже закрыт, поэтому `--force` проверяется на свежем узле.
+    let (_dir2, mut conn, project, task) = fixture("children-force");
+    node::create(
+        &mut conn,
+        &project,
+        NewNode {
+            parent: Some(&task.dot_id),
+            title: "Sub",
+            kind: None,
+            description: None,
+            priority: None,
+            due_date: None,
+            estimated_hours: None,
+            weight: None,
+            source_ref: None,
+            branch: None,
+        },
+    )
+    .expect("subtask");
+    let lease = claim(&mut conn, &project, &task.dot_id, "agent").expect("claim");
     let node = lease::release(
         &mut conn,
         &project,

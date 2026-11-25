@@ -181,13 +181,15 @@ fn is_expired(expires_at: &str, now: &str) -> bool {
 }
 
 fn blockers(conn: &Connection, node_id: i64) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT b.path FROM edges e
          JOIN nodes b ON b.id = e.to_node
          WHERE e.from_node = ?1 AND e.kind = 'blocks'
-           AND b.deleted_at IS NULL AND b.status NOT IN ('done', 'cancelled')
+           AND b.deleted_at IS NULL AND {}
          ORDER BY b.path",
-    )?;
+        crate::status::not_terminal_sql("b.status")
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let paths = stmt
         .query_map(params![node_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -238,10 +240,10 @@ pub fn claim_as(
     // `doctor --gc`. Целевой узел исключён: ветка ниже вытесняет его сама и сообщает об этом
     // в `superseded`, а сборка отняла бы у неё эту информацию.
     release_expired(conn, project, Some(node.id))?;
-    if matches!(
-        node.stored_status(),
-        crate::status::Status::Done | crate::status::Status::Cancelled
-    ) {
+    if node.stored_status().is_terminal() {
+        // Закрытый узел в работу не берётся — включая `incomplete`: работа по нему прекращена,
+        // и «взять» его значит отменить решение, а не продолжить работу. Открыть узел — отдельное
+        // действие (`set --status todo|planned`), и оно не требует `--force`.
         return Err(Error::NodeClosed {
             dot_id: node.dot_id.clone(),
             status: node.status.clone(),
@@ -601,21 +603,24 @@ pub fn release(
         .unwrap_or_else(|| attempt.dot_id.clone());
     let node = node::resolve(conn, project, &format!("#{}", attempt.node_id))
         .or_else(|_| node::resolve(conn, project, &key))?;
+    let mut target = match outcome {
+        Outcome::Completed => crate::status::Status::Done,
+        Outcome::Released | Outcome::Failed => crate::status::Status::Todo,
+    };
     if outcome == Outcome::Completed && node.stored_status() != crate::status::Status::Done {
-        let unfinished: i64 = conn.query_row(
+        let sql = format!(
             "SELECT COUNT(*) FROM nodes
-             WHERE parent_id = ?1 AND deleted_at IS NULL AND status NOT IN ('done', 'cancelled')",
-            params![node.id],
-            |row| row.get(0),
-        )?;
+             WHERE parent_id = ?1 AND deleted_at IS NULL AND {}",
+            crate::status::not_terminal_sql("status")
+        );
+        let unfinished: i64 = conn.query_row(&sql, params![node.id], |row| row.get(0))?;
         if unfinished > 0 && !force {
-            return Err(Error::ChildrenUnfinished {
-                dot_id: node.dot_id.clone(),
-                unfinished,
-            });
+            // Работа сдана с хвостами: исход `completed` не делает узел выполненным.
+            target = crate::status::Status::Incomplete;
         }
         if let Some(paths) = blockers(conn, node.id)?
             && !force
+            && target == crate::status::Status::Done
         {
             return Err(Error::UnmetPrerequisites {
                 dot_id: node.dot_id.clone(),
@@ -636,10 +641,6 @@ pub fn release(
         params![now_text, attempt.id],
     )?;
 
-    let target = match outcome {
-        Outcome::Completed => crate::status::Status::Done,
-        Outcome::Released | Outcome::Failed => crate::status::Status::Todo,
-    };
     tx.execute(
         "UPDATE nodes SET status = ?1, updated_at = ?2 WHERE id = ?3",
         params![target.as_str(), now_text, node.id],

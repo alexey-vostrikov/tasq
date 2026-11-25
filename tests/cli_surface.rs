@@ -359,21 +359,22 @@ fn lease_commands_answer_json_and_text() {
     // Завершение с чекпойнтом и принудительное завершение контейнера с открытыми детьми.
     let second = json(&dir, &["claim", "TASQ-1", "--holder", "agent-c"]);
     let second_token = second["token"].as_str().expect("token").to_string();
-    let (code, error) = refused(&dir, &["release", &second_token, "--outcome", "completed"]);
+    // Завершение с чекпойнтом. Эпик с открытыми детьми закрывается как `incomplete`, а не
+    // `done`: работа по нему прекращена, но задачи не сделаны. С `--force` — как `done`.
+    let undendum = json(&dir, &["release", &second_token, "--outcome", "completed"]);
+    assert_eq!(undendum["status"], Value::from("incomplete"));
+    assert_eq!(undendum["effective_status"], Value::from("incomplete"));
+
+    // Закрытый узел в работу не берётся — включая `incomplete`: работа прекращена, и «взять»
+    // его значит отменить решение, а не продолжить работу.
+    let (code, error) = refused(&dir, &["claim", "TASQ-1", "--holder", "agent-c"]);
     assert_eq!(code, 1);
-    assert_eq!(error, "CHILDREN_UNFINISHED");
-    json(
-        &dir,
-        &[
-            "release",
-            &second_token,
-            "--outcome",
-            "completed",
-            "--checkpoint",
-            "оставил заметку",
-            "--force",
-        ],
-    );
+    assert_eq!(error, "NODE_CLOSED");
+
+    // Довести недоведённый эпик до `done` — отдельным решением: детей всё ещё нет закрытых,
+    // поэтому нужен `--force`; он же и означает «я знаю, что это ложь».
+    let closed = json(&dir, &["set", "TASQ-1", "--status", "done", "--force"]);
+    assert_eq!(closed["status"], Value::from("done"));
 
     // Человекочитаемые ветки.
     let third = text(&dir, &["claim", "TASQ-1.2", "--holder", "agent-d"]);

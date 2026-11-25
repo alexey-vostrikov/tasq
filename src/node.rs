@@ -443,22 +443,26 @@ struct Change {
 }
 
 fn unfinished_children(conn: &Connection, node_id: i64) -> Result<i64> {
-    Ok(conn.query_row(
+    // Закрытость — из справочника, а не литералом: `incomplete` и любой будущий терминальный
+    // статус считаются закрытыми автоматически.
+    let sql = format!(
         "SELECT COUNT(*) FROM nodes
-         WHERE parent_id = ?1 AND deleted_at IS NULL AND status NOT IN ('done', 'cancelled')",
-        params![node_id],
-        |row| row.get(0),
-    )?)
+         WHERE parent_id = ?1 AND deleted_at IS NULL AND {}",
+        crate::status::not_terminal_sql("status")
+    );
+    Ok(conn.query_row(&sql, params![node_id], |row| row.get(0))?)
 }
 
 fn unfinished_blockers(conn: &Connection, node_id: i64) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT b.path FROM edges e
          JOIN nodes b ON b.id = e.to_node
          WHERE e.from_node = ?1 AND e.kind = 'blocks'
-           AND b.deleted_at IS NULL AND b.status NOT IN ('done', 'cancelled')
+           AND b.deleted_at IS NULL AND {}
          ORDER BY b.path",
-    )?;
+        crate::status::not_terminal_sql("b.status")
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let paths = stmt
         .query_map(params![node_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -505,6 +509,7 @@ pub fn update(
         return Err(Error::LeaseRequired);
     }
 
+    let mut patch = patch;
     if let Some(target) = patch.status {
         // Политика реоткрытия — из проекта, а не из кода: где-то `--force` обязателен,
         // где-то мешает. Матрица (куда можно) остаётся общей.
@@ -515,17 +520,22 @@ pub fn update(
             patch.force,
             project.reopen,
         )?;
-        if target == Status::Done {
+        if target == Status::Done && !patch.force {
             let unfinished = unfinished_children(conn, node.id)?;
-            if unfinished > 0 && !patch.force {
-                return Err(Error::ChildrenUnfinished {
-                    dot_id: node.dot_id.clone(),
-                    unfinished,
-                });
-            }
-            if let Some(blockers) = unfinished_blockers(conn, node.id)?
-                && !patch.force
-            {
+            if unfinished > 0 {
+                // Не отказ и не ложное `done`: работа по узлу прекращена, но не доведена.
+                // Цель заменяется на `incomplete`, и замена проходит ту же проверку матрицы —
+                // из `idea`/`backlog` такой переход запрещён, и тогда остаётся прежний явный
+                // отказ с числом детей: там ещё ничего не решено.
+                if Status::can_transition(node.stored_status(), Status::Incomplete, node.kind()) {
+                    patch.status = Some(Status::Incomplete);
+                } else {
+                    return Err(Error::ChildrenUnfinished {
+                        dot_id: node.dot_id.clone(),
+                        unfinished,
+                    });
+                }
+            } else if let Some(blockers) = unfinished_blockers(conn, node.id)? {
                 return Err(Error::UnmetPrerequisites {
                     dot_id: node.dot_id.clone(),
                     blockers,
@@ -766,10 +776,11 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
         values.push(Value::Text(assignee.to_string()));
     }
     if filter.overdue {
-        sql.push_str(
+        sql.push_str(&format!(
             " AND e.due_date IS NOT NULL AND e.due_date < date('now')
-               AND e.effective_status NOT IN ('done', 'cancelled')",
-        );
+               AND {}",
+            crate::status::not_terminal_sql("e.effective_status")
+        ));
     }
 
     let mut stmt = conn.prepare(&sql)?;
@@ -833,10 +844,11 @@ pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
         }
     }
     if filter.overdue {
-        sql.push_str(
+        sql.push_str(&format!(
             " AND e.due_date IS NOT NULL AND e.due_date < date('now')
-               AND e.effective_status NOT IN ('done', 'cancelled')",
-        );
+               AND {}",
+            crate::status::not_terminal_sql("e.effective_status")
+        ));
     }
     sql.push_str(" ORDER BY pr.key, e.depth, e.path");
 

@@ -46,8 +46,13 @@ pub struct Theme {
     pub active: Color,
     /// Узел заблокирован.
     pub blocked: Color,
-    /// Узел закрыт: `done`.
+    /// Узел закрыт и выполнен: `done`.
     pub done: Color,
+    /// Узел закрыт, но не доведён: `incomplete` (эпик прекращён с открытыми задачами).
+    ///
+    /// Свой цвет, а не `done` и не `cancelled`: на экране это третий исход, и человек должен
+    /// видеть его с первого взгляда — иначе «закрыто» снова читается как «сделано».
+    pub incomplete: Color,
     /// Узел отменён или отложен.
     pub cancelled: Color,
     /// Просрочка.
@@ -100,6 +105,7 @@ impl Theme {
         active: Color::LightYellow,
         blocked: Color::LightRed,
         done: Color::Green,
+        incomplete: Color::Yellow,
         cancelled: Color::DarkGray,
         overdue: Color::LightRed,
         leased: Color::LightMagenta,
@@ -124,6 +130,7 @@ impl Theme {
         active: Color::Yellow,
         blocked: Color::Red,
         done: Color::Green,
+        incomplete: Color::Rgb(122, 94, 0),
         cancelled: Color::Gray,
         overdue: Color::Red,
         leased: Color::Magenta,
@@ -146,6 +153,7 @@ impl Theme {
         active: Color::Rgb(250, 189, 47),
         blocked: Color::Rgb(251, 73, 52),
         done: Color::Rgb(142, 192, 124),
+        incomplete: Color::Rgb(152, 151, 26),
         cancelled: Color::Rgb(102, 92, 84),
         overdue: Color::Rgb(251, 73, 52),
         leased: Color::Rgb(211, 134, 155),
@@ -168,6 +176,7 @@ impl Theme {
         active: Color::Rgb(181, 118, 20),
         blocked: Color::Rgb(157, 0, 6),
         done: Color::Rgb(121, 116, 14),
+        incomplete: Color::Rgb(110, 96, 0),
         cancelled: Color::Rgb(146, 131, 116),
         overdue: Color::Rgb(157, 0, 6),
         leased: Color::Rgb(143, 63, 113),
@@ -190,6 +199,7 @@ impl Theme {
         active: Color::Rgb(235, 203, 139),
         blocked: Color::Rgb(191, 97, 106),
         done: Color::Rgb(163, 190, 140),
+        incomplete: Color::Rgb(208, 135, 112),
         cancelled: Color::Rgb(76, 86, 106),
         overdue: Color::Rgb(191, 97, 106),
         leased: Color::Rgb(180, 142, 173),
@@ -214,6 +224,7 @@ impl Theme {
         active: Color::Rgb(163, 122, 30),
         blocked: Color::Rgb(191, 97, 106),
         done: Color::Rgb(94, 129, 76),
+        incomplete: Color::Rgb(176, 106, 60),
         cancelled: Color::Rgb(129, 141, 159),
         overdue: Color::Rgb(191, 97, 106),
         leased: Color::Rgb(143, 100, 140),
@@ -276,6 +287,7 @@ impl Theme {
             "todo" | "in_progress" | "review" => self.active,
             "blocked" => self.blocked,
             "done" => self.done,
+            "incomplete" => self.incomplete,
             "cancelled" | "deferred" => self.cancelled,
             _ => self.text,
         }
@@ -420,6 +432,7 @@ mod tests {
                 ("review", theme.active),
                 ("blocked", theme.blocked),
                 ("done", theme.done),
+                ("incomplete", theme.incomplete),
                 ("cancelled", theme.cancelled),
                 ("deferred", theme.cancelled),
             ] {
@@ -442,6 +455,10 @@ mod tests {
             let pairs = [
                 ("done", theme.done, theme.blocked),
                 ("done", theme.done, theme.error),
+                ("incomplete", theme.incomplete, theme.done),
+                ("incomplete", theme.incomplete, theme.cancelled),
+                ("incomplete", theme.incomplete, theme.active),
+                ("incomplete", theme.incomplete, theme.blocked),
                 ("blocked", theme.blocked, theme.active),
                 ("overdue", theme.overdue, theme.done),
                 ("leased", theme.leased, theme.done),

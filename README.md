@@ -295,12 +295,21 @@ CREATE TABLE burn_snapshots (
 `legacy_alter_table`, перестройка FTS — четыре места, где ошибка рвёт данные молча). Теперь новый
 статус — `INSERT` в справочник. Матрица переходов при этом **остаётся в коде**
 (`status::can_transition`): это правило проверки, а данные не тестируются — они лежат. В
-справочнике живёт только то, что читают запросы: порядок воронки `rank` и признак закрытости
-`terminal`. Совпадение справочника с `Status::all()` проверяется тестом.
+справочнике живёт только то, что читают запросы: порядок воронки `rank`, признак закрытости
+`terminal` и признак выполненности `counts_done`. Совпадение справочника с `Status::all()`
+проверяется тестом.
+
+`terminal` и `counts_done` — разные вопросы, и это разделение появилось в v11 вместе с
+`incomplete`: узел может быть закрыт, но не выполнен. У `done` 1/1, у `cancelled` 1/0,
+у `incomplete` 1/0. Закрытость и выполненность в запросах берутся из справочника
+(`status::not_terminal_sql`), а не литералами `IN ('done','cancelled')`: до v11 такой литерал
+жил в девятнадцати запросах и четырёх представлениях, и новый статус пришлось бы вписывать в
+каждое место — одно из них забывается (так уже выпал `import` из burn-up).
 
 ```sql
 CREATE TABLE statuses (name TEXT PRIMARY KEY, rank INTEGER NOT NULL UNIQUE,
-                       terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0,1)));
+                       terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0,1)),
+                       counts_done INTEGER NOT NULL DEFAULT 0 CHECK (counts_done IN (0,1)));
 ```
 
 **`node_status_history` — факт перехода отдельно от журнала.** `burnup` вынимал дату закрытия из
@@ -448,14 +457,30 @@ TASQ-12.3.1.4    её четвёртая микро-задача
 done**. Первые два состояния нужны, чтобы отделить «мысль» от «очереди»: в `idea` узел лежит, пока
 формулировка не созрела, в `backlog` — принят в работу, но ещё не готов к захвату.
 
+Из воронки есть три выхода, и это **три разных ответа**, а не два: `done` — работа сделана;
+`cancelled` — работу отменили, не начиная; `incomplete` — работу прекратили, не доведя. Последний
+и существует потому, что до него закрытие эпика с открытыми задачами имело только два исхода:
+отказ (`CHILDREN_UNFINISHED`) или ложное `done`, после которого отчёты считали эпик выполненным.
+
+`incomplete` закрыт (`terminal = 1`), но не выполнен (`counts_done = 0`). Отсюда его поведение:
+
+- из «что делать дальше» и из burn-up он уходит — работа по нему прекращена;
+- из списков и с доски он **не** уходит: под ним висят незавершённые задачи, и спрятать его
+  значит спрятать единственный сигнал «здесь остались хвосты». `ls -n` (скрыть `done`) скрывает
+  только `done`;
+- в прогресс он не идёт: эпик, прекращённый с четырьмя открытыми задачами, не показывает 100 %;
+- вернуть его в работу можно без `--force` — это и означает «закрыто, но не закончено»;
+- когда хвостов не осталось, а эпик всё ещё `incomplete`, `next` называет его отдельно:
+  переведите в `done`. Автоматического перехода нет: закрытие — решение человека.
+
 Наборы по `kind` (совместимы с saga; при импорте `completed → done`, `cancelled → cancelled`,
 `on_hold → planned`; `idea`/`backlog` — собственные состояния tasq и переносятся как есть):
 
 | kind | допустимые хранимые статусы |
 | --- | --- |
-| epic | idea, backlog, planned, in_progress, blocked, review, done, cancelled, deferred |
-| task | idea, backlog, todo, in_progress, blocked, review, done, cancelled, deferred |
-| subtask, micro | idea, backlog, todo, in_progress, blocked, review, done, cancelled, deferred |
+| epic | idea, backlog, planned, in_progress, blocked, review, done, cancelled, deferred, incomplete |
+| task | idea, backlog, todo, in_progress, blocked, review, done, cancelled, deferred, incomplete |
+| subtask, micro | idea, backlog, todo, in_progress, blocked, review, done, cancelled, deferred, incomplete |
 
 Разделение `planned`/`todo` — по уровню: планируют эпик, задачи получают `todo`. `idea` и `backlog`
 допустимы любому виду. Отказ `INVALID_TRANSITION` перечисляет допустимые статусы для текущего
@@ -467,24 +492,26 @@ done**. Первые два состояния нужны, чтобы отдел
 | из | в |
 | --- | --- |
 | (создание) | idea (все виды) |
-| idea | backlog, planned (epic), todo (остальные), in_progress, blocked, cancelled, deferred |
-| backlog | idea (сырая мысль), planned (epic), todo (остальные), in_progress, blocked, cancelled, deferred |
-| planned | idea, backlog, in_progress, blocked, cancelled, deferred |
-| todo | idea, backlog, in_progress, blocked, cancelled, deferred |
-| in_progress | review, done, blocked, todo (снять захват), backlog, cancelled, deferred |
-| review | in_progress, done, blocked, backlog, cancelled |
-| blocked | todo, in_progress (если блокеры сняты), backlog, cancelled |
-| deferred | todo, planned (epic), backlog, idea, cancelled |
-| done | in_progress (reopen), todo (reopen) — требует `force` |
+| idea | backlog, planned (epic), todo (остальные), in_progress, blocked, deferred, cancelled |
+| backlog | idea (сырая мысль), planned (epic), todo (остальные), in_progress, blocked, deferred, cancelled, incomplete |
+| planned | idea, backlog, in_progress, blocked, deferred, cancelled, incomplete |
+| todo | idea, backlog, in_progress, blocked, deferred, cancelled, incomplete |
+| in_progress | backlog, todo (снять захват), blocked, review, deferred, done, cancelled, incomplete |
+| review | backlog, in_progress, blocked, done, cancelled, incomplete |
+| blocked | backlog, todo, in_progress (если блокеры сняты), cancelled, incomplete |
+| deferred | idea, backlog, planned (epic), todo, cancelled, incomplete |
+| done | todo, in_progress (reopen) — требует `force` |
 | cancelled | todo (restore) — требует `force` |
+| incomplete | backlog, planned, todo, in_progress, review, done, cancelled — без `force` |
 
 Понижение в идею — обычный переход, а не ошибка: `todo → idea` возвращает сырую мысль в начало
 воронки, и это единственный способ держать «недодуманное» вне очереди.
 
 Флаги, меняющие строгость (а не подменяющие статус), соответствуют saga:
 
-- `force` — завершить узел с незакрытыми детьми (`CHILDREN_UNFINISHED`) или начать работу при
-  невыполненных предусловиях (`UNMET_PREREQUISITES`); факт `force` пишется в лог.
+- `force` — записать именно `done` при незакрытых детях (`CHILDREN_UNFINISHED`) или начать работу
+  при невыполненных предусловиях (`UNMET_PREREQUISITES`); факт `force` пишется в лог. Без `force`
+  закрытие узла с открытыми детьми даёт `incomplete`, а не отказ и не ложное `done`.
 - `description_locked` — защита постановки от перезаписи (`task_lock_description` в saga).
 
 Прочее:
@@ -1341,7 +1368,7 @@ up to date» в CI. Смысл в том, что справочник коман
 | этап | состояние | что проверено |
 | --- | --- | --- |
 | M0 каркас | готово | `init` идемпотентен, `doctor` чист, схема v2 создаётся миграциями, представления исполняются на данных |
-| M1 узлы и дерево | готово | dot-ID `TASQ-1.1.2`, `seq` не переиспользуется, три формы ссылки, матрица переходов с `force`, гварды `CHILDREN_UNFINISHED`/`LEASE_REQUIRED`, блокировка описания, перенос с пересчётом путей потомков, архив поддерева, мягкое удаление и восстановление, запись в лог на каждую мутацию |
+| M1 узлы и дерево | готово | dot-ID `TASQ-1.1.2`, `seq` не переиспользуется, три формы ссылки, матрица переходов с `force`, гварды `incomplete`/`LEASE_REQUIRED`, блокировка описания, перенос с пересчётом путей потомков, архив поддерева, мягкое удаление и восстановление, запись в лог на каждую мутацию |
 | M2 аренды | готово | захват атомарен (8 процессов, 10 кругов — ровно один победитель), второй захват получает `ACTIVE_ATTEMPT_EXISTS` с держателем и сроком, TTL в границах 60…28800, продление и отказ после истечения, чекпойнт наследуется при следующем захвате, просроченная аренда не блокирует, `--steal` для зависшего держателя, `doctor --gc` закрывает истёкшие и возвращает узел в `todo` |
 | M3 резервы | готово | путь сравнивается по границе сегмента (`src/api` задевает `src/api/x.rs`, но не `src/apix`), glob — консервативно по литеральным префиксам, `logical` — по точному равенству; `shared` конфликтует только с `exclusive`; резервы заявляются атомарно с арендой, снимаются при release, истечении и `--gc`; чужой резерв называет держателя и срок; выход за корень проекта — `PATH_OUTSIDE_PROJECT`; пересечения внутри одной заявки разрешены |
 | M4 зависимости | готово | ребро между любыми уровнями и ветвями, пять видов, идемпотентная вставка, `SELF_EDGE`/`ANCESTOR_BLOCK_EDGE`/`CYCLE_DETECTED` с путём круга, снятие последнего блокера возвращает узел в `todo`, `dep graph` показывает «ждёт / разблокирует / транзитивно / цепочка» и Mermaid, `next` объясняет выбор и не предлагает контейнеры и заблокированные узлы |

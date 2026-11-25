@@ -314,6 +314,12 @@ pub struct Board {
     pub leased: usize,
     pub open: usize,
     pub done: usize,
+    /// Закрыто, но не выполнено: эпик, прекращённый с открытыми задачами.
+    ///
+    /// Отдельным числом, а не внутри `done`: `done` в сводке означает «работа сделана», а
+    /// `incomplete` — «работу прекратили». Сложить их значило бы снова завысить результат.
+    #[serde(default)]
+    pub incomplete: usize,
 }
 
 pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
@@ -343,11 +349,17 @@ pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
     let mut leased = 0;
     let mut open = 0;
     let mut done = 0;
+    let mut incomplete = 0;
 
     for node in &nodes {
-        if matches!(node.effective_status.as_str(), "done" | "cancelled") {
-            if node.effective_status == "done" {
+        let status = crate::status::Status::parse(&node.effective_status);
+        // Закрытость и выполненность — разные вопросы. `incomplete` закрыт (работа прекращена),
+        // поэтому в «открыто» не идёт, но и в `done` не попадает: работа не сделана.
+        if status.is_some_and(crate::status::Status::is_terminal) {
+            if status.is_some_and(crate::status::Status::counts_as_done) {
                 done += 1;
+            } else if node.effective_status == "incomplete" {
+                incomplete += 1;
             }
         } else {
             open += 1;
@@ -355,8 +367,8 @@ pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
         if node.lease_holder.is_some() {
             leased += 1;
         }
-        let days_overdue = match (&node.due_date, node.effective_status.as_str()) {
-            (Some(due), status) if !matches!(status, "done" | "cancelled") => {
+        let days_overdue = match (&node.due_date, status) {
+            (Some(due), Some(status)) if !status.is_terminal() => {
                 let due_days = date_to_days(due).unwrap_or(today);
                 let delta = today - due_days;
                 if delta > 0 { delta } else { 0 }
@@ -399,6 +411,7 @@ pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
         leased,
         open,
         done,
+        incomplete,
     })
 }
 
