@@ -609,10 +609,23 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) -> Hits {
     // Шапка: счётчики доски. Проект здесь не выбирается — панель слева делает это лучше, показывая
     // все проекты и подсвечивая активный; дублировать её строкой «проект: KEY ▾» значит тратить
     // строку экрана на второе представление одного факта.
-    let counters = format!(
-        "открыто {}  закрыто {}  просрочено {}  в аренде {}",
-        app.board.open, app.board.done, app.board.overdue, app.board.leased
-    );
+    let counters = if app.board.incomplete > 0 {
+        // «Закрыто, но не доведено» называется отдельно и только когда оно есть: постоянный
+        // ноль в шапке — шум, а спрятать ненулевое значение — врать про состояние доски.
+        format!(
+            "открыто {}  закрыто {}  не доведено {}  просрочено {}  в аренде {}",
+            app.board.open,
+            app.board.done,
+            app.board.incomplete,
+            app.board.overdue,
+            app.board.leased
+        )
+    } else {
+        format!(
+            "открыто {}  закрыто {}  просрочено {}  в аренде {}",
+            app.board.open, app.board.done, app.board.overdue, app.board.leased
+        )
+    };
     // Одна строка, а не две: переключателя проекта в шапке нет. Панель слева показывает все
     // проекты и подсвечивает активный — второй способ выбрать то же самое занимал строку экрана
     // и подсказывал клавишу, которая и так написана внизу.
@@ -1394,6 +1407,7 @@ mod tests {
             leased: 1,
             open: 1,
             done: 0,
+            incomplete: 0,
         };
 
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
@@ -1422,6 +1436,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         };
         let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("terminal");
         let app = app::App::new(board.clone());
@@ -1492,6 +1507,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         };
         board.columns.push(overview::BoardColumn {
             status: "todo".to_string(),
@@ -1578,6 +1594,7 @@ mod tests {
             leased: 0,
             open: 3,
             done: 2,
+            incomplete: 0,
         };
 
         let highlighted = |board: &overview::Board, column: usize, row: usize| -> Option<String> {
@@ -1692,6 +1709,7 @@ mod tests {
             leased: 0,
             open: 2,
             done: 1,
+            incomplete: 0,
         };
         let mut app = app::App::new(board);
         app.state.view = model::View::Kanban;
@@ -1848,6 +1866,7 @@ mod tests {
             leased: 0,
             open: 2,
             done: 1,
+            incomplete: 0,
         };
         let mut app = app::App::new(board);
         app.state.view = model::View::Kanban;
@@ -1930,6 +1949,7 @@ mod tests {
             leased: 1,
             open: 1,
             done: 0,
+            incomplete: 0,
         };
         let app = app::App::new(board);
         let plain = render_once_sized(&app, 120, false);
@@ -1963,6 +1983,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         };
         let app = app::App::new(board);
         let coloured = render_once_sized(&app, 100, true);
@@ -1988,6 +2009,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         };
         let app = app::App::new(board);
         for width in [MIN_ONCE_WIDTH, 80, 140, 200] {
@@ -2051,6 +2073,7 @@ mod tests {
             leased: 0,
             open: 40,
             done: 0,
+            incomplete: 0,
         });
         app.state.row = 35;
 
@@ -2122,6 +2145,7 @@ mod tests {
             leased: 0,
             open: 1,
             done: 0,
+            incomplete: 0,
         };
         let mut app = app::App::new(board);
         app.state.view = model::View::Kanban;
@@ -2161,6 +2185,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         });
         let mut terminal = Terminal::new(TestBackend::new(ONCE_WIDTH, 30)).expect("terminal");
         let mut app = app;
@@ -2258,6 +2283,7 @@ mod tests {
             leased: 0,
             open: 2,
             done: 0,
+            incomplete: 0,
         };
         // Панель проектов рисуется, только когда проекты есть: без них размечать нечего.
         let summary = |key: &str| crate::project::Summary {
@@ -2350,6 +2376,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         });
         app.context = (1..=40).map(|n| format!("DEMO-{n} узел {n}")).collect();
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
@@ -2388,6 +2415,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         });
         app.context = (1..=40).map(|n| format!("DEMO-{n}")).collect();
 
@@ -2441,6 +2469,7 @@ mod tests {
             leased: 0,
             open: 1,
             done: 0,
+            incomplete: 0,
         });
         app.state.view = model::View::Kanban;
         app.detail = (1..=30)

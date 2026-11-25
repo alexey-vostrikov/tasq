@@ -1123,6 +1123,7 @@ mod tests {
             leased: 0,
             open: 0,
             done: 0,
+            incomplete: 0,
         }
     }
 
