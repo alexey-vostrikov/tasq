@@ -870,6 +870,67 @@ fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>>
     Ok(candidates)
 }
 
+/// Узел, закрытый как `incomplete`, у которого хвостов больше нет.
+///
+/// Это не кандидат к работе: узел закрыт, и предлагать его в «что делать дальше» значило бы
+/// вернуть в работу прекращённое. Но и молчать нельзя: задачи под ним доделаны, а эпик всё ещё
+/// числится недоведённым, и решение «перевести в done» человек должен увидеть.
+#[derive(Debug, Clone, Serialize)]
+pub struct Closable {
+    pub dot_id: String,
+    pub title: String,
+    /// Проект: заполняется там, где работа идёт по нескольким проектам.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+/// Недоведённые узлы проекта, под которыми не осталось незакрытых детей.
+///
+/// Автоматического перехода в `done` нет намеренно: закрытие — решение человека, а не следствие
+/// того, что кто-то закрыл последнюю задачу. Здесь только подсказка.
+pub fn closable(conn: &Connection, project: &Project) -> Result<Vec<Closable>> {
+    let unfinished_children = crate::status::not_terminal_sql("c.status");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.path, e.title FROM nodes e
+         WHERE e.project_id = ?1
+           AND e.deleted_at IS NULL
+           AND e.archived_at IS NULL
+           AND e.status = ?2
+           AND NOT EXISTS (
+             SELECT 1 FROM nodes c WHERE c.parent_id = e.id AND c.deleted_at IS NULL
+               AND {unfinished_children})
+         ORDER BY e.path"
+    ))?;
+    let rows = stmt.query_map(
+        params![project.id, crate::status::Status::Incomplete.as_str()],
+        |row| {
+            Ok(Closable {
+                dot_id: project.dot_id(&row.get::<_, String>(0)?),
+                title: row.get(1)?,
+                project: None,
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// То же по всем проектам базы: вызывающему нужен один список, а не по одному на проект.
+pub fn closable_across(conn: &Connection) -> Result<Vec<Closable>> {
+    let mut out = Vec::new();
+    for summary in crate::project::list(conn)? {
+        let Some(project) = crate::project::by_key(conn, &summary.key)? else {
+            continue;
+        };
+        for closable in closable(conn, &project)? {
+            out.push(Closable {
+                project: Some(summary.key.clone()),
+                ..closable
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Что брать дальше с учётом привязки сессии к проекту.
 ///
 /// Правило простое и повторяет то, как работает человек: пока в своём проекте есть что брать —

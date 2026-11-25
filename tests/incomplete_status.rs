@@ -174,3 +174,55 @@ fn closed_node_cannot_be_claimed() {
         "ожидался NODE_CLOSED: {stderr}"
     );
 }
+
+/// Подсказка «хвостов нет — переведите в done»: пока дети открыты, её нет; когда последний
+/// ребёнок закрыт, `next` называет эпик. Автоперехода при этом не происходит.
+#[test]
+fn next_points_at_the_epic_once_the_leftovers_are_gone() {
+    let dir = seeded("closable");
+    assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
+
+    let (code, before, stderr) = run(&dir, &["next"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        !before.contains("closed as incomplete"),
+        "подсказка не должна появляться при открытом ребёнке:\n{before}"
+    );
+
+    // Закрываем последнего открытого ребёнка обычным путём: очередь → аренда → done.
+    for step in [
+        vec!["set", "TASQ-1.1", "--status", "backlog"],
+        vec!["set", "TASQ-1.1", "--status", "todo"],
+    ] {
+        assert_eq!(run(&dir, &step).0, 0);
+    }
+    let (code, claim, stderr) = run(&dir, &["claim", "TASQ-1.1", "--holder", "t", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let token = claim
+        .lines()
+        .find_map(|line| line.split("\"token\": \"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .expect("token")
+        .to_string();
+    assert_eq!(
+        run(&dir, &["release", &token, "--outcome", "completed"]).0,
+        0
+    );
+
+    let (code, after, stderr) = run(&dir, &["next"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        after.contains("closed as incomplete"),
+        "подсказки нет, хотя хвостов не осталось:\n{after}"
+    );
+    assert!(
+        after.contains("TASQ-1 "),
+        "в подсказке нет самого эпика:\n{after}"
+    );
+
+    // Автоперехода нет: эпик по-прежнему `incomplete`, пока человек не решит иначе.
+    let (code, stdout, stderr) = run(&dir, &["show", "TASQ-1", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let node: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(node["status"], "incomplete");
+}

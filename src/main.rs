@@ -990,6 +990,24 @@ fn run_completions(shell: clap_complete::Shell, out: Option<&std::path::Path>) -
     Ok(ExitCode::SUCCESS)
 }
 
+/// Подсказка «закрыто, но не доведено, а хвостов больше нет».
+///
+/// Печатается после списка кандидатов и только когда такие узлы есть: пустая секция — шум, а
+/// молчание спрятало бы от человека решение, которое он уже почти принял.
+fn print_closable(closable: &[edge::Closable]) {
+    if closable.is_empty() {
+        return;
+    }
+    println!();
+    println!("closed as incomplete, but no open children left — move them to done:");
+    for node in closable {
+        match &node.project {
+            Some(project) => println!("  {:<18} {}  ({project})", node.dot_id, node.title),
+            None => println!("  {:<18} {}", node.dot_id, node.title),
+        }
+    }
+}
+
 /// Печать «что делать дальше» с указанием, откуда взялся кандидат.
 ///
 /// Пометка нужна, чтобы переход «в своём проекте брать нечего, предлагаю чужой» не выглядел как
@@ -2141,6 +2159,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if let Some(key) = cli.project.as_deref() {
                 let (conn, project) = open(cli.db.as_deref(), Some(key))?;
                 let candidates = edge::next_candidates(&conn, &project, *limit)?;
+                let closable = edge::closable(&conn, &project)?;
                 if cli.json {
                     print_json(&candidates);
                     return Ok(ExitCode::SUCCESS);
@@ -2149,6 +2168,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     &candidates,
                     &[(project.key.clone(), edge::Origin::Affinity)],
                 );
+                print_closable(&closable);
                 return Ok(ExitCode::SUCCESS);
             }
 
@@ -2163,11 +2183,13 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 None => None,
             };
             let next = edge::next_across(&conn, affinity.as_deref(), *limit)?;
+            let closable = edge::closable_across(&conn)?;
             if cli.json {
                 print_json(&next.candidates);
                 return Ok(ExitCode::SUCCESS);
             }
             print_candidates(&next.candidates, &next.origin);
+            print_closable(&closable);
             Ok(ExitCode::SUCCESS)
         }
 
