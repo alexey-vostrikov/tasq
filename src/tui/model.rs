@@ -152,6 +152,10 @@ pub enum Intent {
     ProjectOpen,
     /// Следующая цветовая тема.
     NextTheme,
+    /// Скрыть или показать выполненное (`ls -n`): недоведённое остаётся на экране.
+    ToggleDone,
+    /// Показать или скрыть архив (`ls -a`).
+    ToggleArchived,
     /// Прокрутка панели под канбаном или справа: страница вниз, вверх, к началу.
     ///
     /// Панель — не доска: у неё нет курсора, и двигать там нечего. Поэтому прокручивается само
@@ -273,6 +277,10 @@ pub fn intent(mode: Mode, key: Key) -> Option<Intent> {
         K::Char('/') => Some(I::Search),
         K::Char('v') => Some(I::ToggleView),
         K::Char('T') => Some(I::NextTheme),
+        // Переключатели вида доски: те же два, что у `ls -n` и `ls -a`. Заглавные, потому что
+        // строчные заняты: `a` создаёт узел, `n` пишет заметку.
+        K::Char('D') => Some(I::ToggleDone),
+        K::Char('A') => Some(I::ToggleArchived),
         K::Tab => Some(I::FocusNext),
         // Панель листается страницами, а не строками: строка в ней — это часть абзаца, и
         // построчное движение заставляло бы читать по одной строке.
@@ -574,6 +582,8 @@ impl State {
                 }
             }
             I::NextTheme => O::Act(I::NextTheme),
+            I::ToggleDone => O::Act(I::ToggleDone),
+            I::ToggleArchived => O::Act(I::ToggleArchived),
             // Панели листает экран, а не модель: предел прокрутки и высоту панели знает кадр.
             // Здесь эти намерения — «ничего не знаю», а не ошибка.
             I::ScrollDown | I::ScrollUp | I::ScrollTop => O::Ignored,

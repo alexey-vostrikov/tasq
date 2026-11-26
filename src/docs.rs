@@ -323,7 +323,12 @@ pub fn drift_error(drift: &[String]) -> Error {
 /// Форма строк зафиксирована шаблоном, а не угадыванием: если строку перепишут так, что шаблон
 /// перестанет её находить, проверка скажет об этом прямо. Молча пропущенный шаблон — та же ложь,
 /// что и устаревшее число.
-pub fn check_readme(readme: &Path, tool_count: usize, profiles: &[(String, i64)]) -> Vec<String> {
+pub fn check_readme(
+    readme: &Path,
+    tool_count: usize,
+    profiles: &[(String, i64)],
+    profile_tools: &[(String, usize)],
+) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(readme) else {
         return vec![format!("{} отсутствует", readme.display())];
     };
@@ -409,6 +414,80 @@ pub fn check_readme(readme: &Path, tool_count: usize, profiles: &[(String, i64)]
         ));
     }
 
+    drift.extend(check_profile_table(readme, &text, profiles, profile_tools));
+    drift
+}
+
+/// Одна строка таблицы профилей из README: `| `full` | 45 | ≤ 6 000 | 5 428 |`.
+///
+/// Нужна, чтобы таблица §13.2 не старела молча: числа инструментов и токенов там такие же
+/// факты, как и в строке «каталог `tools/list`», и проверяются тем же прогоном.
+fn check_profile_table(
+    readme: &Path,
+    text: &str,
+    profiles: &[(String, i64)],
+    profile_tools: &[(String, usize)],
+) -> Vec<String> {
+    let mut drift = Vec::new();
+    for (name, tokens) in profiles {
+        let Some((index, line)) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.starts_with(&format!("| `{name}` |")))
+        else {
+            drift.push(format!(
+                "{}: нет строки таблицы профилей для «{name}»",
+                readme.display()
+            ));
+            continue;
+        };
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len() < 4 {
+            drift.push(format!(
+                "{}:{}: строка профиля «{name}» короче таблицы",
+                readme.display(),
+                index + 1
+            ));
+            continue;
+        }
+        // Ячейки: имя, инструментов, бюджет-цель, факт токенов. Пробелы-разделители тысяч
+        // пишутся для человека, поэтому числа разбираются без них.
+        let documented_tools: usize = cells[1].parse().unwrap_or_else(|_| {
+            drift.push(format!(
+                "{}:{}: число инструментов у «{name}» не разобрать",
+                readme.display(),
+                index + 1
+            ));
+            0
+        });
+        let documented_tokens: i64 = cells[cells.len() - 1]
+            .replace([' ', '\u{202f}'], "")
+            .parse()
+            .unwrap_or_else(|_| {
+                drift.push(format!(
+                    "{}:{}: стоимость «{name}» не разобрать",
+                    readme.display(),
+                    index + 1
+                ));
+                0
+            });
+        if let Some((_, actual)) = profile_tools.iter().find(|(key, _)| key == name)
+            && documented_tools != *actual
+        {
+            drift.push(format!(
+                "{}:{}: README обещает {name} {documented_tools} инструментов, в профиле {actual}",
+                readme.display(),
+                index + 1
+            ));
+        }
+        if documented_tokens != *tokens {
+            drift.push(format!(
+                "{}:{}: README обещает {name} {documented_tokens} токенов, в каталоге {tokens}",
+                readme.display(),
+                index + 1
+            ));
+        }
+    }
     drift
 }
 
@@ -420,4 +499,12 @@ pub fn readme_facts() -> (usize, Vec<(String, i64)>) {
         .map(|report| (report.profile, report.tokens as i64))
         .collect();
     (ALL_TOOLS.len(), profiles)
+}
+
+/// Сколько инструментов в каждом профиле — для проверки таблицы §13.2.
+pub fn profile_sizes() -> Vec<(String, usize)> {
+    budget::measure_all()
+        .into_iter()
+        .map(|report| (report.profile, report.tools))
+        .collect()
 }

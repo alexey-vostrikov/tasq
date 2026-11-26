@@ -84,7 +84,13 @@ fn generated_reference_covers_every_command_and_tool() {
     assert!(cli.contains("--json"), "глобальные флаги описаны");
 
     let tools = fs::read_to_string(dir.join("mcp-tools.md")).expect("mcp-tools.md");
-    assert!(tools.contains("Всего инструментов: 45"), "{tools}");
+    // Число берётся у бинаря, а не пишется в тесте: иначе тест держит третью копию счёта,
+    // которая расходится с каталогом молча — ровно та болезнь, которую ловит `docs --check`.
+    let (count, _) = tasq::docs::readme_facts();
+    assert!(
+        tools.contains(&format!("Всего инструментов: {count}")),
+        "{tools}"
+    );
     for name in [
         "tasq_claim",
         "node_create",
@@ -291,6 +297,7 @@ fn readme_numbers_are_checked_against_the_binary() {
     ));
     fs::create_dir_all(&dir).expect("temp dir");
     let (tools, profiles) = docs::readme_facts();
+    let sizes = docs::profile_sizes();
     assert!(tools > 0 && !profiles.is_empty(), "факты пусты");
 
     let profile_line: String = profiles
@@ -298,21 +305,34 @@ fn readme_numbers_are_checked_against_the_binary() {
         .map(|(name, tokens)| format!("{name} {tokens}"))
         .collect::<Vec<_>>()
         .join(" / ");
+    // Таблица профилей — отдельная часть проверки, поэтому в образце она тоже есть.
+    let table: String = profiles
+        .iter()
+        .map(|(name, tokens)| {
+            let count = sizes
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, count)| *count)
+                .expect("профиль есть в обоих списках");
+            format!("| `{name}` | {count} | ≤ 1 | {tokens} |\n")
+        })
+        .collect();
     let honest = format!(
         "| `docs/mcp-tools.md` | каталог `tools/list` | {tools} инструмента, ... |\n\
-         | M8 | готово | профили: {profile_line} токенов, все в бюджете |\n"
+         | M8 | готово | профили: {profile_line} токенов, все в бюджете |\n\
+         | профиль | инструментов | бюджет | факт |\n{table}"
     );
     let path = dir.join("README.md");
     fs::write(&path, &honest).expect("write");
     assert!(
-        docs::check_readme(&path, tools, &profiles).is_empty(),
+        docs::check_readme(&path, tools, &profiles, &sizes).is_empty(),
         "верные числа не должны давать расхождений"
     );
 
     // Одно число испорчено — гейт обязан назвать файл и строку, а не промолчать.
     let stale = honest.replace(&format!("{tools} инструмента"), "43 инструмента");
     fs::write(&path, &stale).expect("write");
-    let drift = docs::check_readme(&path, tools, &profiles);
+    let drift = docs::check_readme(&path, tools, &profiles, &sizes);
     assert_eq!(drift.len(), 1, "{drift:?}");
     assert!(drift[0].contains("README.md:1"), "{drift:?}");
     assert!(drift[0].contains("43"), "{drift:?}");
@@ -320,7 +340,7 @@ fn readme_numbers_are_checked_against_the_binary() {
 
     // Строка исчезла совсем — это тоже расхождение: молча пропущенный шаблон прячет ошибку.
     fs::write(&path, "ничего не написано\n").expect("write");
-    let drift = docs::check_readme(&path, tools, &profiles);
+    let drift = docs::check_readme(&path, tools, &profiles, &sizes);
     assert!(
         drift.iter().any(|item| item.contains("не найдена")),
         "{drift:?}"
@@ -335,6 +355,7 @@ fn the_repository_readme_matches_the_binary() {
     use tasq::docs;
 
     let (tools, profiles) = docs::readme_facts();
-    let drift = docs::check_readme(std::path::Path::new("README.md"), tools, &profiles);
+    let sizes = docs::profile_sizes();
+    let drift = docs::check_readme(std::path::Path::new("README.md"), tools, &profiles, &sizes);
     assert!(drift.is_empty(), "{drift:?}");
 }

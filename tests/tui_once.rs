@@ -136,3 +136,31 @@ fn a_broken_columns_value_falls_back() {
         "кадр сверстался уже, чем запасная ширина: fallback не сработал"
     );
 }
+
+/// Переключатели вида доски: `D` прячет выполненное, `A` показывает архив.
+///
+/// Проверяется связка «клавиша → намерение»: само переключение делает `App::perform`, у которого
+/// есть соединение с базой, а поведение фильтра проверяется на доске отдельно
+/// (`tests/incomplete_status.rs`).
+#[test]
+fn board_toggle_keys_are_bound_and_letters_stay_taken() {
+    use tasq::tui::model::{self, Intent, Key};
+
+    assert_eq!(
+        model::intent(model::Mode::Board, Key::Char('D')),
+        Some(Intent::ToggleDone)
+    );
+    assert_eq!(
+        model::intent(model::Mode::Board, Key::Char('A')),
+        Some(Intent::ToggleArchived)
+    );
+    // Строчные остаются за своими действиями: переключатели взяли заглавные не случайно.
+    assert_eq!(
+        model::intent(model::Mode::Board, Key::Char('a')),
+        Some(Intent::Create)
+    );
+    assert_eq!(
+        model::intent(model::Mode::Board, Key::Char('n')),
+        Some(Intent::AddNote)
+    );
+}

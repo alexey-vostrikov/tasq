@@ -86,6 +86,9 @@ pub struct App {
     /// освободится сам. Хранить токены в базе значило бы сделать экран единственным, кто может
     /// отпустить взятую им работу.
     pub tokens: HashMap<String, String>,
+    /// Что показывать: скрыть выполненное и/или показать архив. Живёт на экране и
+    /// переключается клавишами — те же два режима, что у `ls -n` и `ls -a`.
+    pub board_filter: overview::BoardFilter,
 }
 
 impl App {
@@ -117,6 +120,7 @@ impl App {
             comments: Vec::new(),
             kinds: HashMap::new(),
             tokens: HashMap::new(),
+            board_filter: overview::BoardFilter::default(),
         }
     }
 
@@ -204,7 +208,7 @@ impl App {
         // отпустил бы не тот узел (в живом прогоне это и вышло: `NOT_YOUR_ATTEMPT` на верном
         // нажатии).
         let keep = self.selected().map(|row| row.dot_id.clone());
-        self.board = overview::board(conn, project)?;
+        self.board = overview::board_with(conn, project, self.board_filter)?;
         self.state.rows = self
             .board
             .columns
@@ -800,6 +804,24 @@ impl App {
     /// Отказ, напечатанный в stdout, сломает кадр; отказ, проглоченный молча, выглядит как
     /// неработающая клавиша. Поэтому одна строка внизу экрана — и она снимается первым же
     /// успешным действием.
+    /// Перечитать доску с текущими переключателями вида и сказать, что изменилось.
+    ///
+    /// Отдельный путь от `refresh`: переключатель — действие человека, и оно обязано быть
+    /// видно в строке состояния. Молчаливое перечитывание оставило бы вопрос «а архив теперь
+    /// показан или нет?» без ответа, и человек нажимал бы клавишу второй раз.
+    fn reload(
+        &mut self,
+        conn: &mut rusqlite::Connection,
+        project: &crate::project::Project,
+        note: &str,
+    ) -> Outcome {
+        match self.refresh(&*conn, project) {
+            Ok(()) => self.say(note.to_string()),
+            Err(err) => self.fail(describe(&err)),
+        }
+        Outcome::Redraw
+    }
+
     pub fn say(&mut self, text: impl Into<String>) {
         self.message = Some(text.into());
         self.level = Level::Ok;
@@ -914,6 +936,26 @@ impl App {
                 self.next_theme();
                 return Outcome::Redraw;
             }
+            Intent::ToggleDone => {
+                // Переключатель вида, а не правка узла: курсор остаётся на том же узле, если
+                // он ещё виден, иначе подтягивается к границам — это делает `refresh`.
+                self.board_filter.hide_done = !self.board_filter.hide_done;
+                let shown = if self.board_filter.hide_done {
+                    "выполненное скрыто"
+                } else {
+                    "выполненное показано"
+                };
+                return self.reload(conn, project, shown);
+            }
+            Intent::ToggleArchived => {
+                self.board_filter.show_archived = !self.board_filter.show_archived;
+                let shown = if self.board_filter.show_archived {
+                    "архив показан"
+                } else {
+                    "архив скрыт"
+                };
+                return self.reload(conn, project, shown);
+            }
             Intent::SearchRun => {
                 self.run_search(&*conn);
                 return Outcome::Redraw;
@@ -983,6 +1025,7 @@ impl App {
                 self.next_theme();
                 Ok("")
             }
+            Intent::ToggleDone | Intent::ToggleArchived => Ok(""),
             Intent::SubmitForm => self.submit(conn, project),
             Intent::SearchRun | Intent::SearchOpen | Intent::ResultDown | Intent::ResultUp => {
                 Ok("")
