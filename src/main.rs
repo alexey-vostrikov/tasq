@@ -455,6 +455,9 @@ enum Command {
         /// With --once: print the frame with ANSI colours (the width follows the terminal)
         #[arg(long)]
         color: bool,
+        /// On exit: print how often the screen asked the database whether anything changed
+        #[arg(long)]
+        stats: bool,
     },
     /// Run the MCP server over stdio
     Mcp {
@@ -2579,7 +2582,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Tui { once, theme, color } => {
+        Command::Tui {
+            once,
+            theme,
+            color,
+            stats,
+        } => {
             // Проект здесь не обязателен: `open` требует `--project` при нескольких проектах, а
             // экран сам показывает все и даёт переключатель. База находится там же, где у
             // остальных команд.
@@ -2587,6 +2595,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let path = db::discover(&cwd, cli.db.as_deref())?;
             let mut conn = db::open_checked(&path)?;
             // `--color` без `--once` бессмыслен: интерактивный экран и так цветной.
+            // `--stats` без интерактивного экрана бессмыслен: один кадр `--once` не живёт ни
+            // одного тика, и сторожу нечего считать.
+            if *stats && *once {
+                return Err(Error::InvalidValue {
+                    field: "--stats".to_string(),
+                    value: "only works without --once".to_string(),
+                });
+            }
             if *color && !*once {
                 return Err(Error::InvalidValue {
                     field: "--color".to_string(),
@@ -2599,6 +2615,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 theme.as_deref(),
                 *once,
                 *color,
+                *stats,
             )?;
             Ok(ExitCode::SUCCESS)
         }

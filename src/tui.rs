@@ -43,12 +43,14 @@ use crate::overview;
 /// ширину неоткуда взять: у терминала она своя (см. [`once_width`]).
 pub const ONCE_WIDTH: u16 = 140;
 
-/// Как часто перерисовывать кадр без событий.
+/// Как часто просыпаться, чтобы спросить терминал о нажатии.
 ///
-/// Ноль событий — не повод крутиться в цикле на 100 % процессора, и не повод стоять часами:
-/// доска меняется и без нажатий (истекает аренда, другой агент закрывает узел). Четверть
-/// секунды — цена одного чтения доски на машине, где их тысячи, и заметная глазом задержка.
+/// Это НЕ период перечитывания доски. Ноль событий — не повод крутиться на 100 % процессора,
+/// но и не повод запаздывать с реакцией на клавишу: четверть секунды — та граница, за которой
+/// нажатие начинает ощущаться запаздывающим. База проверяется здесь же, но одним `PRAGMA`
+/// (1,4 мкс), а доска читается только когда сторож увидел изменение.
 const TICK: Duration = Duration::from_millis(250);
+
 /// Ширина панели проектов.
 ///
 /// Двадцать четыре знака: ключ проекта до восьми (таков предел в схеме), остальное — счётчик
@@ -74,6 +76,7 @@ pub fn run(
     theme: Option<&str>,
     once: bool,
     color: bool,
+    stats: bool,
 ) -> Result<()> {
     let mut app = build(conn, start, theme)?;
 
@@ -100,7 +103,7 @@ pub fn run(
         restore_terminal();
         chained(info);
     }));
-    let outcome = event_loop(std::io::stdout(), conn, &mut app);
+    let outcome = event_loop(std::io::stdout(), conn, &mut app, stats);
     // Обработчик снимается при обычном выходе: иначе он остался бы висеть на процесс, который
     // дальше живёт своей жизнью (MCP-сервер, тесты в одном бинаре).
     let _ = std::panic::take_hook();
@@ -151,7 +154,7 @@ fn build(conn: &Connection, start: Option<&str>, theme: Option<&str>) -> Result<
 }
 
 /// Цикл: кадр → событие → решение. Тело решения в `App::step`, здесь только ввод-вывод.
-fn event_loop<W>(mut out: W, conn: &mut Connection, app: &mut app::App) -> Result<()>
+fn event_loop<W>(mut out: W, conn: &mut Connection, app: &mut app::App, stats: bool) -> Result<()>
 where
     W: std::io::Write,
 {
@@ -168,6 +171,11 @@ where
 
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
+
+    // Сторож за базой объявлен ДО цикла, хотя нужен только внутри: счётчики печатаются после
+    // выхода из него, а экран к этому моменту уже восстановлен — иначе строка уехала бы в чужой
+    // буфер и исчезла вместе с ним.
+    let mut watch = crate::watch::Watch::new(conn)?;
 
     let result = (|| -> Result<()> {
         loop {
@@ -187,13 +195,26 @@ where
                 break;
             }
             if !event::poll(TICK)? {
-                // Пауза без событий: доска могла измениться извне, поэтому перечитываем её, а не
-                // перерисовываем тот же снимок. Ошибка чтения не выходит из цикла — она
-                // показывается в строке состояния: база, запертая другим процессом, не повод
-                // терять экран.
-                if let Err(err) = app.refresh_active(&*conn) {
-                    app.fail(app::describe(&err));
+                // Пауза без событий. Доска меняется и без нажатий (истекает аренда, другой агент
+                // закрывает узел), но узнать об этом дёшево: `data_version` — счётчик коммитов
+                // ЧУЖИХ соединений, одно чтение которого стоит микросхему времени против
+                // полутора сотен миллисекунд полного чтения на десяти тысячах узлов.
+                //
+                // Ошибка чтения не выходит из цикла — она показывается в строке состояния:
+                // база, запертая другим процессом, не повод терять экран.
+                match watch.changed(&*conn) {
+                    Ok(true) => {
+                        if let Err(err) = app.refresh_active(&*conn) {
+                            app.fail(app::describe(&err));
+                        }
+                    }
+                    // Изменений нет — делать нечего. Кадр рисуется в начале цикла и показывает
+                    // уже прочитанное: часы (истечение аренды, наступление просрочки) идут от
+                    // времени, а не от записи в базе, и обновляются на следующей отрисовке.
+                    Ok(false) => {}
+                    Err(err) => app.fail(app::describe(&err)),
                 }
+                app.stats = watch.stats();
                 continue;
             }
             let event = event::read()?;
@@ -212,6 +233,11 @@ where
                     if let Err(err) = app.refresh_active(&*conn) {
                         app.fail(app::describe(&err));
                     }
+                    // Перечитывание по действию человека: `data_version` СВОЮ запись не видит
+                    // никогда, поэтому такие чтения учитываются отдельно и не считаются работой
+                    // в простое.
+                    watch.note_refresh();
+                    app.stats = watch.stats();
                 }
                 model::Outcome::Ignored => {}
             }
@@ -225,6 +251,18 @@ where
     guard.restore();
     drop(guard);
     signals.remove();
+    if stats {
+        // Число, а не ощущение: приёмка «в простое не читаем доску» проверяется этой строкой и
+        // тестом на псевдотерминале, а не глазами по загрузке процессора.
+        let counts = watch.stats();
+        println!(
+            "watch: {} checks, {} board reads on change, {} board reads by hand, {} idle",
+            counts.checks,
+            counts.changes,
+            counts.refreshes.saturating_sub(counts.changes),
+            counts.idle_refreshes(),
+        );
+    }
     result
 }
 
@@ -1564,7 +1602,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tasq-tui-run-{nanos}"));
         let outcome = crate::db::init(&dir, "RUN", "run").expect("init");
         let mut conn = crate::db::open(std::path::Path::new(&outcome.db_path)).expect("open");
-        run(&mut conn, None, None, true, false).expect("один кадр в обычный вывод без --project");
+        run(&mut conn, None, None, true, false, false)
+            .expect("один кадр в обычный вывод без --project");
     }
 
     /// Курсор ВИДЕН: строка под ним помечена реверсом, и помечена ровно одна.

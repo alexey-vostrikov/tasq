@@ -34,6 +34,13 @@ const BUDGET_NEXT_MS: u128 = 100;
 const BUDGET_LS_MS: u128 = 550;
 const BUDGET_LS_COMPACT_MS: u128 = 480;
 
+/// Бюджет проверки сторожа в микросекундах.
+///
+/// Замерено 1,4 мкс на живой базе и на фикстуре 10 000 узлов; бюджет в сто раз больше, потому что
+/// гейт обязан ловить «сторож стал читать доску», а не дрожание контейнера. Отдельный бюджет, а не
+/// «оно и так быстро»: именно это число и есть выигрыш эпика, и его нельзя оставить без охраны.
+const BUDGET_CHECK_US: u128 = 100;
+
 /// Сколько раз мерить каждую операцию.
 const ROUNDS: usize = 40;
 
@@ -129,6 +136,24 @@ fn reading_a_ten_thousand_node_project_stays_within_budget() {
             .collect();
     });
 
+    // Сторож за базой: цена одного вопроса «изменилось ли что-нибудь». Это то, что экран делает
+    // вместо перечитывания доски, и потому именно это отношение задаёт выигрыш: миллисекунды
+    // доски против микросекунд прагмы на одном и том же узле в одно и то же время.
+    let mut watch = tasq::watch::Watch::new(&conn).expect("watch");
+    const CHECK_ROUNDS: u32 = 10_000;
+    let started = Instant::now();
+    for _ in 0..CHECK_ROUNDS {
+        assert!(
+            !watch.changed(&conn).expect("check"),
+            "в простое изменения быть не может"
+        );
+    }
+    // Наносекунды, а не микросекунды: проверка укладывается в единицы микросекунд, и целое
+    // деление показало бы «1» там, где важно 1,4 против 1,9 — это разница между прагмой и
+    // начавшим просачиваться чтением строк.
+    let check_ns = started.elapsed().as_nanos() / u128::from(CHECK_ROUNDS);
+    let check_us = check_ns.div_ceil(1000);
+
     println!(
         "фикстура 10 000 узлов (минимум/медиана/p95/максимум, мс): board {}/{}/{}/{}, \
          next {}/{}/{}/{}, ls {}/{}/{}/{}, ls+fields {}/{}/{}/{}",
@@ -148,6 +173,17 @@ fn reading_a_ten_thousand_node_project_stays_within_budget() {
         short.median,
         short.p95,
         short.max
+    );
+    println!(
+        "сторож: data_version {}.{:03} мкс на проверку, доска {} мс — отношение {}×",
+        check_ns / 1000,
+        check_ns % 1000,
+        board.median,
+        board.median * 1000 / check_us.max(1)
+    );
+    assert!(
+        check_us <= BUDGET_CHECK_US,
+        "проверка сторожа {check_us} мкс при бюджете {BUDGET_CHECK_US}: сторож перестал быть дешевле доски"
     );
 
     assert!(

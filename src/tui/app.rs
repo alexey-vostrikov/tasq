@@ -89,6 +89,12 @@ pub struct App {
     /// Что показывать: скрыть выполненное и/или показать архив. Живёт на экране и
     /// переключается клавишами — те же два режима, что у `ls -n` и `ls -a`.
     pub board_filter: overview::BoardFilter,
+    /// Счётчики сторожа за базой: сколько раз спрашивали `data_version`, сколько раз он увидел
+    /// изменение и сколько было полных чтений доски.
+    ///
+    /// Отдаются в `--once` и в тестах: приёмка эпика — число, а не ощущение, и без счётчиков
+    /// «стало легче» снова осталось бы на слово.
+    pub stats: crate::watch::Stats,
 }
 
 impl App {
@@ -121,6 +127,7 @@ impl App {
             kinds: HashMap::new(),
             tokens: HashMap::new(),
             board_filter: overview::BoardFilter::default(),
+            stats: crate::watch::Stats::default(),
         }
     }
 

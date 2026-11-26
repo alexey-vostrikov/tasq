@@ -31,6 +31,7 @@ pub mod template;
 pub mod transfer;
 pub mod tree;
 pub mod tui;
+pub mod watch;
 
 pub use error::{Error, Result};
 
