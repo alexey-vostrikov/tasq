@@ -8,7 +8,7 @@
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 46 | 6000 | 5562 |
+| `full` | 46 | 6000 | 5583 |
 | `agent` | 30 | 4000 | 3825 |
 | `read-only` | 17 | 2000 | 1910 |
 | `migration` | 6 | 800 | 603 |
@@ -27,7 +27,7 @@
 | `node_get` | full, agent, read-only, migration | 102 | `ref` | One node with children, comments and the parent chain |
 | `node_update` | full, agent | 198 | `ref` | Change node fields; only the given fields are touched |
 | `node_list` | full, agent, read-only | 259 | — | List nodes in tree order with light fields |
-| `node_move` | full | 132 | `ref` | Move a node under another parent; descendant dot-IDs change |
+| `node_move` | full | 153 | `ref` | Move a node under another parent; descendant dot-IDs change |
 | `node_reorder` | full | 105 | `refs` | Set the order of siblings |
 | `node_archive` | full, agent | 111 | `ref` | Archive or unarchive a subtree; nothing is deleted |
 | `node_delete` | full | 99 | `ref` | Soft-delete a todo node; history stays in the database |

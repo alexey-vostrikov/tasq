@@ -133,6 +133,7 @@ tasq mv [ОПЦИИ]
 | флаг | значение | по умолчанию | описание |
 | --- | --- | --- | --- |
 | `--parent` | `REF` | — | New parent; omit to move to the project root |
+| `--to-project` | `KEY` | — | Move the subtree into another project; the dot-ID is rebuilt there |
 | `--renumber` | — | — | Take the next free number among the new siblings |
 
 ## `rm`
