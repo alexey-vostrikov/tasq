@@ -703,11 +703,19 @@ pub fn update(
     if let Some(branch) = patch.branch
         && node.branch.as_deref() != Some(branch)
     {
+        // Пустая строка — это «снять ветку», а не «ветка без имени»: в базе поле обязано
+        // вернуться в NULL, иначе `ls --branch` пришлось бы учить отличать '' от NULL, а
+        // `add --branch ""` и `set --no-branch` давали бы разные состояния одного и того же.
+        let (value, new) = if branch.is_empty() {
+            (Value::Null, None)
+        } else {
+            (Value::Text(branch.to_string()), Some(branch.to_string()))
+        };
         changes.push(Change {
             column: "branch",
-            value: Value::Text(branch.to_string()),
+            value,
             old: node.branch.clone(),
-            new: Some(branch.to_string()),
+            new,
         });
     }
     if let Some(locked) = patch.description_locked
@@ -796,6 +804,11 @@ pub struct Filter<'a> {
     /// отвечает на другой вопрос («что мы решили не делать»), и путать их нельзя.
     pub exclude_done: bool,
     pub assignee: Option<&'a str>,
+    /// Только узлы этой ветки (`ls --branch`). `None` — фильтра нет.
+    ///
+    /// Сравнение точное: ветка — это адрес, а не ключевое слово. Префиксное совпадение
+    /// смешало бы `feat/x` и `feat/x-fix`, и «что делать в этой ветке» отвечало бы про чужую.
+    pub branch: Option<&'a str>,
     pub overdue: bool,
     pub include_archived: bool,
     pub include_deleted: bool,
@@ -942,6 +955,10 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
         sql.push_str(" AND e.assigned_to = ?");
         values.push(Value::Text(assignee.to_string()));
     }
+    if let Some(branch) = filter.branch {
+        sql.push_str(" AND e.branch = ?");
+        values.push(Value::Text(branch.to_string()));
+    }
     if filter.overdue {
         sql.push_str(&format!(
             " AND e.due_date IS NOT NULL AND e.due_date < date('now')
@@ -1014,6 +1031,10 @@ pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
     if let Some(assignee) = filter.assignee {
         sql.push_str(" AND e.assigned_to = ?");
         values.push(Value::Text(assignee.to_string()));
+    }
+    if let Some(branch) = filter.branch {
+        sql.push_str(" AND e.branch = ?");
+        values.push(Value::Text(branch.to_string()));
     }
     if !filter.exclude_projects.is_empty() {
         // Плейсхолдеры по числу ключей: подстановка строки в SQL недопустима даже здесь.

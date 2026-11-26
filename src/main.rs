@@ -11,6 +11,7 @@ use tasq::connect;
 use tasq::docs;
 use tasq::edge;
 use tasq::error::{Error, Result};
+use tasq::git;
 use tasq::lease;
 use tasq::mcp;
 use tasq::node::{self, Filter, NewNode, Node, Patch};
@@ -103,9 +104,9 @@ enum Command {
         /// Reference to the code this work touches
         #[arg(long)]
         source: Option<String>,
-        /// Git branch this node belongs to
-        #[arg(long)]
-        branch: Option<String>,
+        /// Git branch this node belongs to; without a value — the current branch
+        #[arg(long, value_name = "NAME", num_args = 0..=1)]
+        branch: Option<Option<String>>,
     },
     /// Show a node, optionally with its subtree
     Show {
@@ -138,6 +139,9 @@ enum Command {
         /// Project to leave out of the listing (repeatable); unknown keys are refused
         #[arg(long = "except-project", value_name = "KEY")]
         except_project: Vec<String>,
+        /// Only nodes of this branch; without a value — the current branch
+        #[arg(long, value_name = "NAME", num_args = 0..=1)]
+        branch: Option<Option<String>>,
         /// Print only these fields, comma-separated (dot_id,title,status,...)
         #[arg(long, value_name = "LIST")]
         fields: Option<String>,
@@ -167,6 +171,12 @@ enum Command {
         assignee: Option<String>,
         #[arg(long)]
         weight: Option<f64>,
+        /// Git branch this node belongs to; without a value — the current branch
+        #[arg(long, value_name = "NAME", num_args = 0..=1)]
+        branch: Option<Option<String>>,
+        /// Clear the branch
+        #[arg(long = "no-branch", conflicts_with = "branch")]
+        no_branch: bool,
         /// Allow guarded transitions (reopen a closed node, finish with open children)
         #[arg(long)]
         force: bool,
@@ -320,6 +330,9 @@ enum Command {
         /// How many candidates to show
         #[arg(long, default_value_t = 3)]
         limit: usize,
+        /// Only nodes of this branch; without a value — the current branch
+        #[arg(long, value_name = "NAME", num_args = 0..=1)]
+        branch: Option<Option<String>>,
     },
     /// Notes: decisions, context, meetings, blockers, releases
     Note {
@@ -1497,7 +1510,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     estimated_hours: *estimate,
                     weight: *weight,
                     source_ref: source.as_deref(),
-                    branch: branch.as_deref(),
+                    branch: git::resolve(branch.as_ref()).as_deref(),
                 },
             )?;
             if cli.json {
@@ -1581,6 +1594,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             archived,
             no_done,
             except_project,
+            branch,
             fields,
             offset,
             limit,
@@ -1606,6 +1620,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 }
             }
             let excluded: Vec<String> = except_project.clone();
+            // Пустое значение `--branch` — это текущая ветка из git. Вне репозитория значения
+            // нет: фильтр не включается, и об этом говорится прямо — молча выданный полный
+            // список читался бы как «в этой ветке лежит весь проект».
+            let branch_filter = git::resolve(branch.as_ref());
+            // Замечание печатается и в `--json`: поток ошибок не портит документ, а молчание
+            // в этом месте оставило бы человека с полным списком и без объяснения, почему
+            // фильтр не сработал.
+            if matches!(branch, Some(None)) && branch_filter.is_none() {
+                eprintln!("note: --branch without a value and no git branch here; filter is off");
+            }
             let nodes = match project::scope(&conn, cli.project.as_deref())? {
                 project::Scope::One(project) => node::list(
                     &conn,
@@ -1616,6 +1640,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         exclude_projects: &excluded,
                         exclude_done: *no_done,
                         assignee: assignee.as_deref(),
+                        branch: branch_filter.as_deref(),
                         overdue: *overdue,
                         include_archived: *archived,
                         include_deleted: false,
@@ -1631,6 +1656,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         exclude_projects: &excluded,
                         exclude_done: *no_done,
                         assignee: assignee.as_deref(),
+                        branch: branch_filter.as_deref(),
                         overdue: *overdue,
                         include_archived: *archived,
                         include_deleted: false,
@@ -1681,6 +1707,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             due,
             assignee,
             weight,
+            branch,
+            no_branch,
             force,
             lock_desc,
             unlock_desc,
@@ -1698,6 +1726,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             } else {
                 None
             };
+            // Три состояния ветки, и все три значат разное: не трогать, поставить (пустое
+            // значение — текущая ветка из git), снять. Пустая строка вместо «снять» была бы
+            // молчаливой записью пустоты в поле, которое потом никто не отличит от непустого.
+            let branch_value: Option<String> = if *no_branch {
+                Some(String::new())
+            } else {
+                git::resolve(branch.as_ref())
+            };
             let updated = node::update(
                 &mut conn,
                 &project,
@@ -1712,7 +1748,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     weight: *weight,
                     estimated_hours: None,
                     source_ref: None,
-                    branch: None,
+                    branch: branch_value.as_deref(),
                     force: *force,
                     description_locked,
                     lease: None,
@@ -2212,12 +2248,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
         },
 
-        Command::Next { limit } => {
+        Command::Next { limit, branch } => {
+            let branch_filter = git::resolve(branch.as_ref());
             // Явный `--project` сильнее привязки: «покажи только этот проект» — осознанный
             // запрос, и подмешивать к нему чужие задачи значило бы не выполнить его.
             if let Some(key) = cli.project.as_deref() {
                 let (conn, project) = open(cli.db.as_deref(), Some(key))?;
-                let candidates = edge::next_candidates(&conn, &project, *limit)?;
+                let candidates =
+                    edge::next_candidates_on(&conn, &project, *limit, branch_filter.as_deref())?;
                 if cli.json {
                     print_json(&candidates);
                     return Ok(ExitCode::SUCCESS);
@@ -2239,7 +2277,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 Some(id) => session::affinity(&conn, id)?,
                 None => None,
             };
-            let next = edge::next_across(&conn, affinity.as_deref(), *limit)?;
+            let next =
+                edge::next_across_on(&conn, affinity.as_deref(), *limit, branch_filter.as_deref())?;
             if cli.json {
                 print_json(&next.candidates);
                 return Ok(ExitCode::SUCCESS);

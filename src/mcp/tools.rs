@@ -538,6 +538,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     parent: arg_str(args, "parent"),
                     status: arg_str(args, "status"),
                     assignee: arg_str(args, "assignee"),
+                    branch: arg_str(args, "branch"),
                     exclude_projects: &excluded_projects,
                     exclude_done: arg_bool(args, "exclude_done"),
                     overdue: arg_bool(args, "overdue"),
@@ -634,11 +635,17 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             // Явный `project` в аргументах сильнее привязки — как и в CLI.
             if arg_str(args, "project").is_some() {
                 let project = ctx.project(args)?;
-                let candidates = edge::next_candidates(&ctx.conn, &project, limit)?;
+                let candidates =
+                    edge::next_candidates_on(&ctx.conn, &project, limit, arg_str(args, "branch"))?;
                 return Ok(text(&candidates));
             }
             let affinity = crate::session::affinity(&ctx.conn, &ctx.session)?;
-            let next = edge::next_across(&ctx.conn, affinity.as_deref(), limit)?;
+            let next = edge::next_across_on(
+                &ctx.conn,
+                affinity.as_deref(),
+                limit,
+                arg_str(args, "branch"),
+            )?;
             // Ответ остаётся массивом кандидатов: клиенты разбирают его как список, и смена
             // формы сломала бы их ради сведений, которые умещаются в поле строки. Откуда взят
             // кандидат, видно в `origin` каждого элемента (`affinity`/`fallback`/`unbound`).
@@ -1252,6 +1259,7 @@ pub fn definition(name: &str) -> Option<Value> {
                     "parent": {"type": "string", "description": "Only this subtree"},
                     "status": {"type": "string", "description": "Filter by effective status"},
                     "assignee": {"type": "string", "description": "Filter by assignee"},
+                    "branch": {"type": "string", "description": "Only nodes of this git branch"},
                     "overdue": {"type": "boolean", "description": "Only overdue nodes"},
                     "include_archived": {"type": "boolean", "description": "Show archived too"},
                     "exclude_done": {"type": "boolean", "description": "Hide nodes closed as done"},
@@ -1349,7 +1357,10 @@ pub fn definition(name: &str) -> Option<Value> {
             "What to work on next, with the reason for the choice",
             json!({
                 "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "How many candidates"}}
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many candidates"},
+                    "branch": {"type": "string", "description": "Only nodes of this git branch"}
+                }
             }),
             (true, false, true),
         ),
@@ -1740,10 +1751,10 @@ const PROJECT_FREE: &[&str] = &[
 /// Предел существует ради бюджета схемы, а не ради симметрии: каждый параметр стоит токенов в
 /// КАЖДОМ сеансе. Но у `node_list` это единственный способ спросить список, и разнести его
 /// фильтры по двум инструментам стоило бы дороже (второй тул целиком: имя, описание, схема),
-/// чем пять параметров в уже существующем. Предел поднят адресно — одному инструменту, а не
+/// чем несколько параметров в уже существующем. Предел поднят адресно — одному инструменту, а не
 /// всем: общий потолок, поднятый ради одного, перестаёт сдерживать остальные.
 #[cfg(test)]
-const WIDER_THAN_USUAL: &[(&str, usize)] = &[("node_list", 10)];
+const WIDER_THAN_USUAL: &[(&str, usize)] = &[("node_list", 11)];
 
 fn tool(name: &str, description: &str, mut schema: Value, hints: (bool, bool, bool)) -> Value {
     let (read_only, destructive, idempotent) = hints;

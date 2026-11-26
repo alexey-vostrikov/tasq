@@ -14,6 +14,7 @@ pub mod db;
 pub mod docs;
 pub mod edge;
 pub mod error;
+pub mod git;
 pub mod history;
 pub mod lease;
 pub mod mcp;

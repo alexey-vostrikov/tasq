@@ -739,6 +739,9 @@ pub struct Candidate {
     pub unblocks: i64,
     pub score: i64,
     pub reason: String,
+    /// Ветка узла, если задана: по ней отбирает `next --branch`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Проект кандидата: заполняется, когда работа идёт по нескольким проектам.
     ///
     /// `None` при явно выбранном проекте — там он и так известен из запроса, и дублировать его
@@ -774,7 +777,24 @@ pub fn next_candidates(
     project: &Project,
     limit: usize,
 ) -> Result<Vec<Candidate>> {
+    next_candidates_on(conn, project, limit, None)
+}
+
+/// То же, но только по узлам одной ветки (`next --branch`).
+///
+/// Фильтр применяется до обрезки по `limit`: иначе `next --branch -l 3` показал бы три
+/// кандидата из всей доски, а потом выкинул бы чужие ветки — то есть вернул бы меньше строк,
+/// чем просили, и не те, что ближе к делу.
+pub fn next_candidates_on(
+    conn: &Connection,
+    project: &Project,
+    limit: usize,
+    branch: Option<&str>,
+) -> Result<Vec<Candidate>> {
     let mut candidates = candidates_in(conn, project)?;
+    if let Some(branch) = branch {
+        candidates.retain(|candidate| candidate.branch.as_deref() == Some(branch));
+    }
     candidates.truncate(limit);
     Ok(candidates)
 }
@@ -790,7 +810,8 @@ fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>>
                           WHERE x.from_node = e.id AND x.kind = 'blocks'
                             AND b.deleted_at IS NULL AND {unfinished_blockers}), 0)
                     AS blockers,
-                CAST(julianday(date('now')) - julianday(e.due_date) AS INTEGER) AS overdue
+                CAST(julianday(date('now')) - julianday(e.due_date) AS INTEGER) AS overdue,
+                e.branch
          FROM v_node_effective e
          WHERE e.project_id = ?1
            AND e.deleted_at IS NULL
@@ -811,12 +832,13 @@ fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>>
             row.get::<_, i64>(6)?,
             row.get::<_, i64>(7)?,
             row.get::<_, Option<i64>>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
 
     let mut candidates = Vec::new();
     for row in rows {
-        let (id, path, title, priority, due_date, depth, blockers, overdue) = row?;
+        let (id, path, title, priority, due_date, depth, blockers, overdue, node_branch) = row?;
         if blockers > 0 {
             continue;
         }
@@ -861,6 +883,7 @@ fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>>
             unblocks,
             score,
             reason: reasons.join(", "),
+            branch: node_branch,
             // Заполняет вызывающий, который знает, идёт ли работа по нескольким проектам.
             project: None,
             origin: None,
@@ -879,13 +902,30 @@ fn candidates_in(conn: &Connection, project: &Project) -> Result<Vec<Candidate>>
 /// Порядок проектов при переборе — тот же, что в `project::list` (по id), чтобы ответ был
 /// воспроизводимым.
 pub fn next_across(conn: &Connection, affinity: Option<&str>, limit: usize) -> Result<NextAcross> {
+    next_across_on(conn, affinity, limit, None)
+}
+
+/// То же, но только по узлам одной ветки.
+///
+/// Фильтр применяется до склейки и обрезки: иначе чужой проект занял бы место в `limit`, а
+/// потом был бы выброшен — и ответ оказался бы короче запрошенного без причины.
+pub fn next_across_on(
+    conn: &Connection,
+    affinity: Option<&str>,
+    limit: usize,
+    branch: Option<&str>,
+) -> Result<NextAcross> {
     let projects = crate::project::list(conn)?;
     let mut per_project: Vec<(String, Vec<Candidate>)> = Vec::new();
     for summary in &projects {
         let Some(project) = crate::project::by_key(conn, &summary.key)? else {
             continue;
         };
-        per_project.push((summary.key.clone(), candidates_in(conn, &project)?));
+        let mut candidates = candidates_in(conn, &project)?;
+        if let Some(branch) = branch {
+            candidates.retain(|candidate| candidate.branch.as_deref() == Some(branch));
+        }
+        per_project.push((summary.key.clone(), candidates));
     }
 
     // Привязка: если в своём проекте есть что брать — отдаём только его.
