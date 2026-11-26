@@ -253,21 +253,44 @@ pub fn save(
 }
 
 /// Проверяет, что виды и приоритеты в шаблоне допустимы.
+/// Проверяет, что виды и приоритеты в шаблоне допустимы и не противоречат друг другу.
+///
+/// Про «не противоречат»: шаблон не знает, на какой глубине его применят, поэтому вид в нём —
+/// объявление СВОЕГО корня, а не абсолютной глубины. «Задача с подзадачей» — это корень на
+/// глубине 2 и ребёнок на 3, и такое объявление внутренне согласовано, даже если применят его
+/// в корень проекта. Противоречие — другое: ребёнок объявлен эпиком под корнем-задачей, то
+/// есть автор заявил две несовместимые вещи, и какая из них верна, знает только он.
+///
+/// Ловится это при сохранении, а не при применении: шаблон пишется один раз, а применяется
+/// много, и отказ в момент применения приходит против уже выбранного родителя.
 fn validate(tree: &TemplateTree) -> Result<()> {
-    fn walk(node: &TemplateNode, depth: i64) -> Result<()> {
+    // Базовый сдвиг задаёт первое объявление: корень-задача сдвигает всю шкалу на единицу.
+    let base = declared_base(tree);
+    fn walk(node: &TemplateNode, depth: i64, base: i64) -> Result<()> {
         if node.title.trim().is_empty() {
             return Err(Error::InvalidValue {
                 field: "template".to_string(),
                 value: "empty title".to_string(),
             });
         }
-        if let Some(kind) = &node.kind
-            && Kind::parse(kind).is_none()
-        {
-            return Err(Error::InvalidValue {
+        if let Some(kind_text) = &node.kind {
+            let kind = Kind::parse(kind_text).ok_or_else(|| Error::InvalidValue {
                 field: "kind".to_string(),
-                value: kind.clone(),
-            });
+                value: kind_text.clone(),
+            })?;
+            let expected = Kind::from_depth(depth + base);
+            if kind != expected {
+                return Err(Error::InvalidValue {
+                    field: "kind".to_string(),
+                    value: format!(
+                        "«{}» declared {} but on its level the kind is {} — a template's kinds \
+                         must agree with each other",
+                        node.title,
+                        kind.as_str(),
+                        expected.as_str()
+                    ),
+                });
+            }
         }
         if let Some(priority) = &node.priority
             && !matches!(priority.as_str(), "low" | "medium" | "high" | "critical")
@@ -284,14 +307,34 @@ fn validate(tree: &TemplateTree) -> Result<()> {
             return Err(Error::DepthLimit);
         }
         for child in &node.children {
-            walk(child, depth + 1)?;
+            walk(child, depth + 1, base)?;
         }
         Ok(())
     }
     for node in &tree.nodes {
-        walk(node, 1)?;
+        walk(node, 1, base)?;
     }
     Ok(())
+}
+
+/// Сдвиг шкалы видов: на сколько объявленный вид глубже собственной глубины узла.
+///
+/// Берётся первое объявление в порядке обхода, потому что порядок в шаблоне — это порядок
+/// появления: автор пишет корень, потом его детей. Ноль, если вид не объявлен нигде, — тогда
+/// проверять нечего.
+fn declared_base(tree: &TemplateTree) -> i64 {
+    fn find(node: &TemplateNode, depth: i64) -> Option<i64> {
+        if let Some(kind) = node.kind.as_deref().and_then(Kind::parse) {
+            return Some(kind.depth() - depth);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find(child, depth + 1))
+    }
+    tree.nodes
+        .iter()
+        .find_map(|node| find(node, 1))
+        .unwrap_or(0)
 }
 
 /// Шаблон по идентификатору. Проект уточнять не нужно: `id` уникален в базе.
@@ -405,6 +448,12 @@ pub struct Applied {
     pub template: String,
     pub parent: String,
     pub created: Vec<String>,
+    /// Сколько объявленных в шаблоне видов не совпало с видом по глубине и было заменено.
+    ///
+    /// Число, а не молчание: `kind` в шаблоне — подсказка автора о том, что он имел в виду, а
+    /// место в дереве решает. Шаблон «задача с подзадачей», применённый в корень, даёт эпик с
+    /// задачей — и об этом надо сказать, иначе человек ищет, почему вид не тот, что он написал.
+    pub rekinded: usize,
 }
 
 /// Разворачивает шаблон под указанным родителем.
@@ -438,6 +487,7 @@ pub fn apply(
     }
 
     let mut created: Vec<String> = Vec::new();
+    let mut rekinded = 0usize;
     let parent_dot = match parent_ref {
         Some(reference) => Some(node::resolve(conn, project, reference)?.dot_id),
         None => None,
@@ -451,6 +501,7 @@ pub fn apply(
             parent_dot.as_deref(),
             values,
             &mut created,
+            &mut rekinded,
         )?;
     }
     // Без родителя узлы создаются в корне проекта, и «родитель» — ключ проекта.
@@ -463,6 +514,7 @@ pub fn apply(
         template: template.name,
         parent,
         created,
+        rekinded,
     })
 }
 
@@ -473,26 +525,24 @@ fn spawn(
     parent: Option<&str>,
     values: &[(String, String)],
     created: &mut Vec<String>,
+    rekinded: &mut usize,
 ) -> Result<String> {
     let title = render(&item.title, values)?;
     let description = match &item.description {
         Some(text) => Some(render(text, values)?),
         None => None,
     };
-    let kind = match &item.kind {
-        Some(value) => Some(Kind::parse(value).ok_or_else(|| Error::InvalidValue {
-            field: "kind".to_string(),
-            value: value.clone(),
-        })?),
-        None => None,
-    };
+    // Вид НЕ передаётся: он выводится из глубины самим `node::create`. Объявленный в шаблоне
+    // вид — подсказка о замысле, а не требование к месту: шаблон, задуманный как «задача с
+    // подзадачей», обязан работать и в корень проекта (там он станет эпиком с задачей).
+    // Раньше он отказывал — и отказ называл глубину, то есть человек чинил не то.
     let node = node::create(
         conn,
         project,
         NewNode {
             parent,
             title: &title,
-            kind,
+            kind: None,
             description: description.as_deref(),
             priority: item.priority.as_deref(),
             due_date: None,
@@ -502,9 +552,22 @@ fn spawn(
             branch: None,
         },
     )?;
+    if let Some(declared) = &item.kind
+        && declared != &node.kind
+    {
+        *rekinded += 1;
+    }
     created.push(node.dot_id.clone());
     for child in &item.children {
-        spawn(conn, project, child, Some(&node.dot_id), values, created)?;
+        spawn(
+            conn,
+            project,
+            child,
+            Some(&node.dot_id),
+            values,
+            created,
+            rekinded,
+        )?;
     }
     Ok(node.dot_id)
 }

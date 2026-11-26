@@ -3295,6 +3295,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                             applied.template,
                             applied.created.len()
                         );
+                        // Вид в шаблоне — подсказка о замысле, а место в дереве решает. Когда
+                        // они расходятся, об этом говорится числом: молчаливая подмена вида
+                        // выглядит как «шаблон применился неправильно».
+                        if applied.rekinded > 0 {
+                            println!(
+                                "  {} declared kind(s) follow the depth instead: the template \
+                                 was written for another level",
+                                applied.rekinded
+                            );
+                        }
                         for dot in &applied.created {
                             println!("  {dot}");
                         }
