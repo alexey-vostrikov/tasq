@@ -47,6 +47,7 @@ fn fixture(tag: &str) -> (Connection, Project, PathBuf) {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");
@@ -64,6 +65,7 @@ fn fixture(tag: &str) -> (Connection, Project, PathBuf) {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("task");

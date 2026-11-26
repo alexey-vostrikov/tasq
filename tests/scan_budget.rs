@@ -56,6 +56,7 @@ fn fixture(tag: &str) -> (Fixture, Connection, Project) {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");

@@ -8,9 +8,9 @@
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 46 | 6000 | 5605 |
-| `agent` | 30 | 4000 | 3825 |
-| `read-only` | 17 | 2000 | 1910 |
+| `full` | 46 | 6000 | 5664 |
+| `agent` | 30 | 4000 | 3884 |
+| `read-only` | 17 | 2000 | 1926 |
 | `migration` | 6 | 800 | 603 |
 
 ## Каталог
@@ -23,10 +23,10 @@
 | `project_update` | full, agent | 146 | — | Rename a project or change its description and status |
 | `project_delete` | full | 107 | — | Delete a project with all of its nodes, notes and history |
 | `project_select` | full, agent | 84 | `key` | Switch this session to another project; every later call uses it |
-| `node_create` | full, agent | 213 | `title` | Create a node; without parent it becomes a root epic |
+| `node_create` | full, agent | 235 | `title` | Create a node; without parent it becomes a root epic |
 | `node_get` | full, agent, read-only, migration | 102 | `ref` | One node with children, comments and the parent chain |
-| `node_update` | full, agent | 198 | `ref` | Change node fields; only the given fields are touched |
-| `node_list` | full, agent, read-only | 259 | — | List nodes in tree order with light fields |
+| `node_update` | full, agent | 219 | `ref` | Change node fields; only the given fields are touched |
+| `node_list` | full, agent, read-only | 275 | — | List nodes in tree order with light fields |
 | `node_move` | full | 153 | `ref` | Move a node under another parent; descendant dot-IDs change |
 | `node_reorder` | full | 105 | `refs` | Set the order of siblings |
 | `node_archive` | full, agent | 111 | `ref` | Archive or unarchive a subtree; nothing is deleted |

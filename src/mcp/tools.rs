@@ -422,6 +422,9 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
         "node_create" => {
             let project = ctx.project(args)?;
             let kind = arg_kind(args, "kind")?;
+            // Метки при создании, а не отдельным вызовом: иначе первая запись журнала про узел
+            // была бы неполной, а вторая — про метки, которых у него «не было».
+            let tags = arg_strings(args, "tags")?;
             let created = node::create(
                 &mut ctx.conn,
                 &project,
@@ -436,6 +439,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     weight: arg_f64(args, "weight"),
                     source_ref: arg_str(args, "source_ref"),
                     branch: arg_str(args, "branch"),
+                    tags: (!tags.is_empty()).then_some(tags.as_slice()),
                 },
             )?;
             Ok(text(&created))
@@ -493,6 +497,12 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 Some(token) => crate::lease::live_node(&ctx.conn, &project, token)?,
                 None => None,
             };
+            // Метки — замена набора, и это единственный параметр меток в MCP. Добавление и
+            // снятие поштучно остались в CLI: агенту проще прочитать узел и записать набор, чем
+            // держать третий-четвёртый параметр в схеме, которая стоит токенов в каждом сеансе.
+            // Свободные поля (`metadata`) в MCP не выведены вовсе: это свойство для инструментов и
+            // человека, а не то, что агент правит в работе.
+            let set_tags = arg_strings(args, "tags")?;
             let updated = node::update(
                 &mut ctx.conn,
                 &project,
@@ -508,6 +518,11 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     estimated_hours: arg_f64(args, "estimated_hours"),
                     source_ref: arg_str(args, "source_ref"),
                     branch: arg_str(args, "branch"),
+                    tag_add: &[],
+                    tag_remove: &[],
+                    tags: (!set_tags.is_empty()).then_some(set_tags.as_slice()),
+                    meta_set: &[],
+                    meta_remove: &[],
                     force: arg_bool(args, "force"),
                     description_locked,
                     // Токен должен быть живым и указывать на этот же узел: иначе
@@ -538,6 +553,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     parent: arg_str(args, "parent"),
                     status: arg_str(args, "status"),
                     assignee: arg_str(args, "assignee"),
+                    tag: arg_str(args, "tag"),
                     branch: arg_str(args, "branch"),
                     exclude_projects: &excluded_projects,
                     exclude_done: arg_bool(args, "exclude_done"),
@@ -1232,7 +1248,8 @@ pub fn definition(name: &str) -> Option<Value> {
                     "priority": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
                     "due_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "estimated_hours": {"type": "number", "description": "Estimate in hours"},
-                    "weight": {"type": "number", "description": "Points for burn-up, default 1"}
+                    "weight": {"type": "number", "description": "Points for burn-up, default 1"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Labels (a set)"}
                 },
                 "required": ["title"]
             }),
@@ -1260,6 +1277,7 @@ pub fn definition(name: &str) -> Option<Value> {
                     "status": {"type": "string", "description": "Target status"},
                     "priority": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
                     "assigned_to": {"type": "string", "description": "Who works on it"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Replace the tag set"},
                     "due_date": {"type": "string", "description": "YYYY-MM-DD"},
                     "force": {"type": "boolean", "description": "Allow guarded transitions"}
                 },
@@ -1277,6 +1295,7 @@ pub fn definition(name: &str) -> Option<Value> {
                     "status": {"type": "string", "description": "Filter by effective status"},
                     "assignee": {"type": "string", "description": "Filter by assignee"},
                     "branch": {"type": "string", "description": "Only nodes of this git branch"},
+                    "tag": {"type": "string", "description": "Only this tag (exact)"},
                     "overdue": {"type": "boolean", "description": "Only overdue nodes"},
                     "include_archived": {"type": "boolean", "description": "Show archived too"},
                     "exclude_done": {"type": "boolean", "description": "Hide nodes closed as done"},
@@ -1780,8 +1799,14 @@ const PROJECT_FREE: &[&str] = &[
 /// фильтры по двум инструментам стоило бы дороже (второй тул целиком: имя, описание, схема),
 /// чем несколько параметров в уже существующем. Предел поднят адресно — одному инструменту, а не
 /// всем: общий потолок, поднятый ради одного, перестаёт сдерживать остальные.
+///
+/// `node_create` — девятый параметр `tags`: метки пишутся при создании, а не отдельным `set`,
+/// иначе первая запись журнала про узел была бы неполной, а вторая — про то, чего у него «не
+/// было». Альтернатива (создать и потом `node_update`) стоила бы двух вызовов и двух записей
+/// вместо одной.
 #[cfg(test)]
-const WIDER_THAN_USUAL: &[(&str, usize)] = &[("node_list", 11)];
+const WIDER_THAN_USUAL: &[(&str, usize)] =
+    &[("node_list", 12), ("node_create", 9), ("node_update", 9)];
 
 fn tool(name: &str, description: &str, mut schema: Value, hints: (bool, bool, bool)) -> Value {
     let (read_only, destructive, idempotent) = hints;

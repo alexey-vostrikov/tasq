@@ -29,6 +29,12 @@ pub struct TemplateNode {
     pub estimate: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<f64>,
+    /// Метки узла; в них тоже работают `{переменные}`, как в заголовке и описании.
+    ///
+    /// Это то, чего не хватало при переносе из предшественника: там у задачи шаблона были
+    /// `tags`, а здесь поле молча отбрасывалось — и колонка `nodes.tags` оставалась мёртвой.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TemplateNode>,
 }
@@ -532,6 +538,12 @@ fn spawn(
         Some(text) => Some(render(text, values)?),
         None => None,
     };
+    // Метки рендерятся как любой текст: `{name}` в метке — обычное дело («api-{name}»).
+    let tags = item
+        .tags
+        .iter()
+        .map(|tag| render(tag, values))
+        .collect::<Result<Vec<_>>>()?;
     // Вид НЕ передаётся: он выводится из глубины самим `node::create`. Объявленный в шаблоне
     // вид — подсказка о замысле, а не требование к месту: шаблон, задуманный как «задача с
     // подзадачей», обязан работать и в корень проекта (там он станет эпиком с задачей).
@@ -550,6 +562,7 @@ fn spawn(
             weight: item.weight,
             source_ref: None,
             branch: None,
+            tags: (!tags.is_empty()).then_some(tags.as_slice()),
         },
     )?;
     if let Some(declared) = &item.kind

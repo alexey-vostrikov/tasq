@@ -110,6 +110,7 @@ fn the_same_template_under_a_node_keeps_its_declared_kinds() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("эпик");
@@ -152,6 +153,7 @@ fn an_epic_template_under_a_node_becomes_a_task() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("узел");

@@ -768,6 +768,9 @@ impl App {
                     conn,
                     project,
                     crate::node::NewNode {
+                        // Меток из формы нет: экран создаёт узел тем, что человек ввёл в поля,
+                        // а метка — не поле формы, а способ отбора. Ставить их будет `set`
+                        // после создания, когда появится строка в форме.
                         parent: None,
                         title: &title,
                         kind: None,
@@ -778,6 +781,7 @@ impl App {
                         weight: None,
                         source_ref: None,
                         branch: None,
+                        tags: None,
                     },
                 )?;
                 self.state.mode = Mode::Board;
@@ -1612,6 +1616,7 @@ mod tests {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");
@@ -1689,6 +1694,7 @@ mod tests {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");
@@ -1763,6 +1769,7 @@ mod tests {
                     weight: None,
                     source_ref: None,
                     branch: None,
+                    tags: None,
                 },
             )
             .expect("node");
@@ -1829,6 +1836,7 @@ mod tests {
                     weight: None,
                     source_ref: None,
                     branch: None,
+                    tags: None,
                 },
             )
             .expect("node");
@@ -1911,6 +1919,7 @@ mod tests {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");
@@ -1993,6 +2002,7 @@ mod tests {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");
@@ -2079,6 +2089,7 @@ mod tests {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");

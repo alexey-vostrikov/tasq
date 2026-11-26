@@ -44,6 +44,7 @@ fn add(conn: &mut Connection, project: &Project, parent: Option<&str>, title: &s
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("node")
@@ -71,6 +72,7 @@ fn add_weighted(
             weight: Some(weight),
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("node")

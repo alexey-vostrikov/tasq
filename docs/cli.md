@@ -64,6 +64,7 @@ tasq add [ОПЦИИ]
 | `--estimate` | `ESTIMATE` | — | Estimated hours |
 | `--source` | `SOURCE` | — | Reference to the code this work touches |
 | `--branch` | `NAME` | — | Git branch this node belongs to; without a value — the current branch |
+| `--tag` | `NAME` | — | Tag; repeatable (`--tag api --tag dns`) |
 
 ## `show`
 
@@ -95,6 +96,7 @@ tasq ls [ОПЦИИ]
 | `-n`, `--no-done` | — | — | Hide nodes closed as done |
 | `--except-project` | `KEY` | — | Project to leave out of the listing (repeatable); unknown keys are refused |
 | `--branch` | `NAME` | — | Only nodes of this branch; without a value — the current branch |
+| `--tag` | `NAME` | — | Only nodes with this tag (exact match) |
 | `--fields` | `LIST` | — | Print only these fields, comma-separated (dot_id,title,status,...) |
 | `--offset` | `N` | — | Skip this many nodes after sorting (paging with --limit) |
 | `--limit` | `N` | — | Print at most this many nodes |
@@ -121,6 +123,11 @@ tasq set [ОПЦИИ]
 | `--force` | — | — | Allow guarded transitions (reopen a closed node, finish with open children) |
 | `--lock-desc` | — | — | Protect the description from rewrites |
 | `--unlock-desc` | — | — | Allow the description to change again |
+| `--tag` | `NAME` | — | Add a tag; repeatable |
+| `--untag` | `NAME` | — | Remove a tag; repeatable |
+| `--tags` | `LIST` | — | Replace the whole tag set (comma-separated) |
+| `--meta` | `KEY=VALUE` | — | Set a free-form field: key=value; repeatable |
+| `--meta-remove` | `KEY` | — | Remove a free-form field by key; repeatable |
 
 ## `mv`
 
@@ -424,6 +431,18 @@ tasq ls [ОПЦИИ]
 | флаг | значение | по умолчанию | описание |
 | --- | --- | --- | --- |
 | `--include-deleted` | — | — | Show soft-deleted comments with their reasons |
+
+### `edit`
+
+Rewrite a comment's text; the old text stays in the journal
+
+```
+tasq edit [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--author` | `AUTHOR` | — | Author name; defaults to $TASQ_HOLDER or `cli` |
 
 ### `rm`
 

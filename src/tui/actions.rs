@@ -167,6 +167,7 @@ mod tests {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node")

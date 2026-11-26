@@ -44,6 +44,7 @@ fn add(conn: &mut Connection, project: &Project, parent: Option<&str>, title: &s
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("node")
@@ -386,6 +387,7 @@ fn next_prefers_priority_due_date_and_unblocking() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("low");
@@ -403,6 +405,7 @@ fn next_prefers_priority_due_date_and_unblocking() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("high");
@@ -420,6 +423,7 @@ fn next_prefers_priority_due_date_and_unblocking() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("blocked");

@@ -118,6 +118,67 @@ pub fn list(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Правит текст комментария.
+///
+/// Зачем правка вообще есть. Комментарий — это обоснование, а обоснование уточняют: в нём
+/// опечатка, неверная цифра, дописанное «сделано иначе». Без правки единственный выход —
+/// удалить и написать заново, и тогда теряется дата: «когда это решили» подменяется «когда
+/// переписали». Удалённый комментарий править нельзя — сначала `restore`: строка, убранная из
+/// истории, не должна меняться под ней.
+///
+/// Старый текст остаётся в журнале (`activity_log`, `old_value`/`new_value`), а не в самой
+/// строке: комментарий читается человеком, а история правок — аудитом, и смешивать их значило бы
+/// показывать в ленте то, чего человек не писал.
+pub fn edit(
+    conn: &mut Connection,
+    project: &Project,
+    id: i64,
+    content: &str,
+    actor: &str,
+) -> Result<Comment> {
+    let comment = by_id(conn, project, id)?;
+    if content.trim().is_empty() {
+        return Err(Error::InvalidValue {
+            field: "content".to_string(),
+            value: "empty".to_string(),
+        });
+    }
+    if comment.is_deleted {
+        return Err(Error::AlreadyInState {
+            dot_id: comment.dot_id,
+            state: "deleted".to_string(),
+        });
+    }
+    if comment.content == content {
+        // Правка «в тот же текст» — не событие: строка журнала без изменения мешала бы читать
+        // историю правок.
+        return Ok(comment);
+    }
+    let node_id = comment_node(conn, id)?;
+    let tx = crate::db::write_tx(conn)?;
+    tx.execute(
+        "UPDATE comments SET content = ?1 WHERE id = ?2",
+        params![content, id],
+    )?;
+    activity::log(
+        &tx,
+        &Entry {
+            project_id: project.id,
+            node_id,
+            entity_type: "comment",
+            entity_id: id,
+            action: "update",
+            field_name: Some("content"),
+            old_value: Some(comment.content.as_str()),
+            new_value: Some(content),
+            summary: Some(comment.dot_id.as_str()),
+            actor,
+        },
+    )?;
+    tx.commit()?;
+    by_id(conn, project, id)
+}
+
 /// Мягкое удаление: строка остаётся ради аудита, но скрывается из выдач.
 pub fn delete(
     conn: &mut Connection,
@@ -239,6 +300,7 @@ mod tests {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");

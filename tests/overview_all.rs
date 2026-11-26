@@ -60,6 +60,7 @@ fn add(conn: &mut Connection, project: &Project, title: &str) -> node::Node {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("node")
@@ -80,6 +81,7 @@ fn add_child(conn: &mut Connection, project: &Project, parent: &str, title: &str
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("child")

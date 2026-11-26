@@ -41,6 +41,7 @@ fn fixture(tag: &str) -> (Connection, Project, String) {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");

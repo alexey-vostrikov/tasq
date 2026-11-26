@@ -47,6 +47,16 @@ pub struct Node {
     pub due_date: Option<String>,
     pub branch: Option<String>,
     pub source_ref: Option<String>,
+    /// Метки узла: то, по чему ищут и группируют («api», «dns», «срочно»).
+    ///
+    /// Хранятся JSON-массивом в `nodes.tags`, а читаются как набор: колонка была в схеме с
+    /// первой версии и не писалась ничем, то есть обещала возможность, которой не было.
+    pub tags: Vec<String>,
+    /// Свободные ключ-значения узла: то, чему не нужна собственная колонка.
+    ///
+    /// Хранятся JSON-объектом в `nodes.metadata`. Отдельно от `tags`, потому что это разные
+    /// вопросы: метка отвечает «к чему относится», поле — «какое у него свойство».
+    pub metadata: std::collections::BTreeMap<String, String>,
     pub archived_at: Option<String>,
     pub lease_holder: Option<String>,
     pub lease_expires_at: Option<String>,
@@ -145,6 +155,31 @@ const NODE_SELECT: &str = "SELECT e.*, COALESCE(p.done_weight, 0) AS progress_do
    FROM v_node_effective e
    LEFT JOIN v_node_progress p ON p.node_id = e.id";
 
+/// Разбор JSON-колонки в значение.
+///
+/// Ошибка разбора не превращается в пустое значение: колонку пишет только этот код, поэтому
+/// испорченное содержимое означает повреждение данных, а не «меток просто нет». Молчаливая
+/// пустота выглядела бы как «метки потерялись при экспорте» — и искали бы их не там.
+fn parse_json<T: serde::de::DeserializeOwned + Default>(
+    row: &Row<'_>,
+    column: &str,
+) -> rusqlite::Result<T> {
+    let raw: String = row.get(column)?;
+    if raw.trim().is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_str(&raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            raw.len(),
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{column}: {err}"),
+            )),
+        )
+    })
+}
+
 fn map_node(row: &Row<'_>, project: &Project) -> rusqlite::Result<Node> {
     let path: String = row.get("path")?;
     Ok(Node {
@@ -167,6 +202,8 @@ fn map_node(row: &Row<'_>, project: &Project) -> rusqlite::Result<Node> {
         due_date: row.get("due_date")?,
         branch: row.get("branch")?,
         source_ref: row.get("source_ref")?,
+        tags: parse_json(row, "tags")?,
+        metadata: parse_json(row, "metadata")?,
         archived_at: row.get("archived_at")?,
         lease_holder: row.get("lease_holder")?,
         lease_expires_at: row.get("lease_expires_at")?,
@@ -288,6 +325,8 @@ pub struct NewNode<'a> {
     pub weight: Option<f64>,
     pub source_ref: Option<&'a str>,
     pub branch: Option<&'a str>,
+    /// Метки нового узла; `None` — без меток.
+    pub tags: Option<&'a [String]>,
 }
 
 fn validate_path(path: &str) -> Result<()> {
@@ -372,11 +411,14 @@ pub fn create(conn: &mut Connection, project: &Project, req: NewNode<'_>) -> Res
     validate_path(&path)?;
 
     let now = now_iso();
+    // Метки пишутся сразу: `update` после `create` дал бы в журнале две записи на один факт
+    // («узел создан» и «узлу добавлены метки»), и первая из них была бы неполной.
+    let tags_json = normalise_tags(req.tags.unwrap_or(&[]));
     tx.execute(
         "INSERT INTO nodes (project_id, parent_id, depth, seq, path, kind, title, description,
                             status, priority, weight, estimated_hours, due_date, branch, source_ref,
-                            sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?11, ?16, ?16)",
+                            tags, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?11, ?17, ?17)",
         params![
             project.id,
             parent_id,
@@ -393,6 +435,7 @@ pub fn create(conn: &mut Connection, project: &Project, req: NewNode<'_>) -> Res
             req.due_date,
             req.branch,
             req.source_ref,
+            tags_json,
             now,
         ],
     )?;
@@ -442,6 +485,19 @@ pub struct Patch<'a> {
     pub estimated_hours: Option<f64>,
     pub source_ref: Option<&'a str>,
     pub branch: Option<&'a str>,
+    /// Метки: добавить (не заменяет набор).
+    pub tag_add: &'a [String],
+    /// Метки: снять.
+    pub tag_remove: &'a [String],
+    /// Метки: заменить набор целиком.
+    ///
+    /// Отдельно от `tag_add`, потому что это разные намерения: «добавь метку» и «оставь только
+    /// эти». Одна команда на оба случая молча теряла бы метки при втором прочтении.
+    pub tags: Option<&'a [String]>,
+    /// Свободные поля: выставить (ключ перезаписывается).
+    pub meta_set: &'a [(String, String)],
+    /// Свободные поля: убрать ключи.
+    pub meta_remove: &'a [String],
     pub force: bool,
     pub description_locked: Option<bool>,
     /// Узел, на который у вызывающего есть живая аренда. Право выставить
@@ -718,6 +774,60 @@ pub fn update(
             new,
         });
     }
+    // Метки: замена набора, добавление и снятие — одно изменение, а не три. Промежуточные
+    // состояния в журнал не попадают: «добавил и снял» в одной правке — это одна правка.
+    if patch.tags.is_some() || !patch.tag_add.is_empty() || !patch.tag_remove.is_empty() {
+        let mut tags: std::collections::BTreeSet<String> = node.tags.iter().cloned().collect();
+        if let Some(replacement) = patch.tags {
+            tags = replacement
+                .iter()
+                .map(|tag| tag.trim().to_string())
+                .filter(|tag| !tag.is_empty())
+                .collect();
+        }
+        for tag in patch.tag_add {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                tags.insert(tag.to_string());
+            }
+        }
+        for tag in patch.tag_remove {
+            tags.remove(tag.trim());
+        }
+        let next: Vec<String> = tags.into_iter().collect();
+        if next != node.tags {
+            changes.push(Change {
+                column: "tags",
+                value: Value::Text(normalise_tags(&next)),
+                old: Some(normalise_tags(&node.tags)),
+                new: Some(normalise_tags(&next)),
+            });
+        }
+    }
+    if !patch.meta_set.is_empty() || !patch.meta_remove.is_empty() {
+        let mut metadata = node.metadata.clone();
+        for (key, value) in patch.meta_set {
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(Error::InvalidValue {
+                    field: "meta".to_string(),
+                    value: "empty key".to_string(),
+                });
+            }
+            metadata.insert(key.to_string(), value.clone());
+        }
+        for key in patch.meta_remove {
+            metadata.remove(key.trim());
+        }
+        if metadata != node.metadata {
+            changes.push(Change {
+                column: "metadata",
+                value: Value::Text(normalise_metadata(&metadata)),
+                old: Some(normalise_metadata(&node.metadata)),
+                new: Some(normalise_metadata(&metadata)),
+            });
+        }
+    }
     if let Some(locked) = patch.description_locked
         && locked != node.description_locked
     {
@@ -788,6 +898,46 @@ pub fn update(
     load_by_id(conn, &project, node.id)
 }
 
+/// Метки в том виде, в каком они лежат в базе: JSON-массив, без повторов, по порядку.
+///
+/// Порядок наводится, а не сохраняется как ввели: метки — множество, и `["api","dns"]` с
+/// `["dns","api"]` обязаны быть одним и тем же значением, иначе сравнение «метки изменились»
+/// срабатывало бы на перестановке и писало в журнал пустую правку.
+pub fn normalise_tags(tags: &[String]) -> String {
+    let unique: std::collections::BTreeSet<&str> = tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .collect();
+    serde_json::to_string(&unique.into_iter().collect::<Vec<_>>()).expect("сериализуемо")
+}
+
+/// То же для свободных полей: JSON-объект, ключи по порядку.
+fn normalise_metadata(metadata: &std::collections::BTreeMap<String, String>) -> String {
+    serde_json::to_string(metadata).expect("сериализуемо")
+}
+
+/// Приводит произвольный JSON свободных полей к тому виду, в каком их хранит база.
+///
+/// Нужно на границе с чужими данными: импорт принимает `metadata` из дампа предшественника, где
+/// значения бывают числами и флагами. Хранимое поле — объект строк, и это не педантизм: иначе
+/// чтение узла зависело бы от того, чем именно записано значение, а `--meta key=value` и импорт
+/// давали бы разные типы одного поля. Числа и флаги становятся текстом, вложенное — компактным
+/// JSON: смысл сохраняется, тип один.
+pub fn normalise_metadata_json(value: &serde_json::Value) -> String {
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            out.insert(key.clone(), text);
+        }
+    }
+    normalise_metadata(&out)
+}
+
 /// Фильтр для `ls`.
 #[derive(Default)]
 pub struct Filter<'a> {
@@ -809,6 +959,12 @@ pub struct Filter<'a> {
     /// Сравнение точное: ветка — это адрес, а не ключевое слово. Префиксное совпадение
     /// смешало бы `feat/x` и `feat/x-fix`, и «что делать в этой ветке» отвечало бы про чужую.
     pub branch: Option<&'a str>,
+    /// Только узлы с этой меткой (`ls --tag`).
+    ///
+    /// Сравнение точное: `api` и `apiv2` — разные метки, и поиск по вхождению смешивал бы их
+    /// молча. Отбор идёт в SQL через `json_each`, а не разбором JSON в Rust: иначе фильтр читал
+    /// бы все узлы проекта и отбрасывал их после — та же ошибка, что была с `limit`.
+    pub tag: Option<&'a str>,
     pub overdue: bool,
     pub include_archived: bool,
     pub include_deleted: bool,
@@ -853,6 +1009,8 @@ pub const FIELDS: &[&str] = &[
     "due_date",
     "branch",
     "source_ref",
+    "tags",
+    "metadata",
     "archived_at",
     "lease_holder",
     "lease_expires_at",
@@ -958,6 +1116,12 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
     if let Some(branch) = filter.branch {
         sql.push_str(" AND e.branch = ?");
         values.push(Value::Text(branch.to_string()));
+    }
+    if let Some(tag) = filter.tag {
+        // `json_each` по колонке меток: сравнение в SQL, а не разбор JSON в Rust — иначе фильтр
+        // читал бы все узлы проекта и отбрасывал их после, ровно как это было с `limit`.
+        sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(e.tags) WHERE json_each.value = ?)");
+        values.push(Value::Text(tag.to_string()));
     }
     if filter.overdue {
         sql.push_str(&format!(
@@ -1117,6 +1281,12 @@ pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
     if let Some(branch) = filter.branch {
         sql.push_str(" AND e.branch = ?");
         values.push(Value::Text(branch.to_string()));
+    }
+    if let Some(tag) = filter.tag {
+        // `json_each` по колонке меток: сравнение в SQL, а не разбор JSON в Rust — иначе фильтр
+        // читал бы все узлы проекта и отбрасывал их после, ровно как это было с `limit`.
+        sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(e.tags) WHERE json_each.value = ?)");
+        values.push(Value::Text(tag.to_string()));
     }
     if !filter.exclude_projects.is_empty() {
         // Плейсхолдеры по числу ключей: подстановка строки в SQL недопустима даже здесь.

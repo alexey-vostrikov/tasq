@@ -486,6 +486,42 @@ fn integer(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
 }
 
+/// Метки из документа: массив, строка с JSON-массивом или что-то ещё.
+///
+/// Три формы — не избыточность. Наш собственный дамп пишет колонку как есть, то есть строкой с
+/// JSON внутри; дамп предшественника — массивом; поле может отсутствовать вовсе. Принимать
+/// только одну форму значило бы терять метки при импорте и не заметить этого: `tags` в узле
+/// выглядел бы пустым, а не «не разобрался».
+fn tags_field(raw: &Value, key: &str) -> String {
+    let parsed = match raw.get(key) {
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+        Some(other) => other.clone(),
+        None => Value::Null,
+    };
+    let list: Vec<String> = match parsed {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(text) => Some(text.clone()),
+                Value::Null => None,
+                other => Some(other.to_string()),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    crate::node::normalise_tags(&list)
+}
+
+/// Свободные поля из документа: объект, строка с JSON-объектом или ничего.
+fn metadata_field(raw: &Value, key: &str) -> String {
+    let parsed = match raw.get(key) {
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+        Some(other) => other.clone(),
+        None => Value::Null,
+    };
+    crate::node::normalise_metadata_json(&parsed)
+}
+
 fn truthy(value: &Value, key: &str) -> bool {
     match value.get(key) {
         Some(Value::Bool(flag)) => *flag,
@@ -580,8 +616,8 @@ fn plan_nodes(payload: &Value) -> Result<Vec<PlanNode>> {
             due_date: text(raw, "due_date"),
             branch: text(raw, "branch"),
             source_ref: text(raw, "source_ref"),
-            tags: text(raw, "tags").unwrap_or_else(|| "[]".to_string()),
-            metadata: text(raw, "metadata").unwrap_or_else(|| "{}".to_string()),
+            tags: tags_field(raw, "tags"),
+            metadata: metadata_field(raw, "metadata"),
             sort_order: integer(raw, "sort_order").unwrap_or(0),
             archived_at: text(raw, "archived_at"),
             created_at: text(raw, "created_at").unwrap_or_else(|| now.clone()),
@@ -938,7 +974,7 @@ pub fn import(
                 text(note, "title").unwrap_or_default(),
                 text(note, "content").unwrap_or_default(),
                 text(note, "note_type").unwrap_or_else(|| "general".to_string()),
-                text(note, "tags").unwrap_or_else(|| "[]".to_string()),
+                tags_field(note, "tags"),
                 text(note, "metadata").unwrap_or_else(|| "{}".to_string()),
                 text(note, "created_at").unwrap_or_else(now_iso),
                 text(note, "updated_at").unwrap_or_else(now_iso),
@@ -1151,7 +1187,7 @@ pub fn import_saga(
             branch: text(epic, "branch"),
             source_ref: None,
             description_locked: false,
-            tags: text(epic, "tags").unwrap_or_else(|| "[]".to_string()),
+            tags: tags_field(epic, "tags"),
             metadata: text(epic, "metadata").unwrap_or_else(|| "{}".to_string()),
             saga_id: epic_saga_id,
             created_at: text(epic, "created_at").unwrap_or_else(|| now.clone()),
@@ -1185,8 +1221,8 @@ pub fn import_saga(
                 branch: None,
                 source_ref: text(task, "source_ref"),
                 description_locked: truthy(task, "description_locked"),
-                tags: text(task, "tags").unwrap_or_else(|| "[]".to_string()),
-                metadata: text(task, "metadata").unwrap_or_else(|| "{}".to_string()),
+                tags: tags_field(task, "tags"),
+                metadata: metadata_field(task, "metadata"),
                 saga_id: integer(task, "_original_id"),
                 created_at: text(task, "created_at").unwrap_or_else(|| now.clone()),
                 updated_at: text(task, "updated_at").unwrap_or_else(|| now.clone()),
@@ -1219,8 +1255,10 @@ pub fn import_saga(
                     branch: None,
                     source_ref: None,
                     description_locked: false,
-                    tags: "[]".to_string(),
-                    metadata: "{}".to_string(),
+                    // Метки и поля подзадачи берутся из документа, а не затираются: раньше здесь
+                    // стояли пустые значения, и подзадачи теряли метки при импорте молча.
+                    tags: tags_field(subtask, "tags"),
+                    metadata: metadata_field(subtask, "metadata"),
                     saga_id: None,
                     created_at: now.clone(),
                     updated_at: now.clone(),
@@ -1312,7 +1350,9 @@ pub fn import_saga(
         if let Some(saga_id) = node.saga_id
             && let Some(object) = metadata.as_object_mut()
         {
-            object.insert("saga_id".to_string(), json!(saga_id));
+            // Текстом, а не числом: хранимое поле — объект строк, и значение-число сделало бы
+            // чтение узла зависимым от того, кто его записал (см. `node::normalise_metadata_json`).
+            object.insert("saga_id".to_string(), json!(saga_id.to_string()));
         }
         tx.execute(
             "INSERT INTO nodes (project_id, parent_id, depth, seq, path, kind, title, description,

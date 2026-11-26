@@ -51,6 +51,7 @@ impl Fixture {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("create")
@@ -371,6 +372,7 @@ fn a_foreign_project_change_does_not_touch_the_board() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("create");

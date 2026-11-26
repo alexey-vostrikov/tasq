@@ -107,6 +107,9 @@ enum Command {
         /// Git branch this node belongs to; without a value — the current branch
         #[arg(long, value_name = "NAME", num_args = 0..=1)]
         branch: Option<Option<String>>,
+        /// Tag; repeatable (`--tag api --tag dns`)
+        #[arg(long = "tag", value_name = "NAME")]
+        tags: Vec<String>,
     },
     /// Show a node, optionally with its subtree
     Show {
@@ -142,6 +145,9 @@ enum Command {
         /// Only nodes of this branch; without a value — the current branch
         #[arg(long, value_name = "NAME", num_args = 0..=1)]
         branch: Option<Option<String>>,
+        /// Only nodes with this tag (exact match)
+        #[arg(long, value_name = "NAME")]
+        tag: Option<String>,
         /// Print only these fields, comma-separated (dot_id,title,status,...)
         #[arg(long, value_name = "LIST")]
         fields: Option<String>,
@@ -186,6 +192,21 @@ enum Command {
         /// Allow the description to change again
         #[arg(long = "unlock-desc")]
         unlock_desc: bool,
+        /// Add a tag; repeatable
+        #[arg(long = "tag", value_name = "NAME")]
+        tag: Vec<String>,
+        /// Remove a tag; repeatable
+        #[arg(long = "untag", value_name = "NAME")]
+        untag: Vec<String>,
+        /// Replace the whole tag set (comma-separated)
+        #[arg(long = "tags", value_name = "LIST", conflicts_with_all = ["tag", "untag"])]
+        tags: Option<String>,
+        /// Set a free-form field: key=value; repeatable
+        #[arg(long = "meta", value_name = "KEY=VALUE")]
+        meta: Vec<String>,
+        /// Remove a free-form field by key; repeatable
+        #[arg(long = "meta-remove", value_name = "KEY")]
+        meta_remove: Vec<String>,
     },
     /// Move a node under another parent; descendant paths follow
     Mv {
@@ -644,6 +665,14 @@ enum CommentCommand {
         /// Show soft-deleted comments with their reasons
         #[arg(long)]
         include_deleted: bool,
+    },
+    /// Rewrite a comment's text; the old text stays in the journal
+    Edit {
+        id: i64,
+        content: String,
+        /// Author name; defaults to $TASQ_HOLDER or `cli`
+        #[arg(long, env = "TASQ_HOLDER")]
+        author: Option<String>,
     },
     /// Soft-delete a comment; the row stays for the audit trail
     Rm {
@@ -1520,6 +1549,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             estimate,
             source,
             branch,
+            tags,
         } => {
             let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
             let kind = match kind {
@@ -1540,6 +1570,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     weight: *weight,
                     source_ref: source.as_deref(),
                     branch: git::resolve(branch.as_ref()).as_deref(),
+                    tags: (!tags.is_empty()).then_some(tags.as_slice()),
                 },
             )?;
             if cli.json {
@@ -1599,6 +1630,20 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if let Some(branch) = &node.branch {
                 println!("branch    {branch}");
             }
+            // Метки и свободные поля печатаются, только когда они есть: пустая строка «tags -»
+            // в каждой карточке — шум, из-за которого перестают читать остальные строки.
+            if !node.tags.is_empty() {
+                println!("tags      {}", node.tags.join(", "));
+            }
+            if !node.metadata.is_empty() {
+                let pairs = node
+                    .metadata
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("meta      {pairs}");
+            }
             if let Some(lease) = &node.lease_holder {
                 println!(
                     "lease     {lease} until {}",
@@ -1624,6 +1669,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             no_done,
             except_project,
             branch,
+            tag,
             fields,
             offset,
             limit,
@@ -1670,6 +1716,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         exclude_done: *no_done,
                         assignee: assignee.as_deref(),
                         branch: branch_filter.as_deref(),
+                        tag: tag.as_deref(),
                         overdue: *overdue,
                         include_archived: *archived,
                         include_deleted: false,
@@ -1686,6 +1733,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         exclude_done: *no_done,
                         assignee: assignee.as_deref(),
                         branch: branch_filter.as_deref(),
+                        tag: tag.as_deref(),
                         overdue: *overdue,
                         include_archived: *archived,
                         include_deleted: false,
@@ -1741,6 +1789,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             force,
             lock_desc,
             unlock_desc,
+            tag,
+            untag,
+            tags,
+            meta,
+            meta_remove,
         } => {
             let (mut conn, project) =
                 open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
@@ -1763,6 +1816,23 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             } else {
                 git::resolve(branch.as_ref())
             };
+            // Метки: `--tags` заменяет набор, `--tag`/`--untag` правят поштучно. Разбор `--meta`
+            // здесь, а не в библиотеке: `set` — единственное место, где ключ приходит строкой
+            // «key=value», и второй разбор в библиотеке разошёлся бы с этим.
+            let mut meta_set: Vec<(String, String)> = Vec::new();
+            for pair in meta {
+                let (key, value) = pair.split_once('=').ok_or_else(|| Error::InvalidValue {
+                    field: "--meta".to_string(),
+                    value: format!("{pair}: expected key=value"),
+                })?;
+                meta_set.push((key.trim().to_string(), value.to_string()));
+            }
+            let tags_set: Option<Vec<String>> = tags.as_ref().map(|list| {
+                list.split(',')
+                    .map(|tag| tag.trim().to_string())
+                    .filter(|tag| !tag.is_empty())
+                    .collect()
+            });
             let updated = node::update(
                 &mut conn,
                 &project,
@@ -1778,6 +1848,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     estimated_hours: None,
                     source_ref: None,
                     branch: branch_value.as_deref(),
+                    tag_add: tag,
+                    tag_remove: untag,
+                    tags: tags_set.as_deref(),
+                    meta_set: &meta_set,
+                    meta_remove,
                     force: *force,
                     description_locked,
                     lease: None,
@@ -2459,6 +2534,20 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 } => {
                     let author = author.clone().unwrap_or_else(|| "cli".to_string());
                     let comment = comment::add(&mut conn, &project, reference, content, &author)?;
+                    if cli.json {
+                        print_json(&comment);
+                    } else {
+                        println!("#{} {}: {}", comment.id, comment.dot_id, comment.content);
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                CommentCommand::Edit {
+                    id,
+                    content,
+                    author,
+                } => {
+                    let actor = author.clone().unwrap_or_else(|| "cli".to_string());
+                    let comment = comment::edit(&mut conn, &project, *id, content, &actor)?;
                     if cli.json {
                         print_json(&comment);
                     } else {

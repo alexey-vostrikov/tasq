@@ -63,6 +63,15 @@ fn search_in(conn: &Connection, project: Option<&Project>, query: &str) -> Resul
     };
     hits.extend(notes);
 
+    // Комментарии — третья поверхность поиска, и на живой базе самая содержательная: обоснования
+    // решений живут в них, а не в описаниях узлов (250 комментариев против нуля заметок). Без них
+    // `find` отвечал «ничего не найдено» на вопрос, ответ на который в базе был.
+    let comments: Vec<Hit> = match fts_comments(conn, project, &fts_query) {
+        Ok(rows) => rows,
+        Err(_) => like_comments(conn, project, trimmed)?,
+    };
+    hits.extend(comments);
+
     Ok(hits)
 }
 
@@ -191,6 +200,94 @@ fn fts_notes(conn: &Connection, project: Option<&Project>, query: &str) -> Resul
             dot_id: node_path.map(|path| format!("{key}-{path}")),
             title: row.get(0)?,
             snippet: row.get(1)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Заголовок найденного комментария: автор и первая строка, обрезанная по границе слова.
+///
+/// Сниппет FTS несёт контекст вокруг совпадения и бывает в несколько строк; в таблице он идёт
+/// отдельной строкой ниже. Заголовок нужен, чтобы отличить один комментарий от другого, поэтому
+/// он — одна строка: иначе вывод на экране разъезжается и два найденных комментария сливаются.
+fn comment_title(author: Option<&str>, snippet: &str) -> String {
+    let line = snippet.lines().next().unwrap_or("").trim();
+    let short: String = if line.chars().count() > 80 {
+        let cut: String = line.chars().take(80).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        line.to_string()
+    };
+    match author {
+        Some(author) => format!("{author}: {short}"),
+        None => short,
+    }
+}
+
+/// Поиск по комментариям через FTS: ответ — сам комментарий и узел, к которому он написан.
+///
+/// Заголовок ответа — начало комментария, а не заголовок узла: два комментария к одному узлу
+/// иначе выглядели бы одинаково, и человек не понял бы, какой из них нашёлся. Адрес узла
+/// остаётся в `dot_id`, поэтому найденное открывается через `show`.
+fn fts_comments(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
+    let mut stmt = conn.prepare(
+        "SELECT snippet(comments_fts, 0, '', '', '…', 12), x.path, p.key, c.author
+         FROM comments_fts f
+         JOIN comments c ON c.id = f.rowid
+         JOIN nodes n ON n.id = c.node_id
+         JOIN projects p ON p.id = n.project_id
+         LEFT JOIN nodes x ON x.id = c.node_id
+         WHERE comments_fts MATCH ?1 AND (?2 < 0 OR n.project_id = ?2) AND n.deleted_at IS NULL
+         ORDER BY rank
+         LIMIT 50",
+    )?;
+    let rows = stmt.query_map(params![query, project_param(project)], |row| {
+        let snippet: String = row.get(0)?;
+        let node_path: Option<String> = row.get(1)?;
+        let key: String = row.get(2)?;
+        let author: Option<String> = row.get(3)?;
+        Ok(Hit {
+            entity: "comment".to_string(),
+            dot_id: node_path.map(|path| format!("{key}-{path}")),
+            title: comment_title(author.as_deref(), &snippet),
+            snippet,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Запасной путь по комментариям — для запросов, которые FTS не разобрал.
+fn like_comments(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
+    let words = query_words(query);
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql = String::from(
+        "SELECT c.content, x.path, p.key, c.author FROM comments c
+         JOIN nodes n ON n.id = c.node_id
+         JOIN projects p ON p.id = n.project_id
+         LEFT JOIN nodes x ON x.id = c.node_id
+         WHERE (? < 0 OR n.project_id = ?) AND n.deleted_at IS NULL",
+    );
+    let param = Value::Integer(project_param(project));
+    let mut values: Vec<Value> = vec![param.clone(), param];
+    for word in &words {
+        sql.push_str(" AND instr(uni_lower(c.content), ?) > 0");
+        values.push(Value::Text(word.clone()));
+    }
+    sql.push_str(" ORDER BY c.created_at DESC LIMIT 50");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+        let content: String = row.get(0)?;
+        let node_path: Option<String> = row.get(1)?;
+        let key: String = row.get(2)?;
+        let author: Option<String> = row.get(3)?;
+        let snippet = content.chars().take(160).collect::<String>();
+        Ok(Hit {
+            entity: "comment".to_string(),
+            dot_id: node_path.map(|path| format!("{key}-{path}")),
+            title: comment_title(author.as_deref(), &snippet),
+            snippet,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

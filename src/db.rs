@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 10;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 11;
 pub const DB_DIR: &str = ".tasq";
 pub const DB_FILE: &str = "tasq.db";
 
@@ -43,6 +43,10 @@ fn migrations() -> Vec<(i64, String)> {
         10,
         include_str!("../migrations/0010_progress_budget.sql")
             .replace("__MAX_DEPTH__", &crate::node::MAX_DEPTH.to_string()),
+    ));
+    all.push((
+        11,
+        include_str!("../migrations/0011_comments_search.sql").to_string(),
     ));
     all
 }

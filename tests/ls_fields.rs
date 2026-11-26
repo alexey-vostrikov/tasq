@@ -191,13 +191,21 @@ fn the_default_answer_is_unchanged() {
         .keys()
         .map(String::as_str)
         .collect();
+    // 28, а не 26: `tags` и `metadata` перестали быть мёртвыми колонками и появились в ответе
+    // (TASQDEV, схема v11). Число держится здесь как утверждение «форма ответа не меняется
+    // молча»: следующее поле обязано пройти через этот тест, а не проехать незамеченным.
     assert_eq!(
         keys.len(),
-        26,
+        28,
         "полей узла стало больше или меньше: {keys:?}"
     );
     assert!(keys.contains(&"description"));
     assert!(keys.contains(&"updated_at"));
+    assert!(keys.contains(&"tags"), "метки не попали в ответ: {keys:?}");
+    assert!(
+        keys.contains(&"metadata"),
+        "свободные поля не попали в ответ: {keys:?}"
+    );
 }
 
 /// Паритет с CLI: у MCP-инструмента те же фильтры и тот же выбор полей — иначе агент и человек

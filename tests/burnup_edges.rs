@@ -53,6 +53,7 @@ fn add(
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("create node")

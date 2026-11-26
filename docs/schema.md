@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v10**.
+Версия схемы: **v11**.
 
 ## Таблицы
 
@@ -76,6 +76,17 @@ CREATE TABLE comments (
   deleted_by    TEXT,
   delete_reason TEXT,
   created_at    TEXT NOT NULL
+)
+```
+
+### `comments_fts`
+
+```sql
+CREATE VIRTUAL TABLE comments_fts USING fts5(
+  content,
+  content='comments',
+  content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
 )
 ```
 

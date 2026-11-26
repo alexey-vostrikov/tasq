@@ -41,6 +41,7 @@ fn fixture(tag: &str) -> (Connection, Project, node::Node) {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node")
@@ -109,6 +110,7 @@ fn overlapping_path_blocks_the_claim_and_names_the_holder() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("second epic");
@@ -162,6 +164,7 @@ fn segment_boundary_is_respected() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");
@@ -207,6 +210,7 @@ fn glob_patterns_conflict_conservatively() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");
@@ -260,6 +264,7 @@ fn shared_reservations_coexist_with_shared_only() {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("epic");
@@ -331,6 +336,7 @@ fn release_frees_the_resources() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");
@@ -380,6 +386,7 @@ fn expiry_frees_the_resources_without_gc() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");
@@ -465,6 +472,7 @@ fn reserve_refuses_someone_elses_resources() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");

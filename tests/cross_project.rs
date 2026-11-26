@@ -49,6 +49,7 @@ fn add(conn: &mut Connection, project: &Project, title: &str) -> node::Node {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("create node")

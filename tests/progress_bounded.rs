@@ -92,6 +92,7 @@ fn seeded_tree(conn: &mut Connection, project: &Project) -> Vec<node::Node> {
             weight: Some(2.0),
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("root");
@@ -111,6 +112,7 @@ fn seeded_tree(conn: &mut Connection, project: &Project) -> Vec<node::Node> {
                 weight: Some(1.0),
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("child");
@@ -130,6 +132,7 @@ fn seeded_tree(conn: &mut Connection, project: &Project) -> Vec<node::Node> {
                     weight: Some(1.0),
                     source_ref: None,
                     branch: None,
+                    tags: None,
                 },
             )
             .expect("leaf");
@@ -356,6 +359,7 @@ fn a_cycle_still_terminates_within_the_step_limit() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("root");
@@ -373,6 +377,7 @@ fn a_cycle_still_terminates_within_the_step_limit() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("task");

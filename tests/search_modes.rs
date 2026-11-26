@@ -46,6 +46,7 @@ fn add(conn: &mut Connection, project: &Project, title: &str) -> node::Node {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("create node")
@@ -167,6 +168,7 @@ fn next_explains_why_a_node_is_first() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("overdue");
@@ -184,6 +186,7 @@ fn next_explains_why_a_node_is_first() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("scheduled");
@@ -201,6 +204,7 @@ fn next_explains_why_a_node_is_first() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("dependent");
@@ -269,6 +273,7 @@ fn context_walks_the_chain() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("task");
@@ -286,6 +291,7 @@ fn context_walks_the_chain() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("subtask");

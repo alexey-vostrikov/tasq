@@ -45,6 +45,7 @@ fn fixture(tag: &str) -> (PathBuf, Connection, Project, node::Node) {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("epic");
@@ -62,6 +63,7 @@ fn fixture(tag: &str) -> (PathBuf, Connection, Project, node::Node) {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("task");
@@ -307,6 +309,7 @@ fn completing_with_open_children_stores_done_and_reads_incomplete() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("subtask");
@@ -393,6 +396,7 @@ fn concurrent_claims_let_exactly_one_win() {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         )
         .expect("node");

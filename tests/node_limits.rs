@@ -48,6 +48,7 @@ fn add(conn: &mut Connection, project: &Project, parent: Option<&str>, title: &s
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("create node")
@@ -77,6 +78,7 @@ fn depth_limit_stops_the_chain() {
                 weight: None,
                 source_ref: None,
                 branch: None,
+                tags: None,
             },
         ) {
             Ok(node) => {
@@ -134,6 +136,7 @@ fn kind_must_match_the_depth() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect_err("эпик на второй глубине");
@@ -155,6 +158,7 @@ fn kind_must_match_the_depth() {
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect_err("пустое имя");

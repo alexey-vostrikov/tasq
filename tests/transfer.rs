@@ -45,6 +45,7 @@ fn add(conn: &mut Connection, project: &Project, parent: Option<&str>, title: &s
             weight: None,
             source_ref: None,
             branch: None,
+            tags: None,
         },
     )
     .expect("node")
@@ -67,6 +68,7 @@ fn seeded(tag: &str) -> (Connection, Project) {
             weight: Some(5.0),
             source_ref: Some("src/main.rs:1"),
             branch: Some("main"),
+            tags: None,
         },
     )
     .expect("epic");
@@ -371,7 +373,11 @@ fn saga_export_is_imported_with_mapping() {
             |row| row.get(0),
         )
         .expect("metadata");
-    assert!(metadata.contains("\"saga_id\":21"), "{metadata}");
+    // Значение — СТРОКА, а не число: `nodes.metadata` хранит объект строк, и это не косметика.
+    // Число сделало бы чтение узла зависимым от того, кто записал поле (импорт дал бы `21`, а
+    // `set --meta saga_id=21` — `"21"`), и `serde` падал бы на разборе такой строки в
+    // `node::map_node`. Смысл сохранён: идентификатор для трассировки тот же.
+    assert!(metadata.contains("\"saga_id\":\"21\""), "{metadata}");
 }
 
 #[test]
