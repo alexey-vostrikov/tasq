@@ -1,0 +1,31 @@
+{
+  "nodes": [
+    {
+      "title": "Границы и спека: что {screen} делает и чего не делает",
+      "estimate": 1,
+      "priority": "medium",
+      "children": [
+        {
+          "title": "Модель {screen} без терминала",
+          "estimate": 2
+        },
+        {
+          "title": "Режим одного кадра для CI",
+          "estimate": 1
+        },
+        {
+          "title": "Экран {screen} и навигация",
+          "estimate": 2
+        },
+        {
+          "title": "Действия {screen}: аренда, переход статуса, форма",
+          "estimate": 3
+        },
+        {
+          "title": "Гейты и документация {screen}",
+          "estimate": 1
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {
+      "title": "Числа в {document} берутся у бинаря",
+      "estimate": 1,
+      "priority": "medium",
+      "children": [
+        {
+          "title": "Гейт --check для {document}, падающий на расхождении",
+          "estimate": 1
+        },
+        {
+          "title": "Убрать из {document} то, что нельзя проверить",
+          "estimate": 0.5
+        }
+      ]
+    }
+  ]
+}

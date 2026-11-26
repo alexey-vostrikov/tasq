@@ -32,7 +32,7 @@ DOCKER_FILE  = --rm -v $(CURDIR):/src -v $(CARGO_VOL):/cargo \
 TARGET_DIR    = /cargo/target-tasq
 RUN          = docker run $(DOCKER_FILE) $(IMAGE)
 
-.PHONY: all image image-check cache-init fmt clippy deny test cov build install smoke act clean tokens docs glibc-check mutants mutants-file mutants-diff
+.PHONY: all image image-check cache-init fmt clippy deny test cov build install smoke act clean tokens docs templates glibc-check mutants mutants-file mutants-diff
 
 all: fmt clippy deny test tokens docs glibc-check
 
@@ -182,6 +182,37 @@ BASE ?= origin/main
 mutants-diff: cache-init
 	$(require_mutants)
 	$(RUN) sh -c 'git diff $(BASE) > /tmp/mutants.diff && bash scripts/mutants-parallel.sh $(MUT_WORKERS) -- --in-diff /tmp/mutants.diff'
+
+# Шаблоны работ из каталога `templates/` — в базу текущего проекта.
+#
+# Каталог, а не база, отвечает на вопрос «какие шаблоны есть»: шаблон — это знание о процессе, и
+# жить оно должно рядом с кодом, под версионным контролем. Цель только загружает файлы; их
+# содержимое проверяется тестом (`tests/templates.rs`), а не этой целью, иначе проверка
+# применялась бы только к тому, что кто-то вспомнил загрузить.
+TEMPLATES_DIR ?= templates
+# База называется явно: от каталога репозитория её не найти, потому что `.tasq` здесь нет и быть не
+# должно, а молчаливая загрузка «куда-нибудь найденное» хуже отказа.
+#
+# `TEMPLATES_PROJECT` пуст по умолчанию, и это осознанно: каталог описывает, КАК ведётся работа, а
+# работа ведётся одинаково во всех проектах, поэтому шаблоны из него грузятся общими. Названный
+# проект — когда каталог нужен именно одному проекту (или чтобы поправить шаблон под него).
+TEMPLATES_DB      ?=
+TEMPLATES_PROJECT ?=
+templates: build
+	@if [ -z "$(TEMPLATES_DB)" ]; then \
+	  echo "templates: назовите базу:" >&2; \
+	  echo "  make templates TEMPLATES_DB=$$HOME/.local/share/tasq/hermes.db [TEMPLATES_PROJECT=TASQDEV]" >&2; \
+	  exit 1; \
+	fi
+	docker run $(DOCKER_FILE) -v $(realpath $(dir $(TEMPLATES_DB))):/db $(IMAGE) sh -c 'set -e; \
+	  scope="--global"; where="the whole database"; \
+	  if [ -n "$(TEMPLATES_PROJECT)" ]; then scope="--project $(TEMPLATES_PROJECT)"; where="$(TEMPLATES_PROJECT)"; fi; \
+	  for file in $(TEMPLATES_DIR)/*.json; do \
+	    name=$$(basename "$$file" .json); \
+	    $(TARGET_DIR)/release/tasq --db /db/$(notdir $(TEMPLATES_DB)) \
+	      template save "$$name" --file "$$file" $$scope >/dev/null; \
+	    echo "template $$name: loaded into $$where"; \
+	  done'
 
 # Справочник в docs/ снимается с бинаря; правка руками ловится гейтом.
 docs: build

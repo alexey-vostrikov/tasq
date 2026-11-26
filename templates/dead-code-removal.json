@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {
+      "title": "Перечень всех использований {subject}",
+      "estimate": 1,
+      "priority": "medium",
+      "children": [
+        {
+          "title": "Перевод на новый путь вместо {subject}",
+          "estimate": 2
+        },
+        {
+          "title": "Удаление {subject} и тест, который ловит возврат",
+          "estimate": 1
+        }
+      ]
+    }
+  ]
+}

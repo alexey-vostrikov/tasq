@@ -1,0 +1,23 @@
+{
+  "nodes": [
+    {
+      "title": "Модель и ключи {backend}",
+      "estimate": 2,
+      "priority": "high",
+      "children": [
+        {
+          "title": "Проводка {backend} в шов: enum, ошибка, журнал",
+          "estimate": 2
+        },
+        {
+          "title": "Тесты {backend} против живого сервиса",
+          "estimate": 2
+        },
+        {
+          "title": "Документация {backend} с ценой в миллисекундах",
+          "estimate": 1
+        }
+      ]
+    }
+  ]
+}

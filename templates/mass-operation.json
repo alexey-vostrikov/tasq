@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {
+      "title": "Отбор {subject} по критерию и dry-run",
+      "estimate": 1,
+      "priority": "medium",
+      "children": [
+        {
+          "title": "Применение {subject} одной транзакцией",
+          "estimate": 1
+        },
+        {
+          "title": "Откат {subject} и проверка после него",
+          "estimate": 1
+        }
+      ]
+    }
+  ]
+}

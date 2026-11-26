@@ -1,0 +1,24 @@
+{
+  "nodes": [
+    {
+      "title": "Спека: что меняется в схеме {subject} и почему",
+      "description": "Чем плох текущий вид, а не «так удобнее».",
+      "estimate": 2,
+      "priority": "high",
+      "children": [
+        {
+          "title": "Миграция {subject}: таблицы, представления, справочники",
+          "estimate": 3
+        },
+        {
+          "title": "Путь апгрейда {subject}: dump → новая схема → restore с отчётом потерь",
+          "estimate": 2
+        },
+        {
+          "title": "Приёмка {subject} на копии живой базы и откат",
+          "estimate": 2
+        }
+      ]
+    }
+  ]
+}
