@@ -273,3 +273,68 @@ fn parse_documented_matrix(table: &str) -> std::collections::BTreeSet<(String, S
     }
     pairs
 }
+
+/// Числа в README сверяются с бинарём, а не с памятью автора.
+///
+/// Проверка идёт на копии README во временном каталоге: настоящий файл обязан быть верным, но
+/// тест должен проверить сам гейт — и «верно» и «разошлось».
+#[test]
+fn readme_numbers_are_checked_against_the_binary() {
+    use tasq::docs;
+
+    let dir = std::env::temp_dir().join(format!(
+        "tasq-readme-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let (tools, profiles) = docs::readme_facts();
+    assert!(tools > 0 && !profiles.is_empty(), "факты пусты");
+
+    let profile_line: String = profiles
+        .iter()
+        .map(|(name, tokens)| format!("{name} {tokens}"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let honest = format!(
+        "| `docs/mcp-tools.md` | каталог `tools/list` | {tools} инструмента, ... |\n\
+         | M8 | готово | профили: {profile_line} токенов, все в бюджете |\n"
+    );
+    let path = dir.join("README.md");
+    fs::write(&path, &honest).expect("write");
+    assert!(
+        docs::check_readme(&path, tools, &profiles).is_empty(),
+        "верные числа не должны давать расхождений"
+    );
+
+    // Одно число испорчено — гейт обязан назвать файл и строку, а не промолчать.
+    let stale = honest.replace(&format!("{tools} инструмента"), "43 инструмента");
+    fs::write(&path, &stale).expect("write");
+    let drift = docs::check_readme(&path, tools, &profiles);
+    assert_eq!(drift.len(), 1, "{drift:?}");
+    assert!(drift[0].contains("README.md:1"), "{drift:?}");
+    assert!(drift[0].contains("43"), "{drift:?}");
+    assert!(drift[0].contains(&tools.to_string()), "{drift:?}");
+
+    // Строка исчезла совсем — это тоже расхождение: молча пропущенный шаблон прячет ошибку.
+    fs::write(&path, "ничего не написано\n").expect("write");
+    let drift = docs::check_readme(&path, tools, &profiles);
+    assert!(
+        drift.iter().any(|item| item.contains("не найдена")),
+        "{drift:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Настоящий README обязан проходить проверку: иначе гейт зелёный, а документация врёт.
+#[test]
+fn the_repository_readme_matches_the_binary() {
+    use tasq::docs;
+
+    let (tools, profiles) = docs::readme_facts();
+    let drift = docs::check_readme(std::path::Path::new("README.md"), tools, &profiles);
+    assert!(drift.is_empty(), "{drift:?}");
+}

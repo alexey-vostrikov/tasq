@@ -1122,7 +1122,25 @@ fn run(cli: &Cli) -> Result<ExitCode> {
     if let Command::Docs { out, check } = &cli.command {
         let files = docs::generate(&Cli::command())?;
         if *check {
-            let drift = docs::check(out, &files)?;
+            let mut drift = docs::check(out, &files)?;
+            // Числа в README проверяются тем же гейтом: «сколько инструментов» и «сколько
+            // токенов» известны бинарю, и разойтись с ним они не имеют права.
+            let readme = out
+                .parent()
+                .map(|root| root.join("README.md"))
+                .unwrap_or_else(|| PathBuf::from("README.md"));
+            let (tool_count, profiles) = docs::readme_facts();
+            if readme.is_file() {
+                drift.extend(docs::check_readme(&readme, tool_count, &profiles));
+            } else if !cli.json {
+                // Не молчание: при `--out` в чужой каталог README рядом нет, и это стоит
+                // назвать вслух — иначе непонятно, почему числа остались непроверенными.
+                eprintln!(
+                    "note: {} not found next to {}, README numbers are not checked",
+                    readme.display(),
+                    out.display()
+                );
+            }
             if !drift.is_empty() {
                 if cli.json {
                     print_json(&serde_json::json!({"ok": false, "drift": drift}));

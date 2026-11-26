@@ -312,3 +312,112 @@ pub fn drift_error(drift: &[String]) -> Error {
         value: format!("{}; run `tasq docs`", drift.join(", ")),
     }
 }
+
+/// Проверка чисел в README против бинаря.
+///
+/// README — не справочник, его не сгенерировать целиком, но числа в нём стареют молча: на момент
+/// этой проверки он обещал 43 инструмента (в каталоге 45) и старые токены профилей. Правило
+/// простое: число либо берётся из бинаря, либо в тексте его нет. Эта функция держит ту половину
+/// правила, которую бинарь знает сам — количество инструментов и стоимость профилей.
+///
+/// Форма строк зафиксирована шаблоном, а не угадыванием: если строку перепишут так, что шаблон
+/// перестанет её находить, проверка скажет об этом прямо. Молча пропущенный шаблон — та же ложь,
+/// что и устаревшее число.
+pub fn check_readme(readme: &Path, tool_count: usize, profiles: &[(String, i64)]) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(readme) else {
+        return vec![format!("{} отсутствует", readme.display())];
+    };
+    let mut drift = Vec::new();
+
+    // «| `docs/mcp-tools.md` | каталог `tools/list` | 45 инструмента, ...»
+    let mut tools_seen = false;
+    for (index, line) in text.lines().enumerate() {
+        if let Some(rest) = line.split("каталог `tools/list` | ").nth(1) {
+            tools_seen = true;
+            let documented: usize = rest
+                .split_whitespace()
+                .next()
+                .and_then(|word| word.parse().ok())
+                .unwrap_or_else(|| {
+                    drift.push(format!(
+                        "{}:{}: числа инструментов не разобрать",
+                        readme.display(),
+                        index + 1
+                    ));
+                    0
+                });
+            if documented != tool_count {
+                drift.push(format!(
+                    "{}:{}: README обещает {documented} инструментов, в каталоге {tool_count}",
+                    readme.display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    if !tools_seen {
+        drift.push(format!(
+            "{}: строка «каталог `tools/list` | N инструмента» не найдена",
+            readme.display()
+        ));
+    }
+
+    // «профили: full 5346 / agent 3609 / read-only 1694 / migration 603 токенов»
+    let needle = "профили: ";
+    let mut tokens_seen = false;
+    for (index, line) in text.lines().enumerate() {
+        let Some(rest) = line.split(needle).nth(1) else {
+            continue;
+        };
+        tokens_seen = true;
+        for (name, actual) in profiles {
+            // Профиль ищется по имени и числу после него: «read-only 1694» — имя с дефисом,
+            // поэтому поиск по границе, а не по началу слова.
+            let Some(position) = rest.find(&format!("{name} ")) else {
+                drift.push(format!(
+                    "{}:{}: в строке профилей нет «{name}»",
+                    readme.display(),
+                    index + 1
+                ));
+                continue;
+            };
+            let documented: i64 = rest[position + name.len() + 1..]
+                .split_whitespace()
+                .next()
+                .and_then(|word| word.parse().ok())
+                .unwrap_or_else(|| {
+                    drift.push(format!(
+                        "{}:{}: стоимость «{name}» не разобрать",
+                        readme.display(),
+                        index + 1
+                    ));
+                    0
+                });
+            if documented != *actual {
+                drift.push(format!(
+                    "{}:{}: README обещает {name} {documented} токенов, в каталоге {actual}",
+                    readme.display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    if !tokens_seen {
+        drift.push(format!(
+            "{}: строка «профили: ...» не найдена",
+            readme.display()
+        ));
+    }
+
+    drift
+}
+
+/// Факты, которые README обязан повторять без ошибок: количество инструментов и стоимость
+/// профилей — те же числа, что печатает `tasq tokens`, поэтому берутся они из одного места.
+pub fn readme_facts() -> (usize, Vec<(String, i64)>) {
+    let profiles = budget::measure_all()
+        .into_iter()
+        .map(|report| (report.profile, report.tokens as i64))
+        .collect();
+    (ALL_TOOLS.len(), profiles)
+}
