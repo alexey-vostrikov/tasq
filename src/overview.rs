@@ -326,13 +326,21 @@ pub struct Board {
 ///
 /// Один тип на экран и на CLI, чтобы «скрыть выполненное» означало одно и то же в обоих местах:
 /// правило «`incomplete` виден там, где `done` скрыт» нарушилось бы ровно на расхождении фильтров.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// `Copy` снят вместе с появлением ветки: `String` копировать бесплатно нельзя, а
+// `BoardFilter` передаётся в `board_with` по значению — `Clone` для этого достаточно, и
+// вызывающий, которому нужен свой экземпляр, клонирует явно.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BoardFilter {
     /// Скрыть выполненное (`ls -n`). Закрытое с хвостами (`incomplete`) при этом остаётся:
     /// это единственный сигнал, что под узлом есть незакрытые задачи.
     pub hide_done: bool,
     /// Показать архив (`ls -a`).
     pub show_archived: bool,
+    /// Только узлы этой ветки (`ls --branch`); `None` — фильтра нет.
+    ///
+    /// Владелец — `String`, а не `&str`, потому что фильтр живёт на экране дольше любого
+    /// вызова: имя приходит из git один раз при включении и потом просто сравнивается.
+    pub branch: Option<String>,
 }
 
 pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
@@ -346,6 +354,7 @@ pub fn board_with(conn: &Connection, project: &Project, filter: BoardFilter) -> 
         &Filter {
             include_archived: filter.show_archived,
             exclude_done: filter.hide_done,
+            branch: filter.branch.as_deref(),
             ..Filter::default()
         },
     )?;

@@ -675,7 +675,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) -> Hits {
     );
     frame.render_widget(
         Paragraph::new(Line::from(format!(
-            "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, v — вид, D — скрыть выполненное, A — архив, PgUp/PgDn — панель, T — тема, q — выход{}",
+            "{}   j/k — строки, h/l — колонки, Enter — карточка, c/r — аренда, s — статус, v — вид, D — скрыть выполненное, A — архив, B — ветка, PgUp/PgDn — панель, T — тема, q — выход{}",
             app.state.mode.title(),
             // Активные переключатели виду называются и в подсказке: иначе человек не отличит
             // «архив пуст» от «архив скрыт» — на экране оба выглядят одинаково.
@@ -686,6 +686,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &app::App) -> Hits {
                 }
                 if app.board_filter.show_archived {
                     marks.push("-a");
+                }
+                if let Some(branch) = &app.board_filter.branch {
+                    marks.push(branch);
                 }
                 if marks.is_empty() {
                     String::new()

@@ -240,6 +240,7 @@ fn the_board_hides_done_but_keeps_incomplete() {
         BoardFilter {
             hide_done: true,
             show_archived: false,
+            branch: None,
         },
     )
     .expect("board");

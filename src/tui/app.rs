@@ -208,7 +208,7 @@ impl App {
         // отпустил бы не тот узел (в живом прогоне это и вышло: `NOT_YOUR_ATTEMPT` на верном
         // нажатии).
         let keep = self.selected().map(|row| row.dot_id.clone());
-        self.board = overview::board_with(conn, project, self.board_filter)?;
+        self.board = overview::board_with(conn, project, self.board_filter.clone())?;
         self.state.rows = self
             .board
             .columns
@@ -956,6 +956,27 @@ impl App {
                 };
                 return self.reload(conn, project, shown);
             }
+            Intent::ToggleBranch => {
+                // Ветка берётся у git в момент включения, а не при каждом перечитывании: экран
+                // не должен менять содержимое от того, что человек переключил ветку в другом
+                // терминале. Снять фильтр можно той же клавишей.
+                if self.board_filter.branch.is_some() {
+                    self.board_filter.branch = None;
+                    return self.reload(conn, project, "фильтр по ветке снят");
+                }
+                match crate::git::current_branch() {
+                    Some(branch) => {
+                        self.board_filter.branch = Some(branch.clone());
+                        return self.reload(conn, project, &format!("только ветка {branch}"));
+                    }
+                    // Вне репозитория значения нет, и подставлять `main` нельзя: фильтр
+                    // показал бы чужие узлы как «свои».
+                    None => {
+                        self.fail("не в репозитории git: текущей ветки нет");
+                        return Outcome::Redraw;
+                    }
+                }
+            }
             Intent::SearchRun => {
                 self.run_search(&*conn);
                 return Outcome::Redraw;
@@ -1025,7 +1046,7 @@ impl App {
                 self.next_theme();
                 Ok("")
             }
-            Intent::ToggleDone | Intent::ToggleArchived => Ok(""),
+            Intent::ToggleDone | Intent::ToggleArchived | Intent::ToggleBranch => Ok(""),
             Intent::SubmitForm => self.submit(conn, project),
             Intent::SearchRun | Intent::SearchOpen | Intent::ResultDown | Intent::ResultUp => {
                 Ok("")
