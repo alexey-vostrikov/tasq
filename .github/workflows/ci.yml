@@ -108,5 +108,11 @@ jobs:
       - name: Tool schema budget
         run: ./target/release/tasq tokens --max 6000
 
+      # Нагрузочный гейт: фикстура 10 000 узлов и бюджеты p99. Стоит рядом с glibc и токенами
+      # потому что это тот же класс проверки — «то, что легко потерять молча»; бюджеты и их
+      # происхождение — в шапке `tests/perf.rs`.
+      - name: Read budget on a ten thousand node project
+        run: cargo test --release --test perf -- --ignored --test-threads=1
+
       - name: Reference docs are up to date
         run: ./target/release/tasq docs --check

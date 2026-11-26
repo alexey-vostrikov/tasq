@@ -84,6 +84,17 @@ cov: cache-init image-check
 test: cache-init
 	$(RUN) cargo test --all-targets
 
+# Нагрузочный замер на фикстуре 10 000 узлов. Отдельная цель, а не часть `all`: она строит
+# десятитысячную базу и меряет чтение, и в общем прогоне это добавило бы десять секунд к
+# каждой правке. Бюджеты p99 и их происхождение — в шапке `tests/perf.rs`; сборка release,
+# потому что бюджет, снятый на debug, ничего не говорит о том, что видит человек.
+PERF_ROUNDS ?= 20
+# `--ignored`: замер помечен игнорируемым, чтобы не попадать в `cargo test --all-targets`
+# (debug + параллельные тесты = замер не того). `--test-threads=1`: рядом не должно строить
+# свою фикстуру ничего другое, иначе числа меряют конкуренцию за диск.
+perf: cache-init
+	$(RUN) cargo test --release --test perf -- --ignored --nocapture --test-threads=1
+
 build: cache-init
 	$(RUN) cargo build --release
 
