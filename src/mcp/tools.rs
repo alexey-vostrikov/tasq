@@ -918,7 +918,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             })?;
             let saved = template::save(
                 &mut ctx.conn,
-                &project,
+                Some(&project),
                 req_str(args, "name")?,
                 arg_str(args, "description"),
                 &serde_json::to_string(tree).unwrap_or_else(|_| "[]".to_string()),
@@ -927,8 +927,12 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             Ok(text(&saved))
         }
         "template_list" => {
-            let project = ctx.project(args)?;
-            let templates = template::list(&ctx.conn, &project)?;
+            // Проект не требуется: без него видно всё — по проектам и общие. С проектом — свои и
+            // общие, то есть ровно то, что можно применить в этом проекте.
+            let templates = match &ctx.active {
+                Some(project) => template::list(&ctx.conn, project)?,
+                None => template::list_all(&ctx.conn)?,
+            };
             Ok(text(&templates))
         }
         "template_apply" => {
@@ -958,7 +962,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             let project = ctx.project(args)?;
             template::delete(
                 &mut ctx.conn,
-                &project,
+                Some(&project),
                 req_str(args, "name")?,
                 &arg_holder(args),
             )?;
@@ -1604,8 +1608,16 @@ pub fn definition(name: &str) -> Option<Value> {
         ),
         "template_list" => tool(
             name,
-            "List templates with their variables",
-            json!({"type": "object", "properties": {}}),
+            "List templates with their variables. Without a project, every template in the database is listed with its project key; global templates have no project.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project key; its templates and the global ones. Omit for every template in the database"
+                    }
+                }
+            }),
             (true, false, true),
         ),
         "template_apply" => tool(

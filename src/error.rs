@@ -200,6 +200,13 @@ pub enum Error {
     #[error("invalid {field} value {value}")]
     InvalidValue { field: String, value: String },
 
+    /// Общий шаблон пытаются удалить из проекта.
+    ///
+    /// Отдельный код, а не `INVALID_VALUE`: общий шаблон существует и найден, отказ не в имени —
+    /// «invalid template value» отправило бы человека искать опечатку, которой он не сделал.
+    #[error("template {name} belongs to the whole database, not to a project")]
+    GlobalTemplate { name: String },
+
     /// Терминала нет: экран не на что рисовать.
     ///
     /// Отдельный код, а не `STORAGE_ERROR`: `enable_raw_mode` на входе без tty отдаёт
@@ -255,6 +262,7 @@ impl Error {
             Error::MoveIntoSelf { .. } => "MOVE_INTO_SELF",
             Error::MigrationBroken { .. } => "MIGRATION_BROKEN",
             Error::InvalidValue { .. } => "INVALID_VALUE",
+            Error::GlobalTemplate { .. } => "GLOBAL_TEMPLATE",
             Error::NoTerminal { .. } => "NO_TERMINAL",
             Error::Io(_) | Error::Sqlite(_) => "STORAGE_ERROR",
         }
@@ -342,6 +350,9 @@ impl Error {
                 "restore the database from a backup: the migration was rolled back untouched"
             }
             Error::InvalidValue { .. } => "check the allowed values with --help",
+            Error::GlobalTemplate { .. } => {
+                "run `template rm` without --project, or remove the file in templates/"
+            }
             Error::NoTerminal { .. } => {
                 "run it from an interactive terminal, or use `tasq tui --once` to print one frame"
             }

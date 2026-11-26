@@ -8,7 +8,7 @@
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 46 | 6000 | 5583 |
+| `full` | 46 | 6000 | 5605 |
 | `agent` | 30 | 4000 | 3825 |
 | `read-only` | 17 | 2000 | 1910 |
 | `migration` | 6 | 800 | 603 |
@@ -50,7 +50,7 @@
 | `note_search` | full, agent, read-only | 90 | `query` | Search notes by keyword |
 | `note_delete` | full | 90 | `id` | Delete a note |
 | `template_save` | full | 136 | `name`, `tree` | Create or replace a template: a node tree with {variable} placeholders |
-| `template_list` | full | 75 | — | List templates with their variables |
+| `template_list` | full | 97 | — | List templates with their variables. Without a project, every template in the database is listed with its project key; global templates have no project. |
 | `template_apply` | full | 124 | `name` | Create nodes from a template under a parent |
 | `template_delete` | full | 90 | `name` | Delete a template |
 | `activity_log` | full, agent, read-only | 90 | — | Recent changes: what happened and when |

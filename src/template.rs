@@ -77,6 +77,17 @@ impl TemplateTree {
         Ok(tree)
     }
 
+    /// Сколько узлов создаст применение — вместе с детьми всех уровней.
+    ///
+    /// Нужно снаружи (каталог шаблонов в `templates/` сверяется по этому числу): читатель файла
+    /// не должен считать дерево руками, а тест — тем более, иначе две реализации счёта разойдутся.
+    pub fn count(&self) -> usize {
+        fn walk(node: &TemplateNode) -> usize {
+            1 + node.children.iter().map(walk).sum::<usize>()
+        }
+        self.nodes.iter().map(walk).sum()
+    }
+
     /// Имена всех `{переменных}` в дереве, в порядке появления.
     pub fn variables(&self) -> Vec<String> {
         let mut found = BTreeSet::new();
@@ -141,6 +152,13 @@ pub fn render(text: &str, values: &[(String, String)]) -> Result<String> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Template {
     pub id: i64,
+    /// Ключ проекта, которому шаблон принадлежит; `None` — шаблон общий для всей базы.
+    ///
+    /// Общий шаблон — это запись процесса, а не данные проекта: каталог `templates/` описывает,
+    /// как ведётся работа, и ведётся она одинаково во всех проектах. Поле нужно читателю, чтобы
+    /// ответ «без проекта» был однозначным: имя шаблона уникально внутри проекта, а не в базе,
+    /// поэтому два проекта могут держать одноимённые шаблоны.
+    pub project: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub tree: TemplateTree,
@@ -149,13 +167,18 @@ pub struct Template {
     pub updated_at: String,
 }
 
-const SELECT: &str = "SELECT id, name, description, tree, created_at, updated_at FROM templates";
+/// Проект ключом, а не номером: ответ читает человек, и `project: 3` ему ничего не говорит.
+/// `LEFT JOIN`, а не `JOIN`: у общего шаблона проекта нет, и внутреннее соединение выбросило бы
+/// его из списка — то есть ровно тот шаблон, который мы хотим показать.
+const SELECT: &str = "SELECT t.id, t.name, t.description, t.tree, t.created_at, t.updated_at, p.key
+     FROM templates t LEFT JOIN projects p ON p.id = t.project_id";
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Template> {
     let raw: String = row.get(3)?;
     let tree = TemplateTree::parse(&raw).unwrap_or_default();
     Ok(Template {
         id: row.get(0)?,
+        project: row.get(6)?,
         name: row.get(1)?,
         description: row.get(2)?,
         variables: tree.variables(),
@@ -166,14 +189,20 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Template> {
 }
 
 /// Создаёт шаблон или заменяет существующий с тем же именем.
+///
+/// `project: None` — шаблон общий для всей базы. В журнал (`activity_log`) такая запись не
+/// попадает: `activity_log.project_id` объявлен обязательным, а у общего шаблона проекта нет —
+/// приписать ему чужой значило бы положить в аудит ложь. Видно это и по `updated_at`, и по
+/// каталогу `templates/`, откуда общие шаблоны и берутся.
 pub fn save(
     conn: &mut Connection,
-    project: &Project,
+    project: Option<&Project>,
     name: &str,
     description: Option<&str>,
     raw_tree: &str,
     actor: &str,
 ) -> Result<Template> {
+    let project_id = project.map(|project| project.id);
     if name.trim().is_empty() {
         return Err(Error::InvalidValue {
             field: "name".to_string(),
@@ -193,30 +222,34 @@ pub fn save(
            description = excluded.description,
            tree = excluded.tree,
            updated_at = excluded.updated_at",
-        params![project.id, name.trim(), description, stored, now],
+        params![project_id, name.trim(), description, stored, now],
     )?;
+    // Поиск идёт по `IS`, а не `=`: у общего шаблона `project_id IS NULL`, и `= NULL` не совпал
+    // бы ни с одной строкой — сохранение отвечало бы «шаблона нет» сразу после успешной записи.
     let id: i64 = tx.query_row(
-        "SELECT id FROM templates WHERE project_id = ?1 AND name = ?2",
-        params![project.id, name.trim()],
+        "SELECT id FROM templates WHERE project_id IS ?1 AND name = ?2",
+        params![project_id, name.trim()],
         |row| row.get(0),
     )?;
-    activity::log(
-        &tx,
-        &Entry {
-            project_id: project.id,
-            node_id: None,
-            entity_type: "template",
-            entity_id: id,
-            action: "save",
-            field_name: Some("name"),
-            old_value: None,
-            new_value: Some(name.trim()),
-            summary: None,
-            actor,
-        },
-    )?;
+    if let Some(project) = project {
+        activity::log(
+            &tx,
+            &Entry {
+                project_id: project.id,
+                node_id: None,
+                entity_type: "template",
+                entity_id: id,
+                action: "save",
+                field_name: Some("name"),
+                old_value: None,
+                new_value: Some(name.trim()),
+                summary: None,
+                actor,
+            },
+        )?;
+    }
     tx.commit()?;
-    by_id(conn, project, id)
+    by_id(conn, id)
 }
 
 /// Проверяет, что виды и приоритеты в шаблоне допустимы.
@@ -261,25 +294,36 @@ fn validate(tree: &TemplateTree) -> Result<()> {
     Ok(())
 }
 
-/// Шаблон по идентификатору.
-pub fn by_id(conn: &Connection, project: &Project, id: i64) -> Result<Template> {
-    conn.query_row(
-        &format!("{SELECT} WHERE id = ?1 AND project_id = ?2"),
-        params![id, project.id],
-        map_row,
-    )
-    .optional()?
-    .ok_or_else(|| Error::InvalidValue {
-        field: "template id".to_string(),
-        value: format!("{id} not found"),
-    })
+/// Шаблон по идентификатору. Проект уточнять не нужно: `id` уникален в базе.
+pub fn by_id(conn: &Connection, id: i64) -> Result<Template> {
+    conn.query_row(&format!("{SELECT} WHERE t.id = ?1"), params![id], map_row)
+        .optional()?
+        .ok_or_else(|| Error::InvalidValue {
+            field: "template id".to_string(),
+            value: format!("{id} not found"),
+        })
 }
 
-/// Шаблон по имени.
-pub fn by_name(conn: &Connection, project: &Project, name: &str) -> Result<Template> {
+/// Шаблон по имени: сначала свой, потом общий.
+///
+/// Порядок — не мелочь: проект вправе переопределить общий шаблон под свои условия, и
+/// переопределение обязано побеждать. Обратный порядок означал бы, что загруженный из каталога
+/// шаблон нельзя поправить в проекте.
+pub fn by_name(conn: &Connection, project: Option<&Project>, name: &str) -> Result<Template> {
+    if let Some(project) = project
+        && let Some(found) = conn
+            .query_row(
+                &format!("{SELECT} WHERE t.name = ?1 AND t.project_id = ?2"),
+                params![name, project.id],
+                map_row,
+            )
+            .optional()?
+    {
+        return Ok(found);
+    }
     conn.query_row(
-        &format!("{SELECT} WHERE name = ?1 AND project_id = ?2"),
-        params![name, project.id],
+        &format!("{SELECT} WHERE t.name = ?1 AND t.project_id IS NULL"),
+        params![name],
         map_row,
     )
     .optional()?
@@ -289,38 +333,68 @@ pub fn by_name(conn: &Connection, project: &Project, name: &str) -> Result<Templ
     })
 }
 
-/// Все шаблоны проекта.
+/// Шаблоны проекта вместе с общими.
+///
+/// Общие показываются всегда: они доступны в любом проекте (их и применяет `by_name`), и молча
+/// скрыть их значило бы врать о том, что можно применить.
 pub fn list(conn: &Connection, project: &Project) -> Result<Vec<Template>> {
-    let mut stmt = conn.prepare(&format!("{SELECT} WHERE project_id = ?1 ORDER BY name"))?;
+    let mut stmt = conn.prepare(&format!(
+        "{SELECT} WHERE t.project_id = ?1 OR t.project_id IS NULL ORDER BY t.name"
+    ))?;
     let rows = stmt.query_map(params![project.id], map_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Все шаблоны базы, без выбора проекта: по проекту и общие.
+///
+/// Нужен там, где проект не назван. Ответ обязан называть проект у каждого шаблона — иначе
+/// список из нескольких проектов выглядит как один, а имя шаблона уникально только внутри
+/// проекта, и два одноимённых стали бы неразличимы.
+pub fn list_all(conn: &Connection) -> Result<Vec<Template>> {
+    let mut stmt = conn.prepare(&format!("{SELECT} ORDER BY COALESCE(p.key, ''), t.name"))?;
+    let rows = stmt.query_map([], map_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Удаляет шаблон.
 /// Удаляет шаблон. Отсутствующий шаблон — отказ из `by_name`, поэтому
 /// «удалено ли что-то» не возвращается: строка после успешного поиска есть всегда.
-pub fn delete(conn: &mut Connection, project: &Project, name: &str, actor: &str) -> Result<()> {
+/// Удаляет шаблон — свой или общий (когда проект не назван).
+///
+/// Общий шаблон из проекта не удаляется: он принадлежит не проекту, а всей базе, и удаление
+/// «отсюда» было бы удалением того, чем пользуются соседи. Такой отказ называет причину, а не
+/// «не найдено»: иначе человек ищет опечатку в имени, которого не допустил.
+pub fn delete(
+    conn: &mut Connection,
+    project: Option<&Project>,
+    name: &str,
+    actor: &str,
+) -> Result<()> {
     let template = by_name(conn, project, name)?;
+    if template.project.is_none() && project.is_some() {
+        return Err(Error::GlobalTemplate {
+            name: name.to_string(),
+        });
+    }
     let tx = crate::db::write_tx(conn)?;
-    tx.execute(
-        "DELETE FROM templates WHERE id = ?1 AND project_id = ?2",
-        params![template.id, project.id],
-    )?;
-    activity::log(
-        &tx,
-        &Entry {
-            project_id: project.id,
-            node_id: None,
-            entity_type: "template",
-            entity_id: template.id,
-            action: "delete",
-            field_name: Some("name"),
-            old_value: Some(template.name.as_str()),
-            new_value: None,
-            summary: None,
-            actor,
-        },
-    )?;
+    tx.execute("DELETE FROM templates WHERE id = ?1", params![template.id])?;
+    if let Some(project) = project {
+        activity::log(
+            &tx,
+            &Entry {
+                project_id: project.id,
+                node_id: None,
+                entity_type: "template",
+                entity_id: template.id,
+                action: "delete",
+                field_name: Some("name"),
+                old_value: Some(template.name.as_str()),
+                new_value: None,
+                summary: None,
+                actor,
+            },
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -347,7 +421,9 @@ pub fn apply(
     parent_ref: Option<&str>,
     values: &[(String, String)],
 ) -> Result<Applied> {
-    let template = by_name(conn, project, name)?;
+    // Проект обязателен: применение создаёт узлы, а узлы живут в проекте. Общий шаблон при этом
+    // применим — `by_name` находит его, когда своего с таким именем нет.
+    let template = by_name(conn, Some(project), name)?;
     let missing: Vec<String> = template
         .variables
         .iter()

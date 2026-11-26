@@ -194,7 +194,7 @@ fn template_variables_are_collected_and_rendered() {
     let epic = add(&mut conn, &project, None, "Эпик");
     let saved = template::save(
         &mut conn,
-        &project,
+        Some(&project),
         "api-handler",
         Some("Новая ручка API"),
         r#"[
@@ -244,7 +244,7 @@ fn template_apply_fails_before_writing_when_a_variable_is_missing() {
     let (mut conn, project) = fixture("tplmiss");
     template::save(
         &mut conn,
-        &project,
+        Some(&project),
         "release",
         None,
         r#"{"nodes": [{"title": "Выпустить {version}", "description": "тег {version}"}]}"#,
@@ -265,7 +265,7 @@ fn template_rejects_bad_kind_and_duplicate_name_updates_in_place() {
     let (mut conn, project) = fixture("tplkind");
     let err = template::save(
         &mut conn,
-        &project,
+        Some(&project),
         "bad",
         None,
         r#"[{"title": "X", "kind": "epiccc"}]"#,
@@ -276,7 +276,7 @@ fn template_rejects_bad_kind_and_duplicate_name_updates_in_place() {
 
     template::save(
         &mut conn,
-        &project,
+        Some(&project),
         "same",
         None,
         r#"[{"title": "A"}]"#,
@@ -285,7 +285,7 @@ fn template_rejects_bad_kind_and_duplicate_name_updates_in_place() {
     .expect("first");
     template::save(
         &mut conn,
-        &project,
+        Some(&project),
         "same",
         None,
         r#"[{"title": "B"}]"#,

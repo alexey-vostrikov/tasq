@@ -32,7 +32,7 @@ fn fixture(tag: &str) -> (Connection, Project) {
 }
 
 fn save(conn: &mut Connection, project: &Project, name: &str, raw: &str) -> tasq::Result<()> {
-    template::save(conn, project, name, None, raw, "-").map(|_| ())
+    template::save(conn, Some(project), name, None, raw, "-").map(|_| ())
 }
 
 /// Вход шаблона: битый JSON, скаляр, объект без `nodes`, пустой список.
@@ -143,7 +143,7 @@ fn names_and_ids_are_checked() {
 
     save(&mut conn, &project, "api", r#"[{"title": "Узел"}]"#).expect("save");
 
-    let error = template::by_id(&conn, &project, 999).expect_err("нет id");
+    let error = template::by_id(&conn, 999).expect_err("нет id");
     assert_eq!(error.code(), "INVALID_VALUE");
     assert!(error.to_string().contains("999"), "{error}");
 
@@ -155,7 +155,7 @@ fn names_and_ids_are_checked() {
         r#"[{"title": "Узел"}, {"title": "Второй"}]"#,
     )
     .expect("update");
-    let stored = template::by_name(&conn, &project, "api").expect("by name");
+    let stored = template::by_name(&conn, Some(&project), "api").expect("by name");
     assert_eq!(stored.tree.nodes.len(), 2);
     assert_eq!(template::list(&conn, &project).expect("list").len(), 1);
 }

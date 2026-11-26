@@ -466,6 +466,7 @@ tasq save [ОПЦИИ]
 | `--file` | `PATH` | — | Path to a JSON file with the template tree |
 | `--tree` | `JSON` | — | Inline JSON (array of nodes or {"nodes": [...]}) |
 | `--description` | `DESCRIPTION` | — |  |
+| `--global` | — | — | Template for the whole database, not for one project |
 
 ### `ls`
 

@@ -100,7 +100,7 @@ fn seeded(tag: &str) -> (Connection, Project) {
     .expect("note");
     template::save(
         &mut conn,
-        &project,
+        Some(&project),
         "api",
         None,
         r#"[{"title":"Ручка {res}","kind":"task"}]"#,

@@ -326,7 +326,7 @@ fn template_applied_at_root_names_the_project() {
     let tree = serde_json::json!([{"title": "{resource}: контроллер"}]);
     template::save(
         &mut conn,
-        &project,
+        Some(&project),
         "api",
         None,
         &serde_json::to_string(&tree).expect("serialise"),

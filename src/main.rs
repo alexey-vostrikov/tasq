@@ -669,6 +669,9 @@ enum TemplateCommand {
         tree: Option<String>,
         #[arg(long)]
         description: Option<String>,
+        /// Template for the whole database, not for one project
+        #[arg(long)]
+        global: bool,
     },
     /// List templates with their variables
     Ls,
@@ -755,6 +758,26 @@ fn main() -> ExitCode {
 ///
 /// Проект выбирается по `--project`/`TASQ_PROJECT`, иначе берётся первый по порядку
 /// создания — так работают существующие базы и скрипты.
+/// Соединение и проект, если он назван или единственный в базе.
+///
+/// `None` — проектов несколько и ни один не назван. Это законное состояние для команд, которые
+/// умеют работать по всей базе (`template ls`: список по проектам и общие), и недопустимое для
+/// тех, кто пишет внутрь проекта. Различать эти два случая должен вызывающий, а не `open`: он
+/// отвечает за соединение, а не за политику команды.
+fn open_optional(
+    db_path: Option<&std::path::Path>,
+    project_key: Option<&str>,
+) -> Result<(Connection, Option<Project>)> {
+    let cwd = std::env::current_dir()?;
+    let path = db::discover(&cwd, db_path)?;
+    let conn = db::open_checked(&path)?;
+    let project = match project_key {
+        Some(key) => Some(project::select(&conn, Some(key))?),
+        None => project::first_project_if_single(&conn)?,
+    };
+    Ok((conn, project))
+}
+
 fn open(
     db_path: Option<&std::path::Path>,
     project_key: Option<&str>,
@@ -3133,13 +3156,17 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Template { command } => {
-            let (mut conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            // Проект здесь необязателен: `ls` без проекта показывает всё по проектам и общие,
+            // `rm` умеет удалять общий. Команды, создающие узлы (`apply`), требуют проект сами —
+            // и отказывают словами, а не «проект не найден» посередине работы.
+            let (mut conn, project) = open_optional(cli.db.as_deref(), cli.project.as_deref())?;
             match command {
                 TemplateCommand::Save {
                     name,
                     file,
                     tree,
                     description,
+                    global,
                 } => {
                     let raw = match (file, tree) {
                         (Some(path), _) => std::fs::read_to_string(path)?,
@@ -3151,14 +3178,21 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                             });
                         }
                     };
-                    let saved = template::save(
-                        &mut conn,
-                        &project,
-                        name,
-                        description.as_deref(),
-                        &raw,
-                        "-",
-                    )?;
+                    // `--global` — шаблон всей базы, без проекта. Без флага проект обязателен:
+                    // молча создать шаблон «в первом по порядку» значило бы положить его не туда.
+                    let scope = if *global {
+                        None
+                    } else {
+                        Some(project.as_ref().ok_or_else(|| {
+                            Error::InvalidValue {
+                            field: "template".to_string(),
+                            value: "name the project, or pass --global for a database-wide template"
+                                .to_string(),
+                        }
+                        })?)
+                    };
+                    let saved =
+                        template::save(&mut conn, scope, name, description.as_deref(), &raw, "-")?;
                     if cli.json {
                         print_json(&saved);
                     } else {
@@ -3181,7 +3215,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
                 TemplateCommand::Ls => {
-                    let templates = template::list(&conn, &project)?;
+                    let templates = match &project {
+                        Some(project) => template::list(&conn, project)?,
+                        None => template::list_all(&conn)?,
+                    };
                     if cli.json {
                         print_json(&templates);
                         return Ok(ExitCode::SUCCESS);
@@ -3191,9 +3228,17 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         return Ok(ExitCode::SUCCESS);
                     }
                     for template in &templates {
+                        // Проект печатается всегда, когда его нет у шаблона или когда список
+                        // смешанный: имя уникально внутри проекта, и два одноимённых шаблона в
+                        // разных проектах иначе выглядели бы дублем.
+                        let owner = match (&template.project, &project) {
+                            (Some(key), _) => key.as_str(),
+                            (None, _) => "(global)",
+                        };
                         println!(
-                            "{:<24} {:>2} root(s)  {}",
+                            "{:<24} {:<10} {:>2} root(s)  {}",
                             template.name,
+                            owner,
                             template.tree.nodes.len(),
                             template.variables.join(" ")
                         );
@@ -3201,7 +3246,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
                 TemplateCommand::Show { name } => {
-                    let template = template::by_name(&conn, &project, name)?;
+                    let template = template::by_name(&conn, project.as_ref(), name)?;
                     if cli.json {
                         print_json(&template);
                         return Ok(ExitCode::SUCCESS);
@@ -3234,8 +3279,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                             })?;
                         values.push((key.trim().to_string(), value.to_string()));
                     }
+                    // Применение создаёт узлы, а узел живёт в проекте: без проекта здесь нечего
+                    // делать, и отказ приходит до чтения шаблона.
+                    let project = project.as_ref().ok_or_else(|| Error::InvalidValue {
+                        field: "template".to_string(),
+                        value: "name the project: applying creates nodes inside it".to_string(),
+                    })?;
                     let applied =
-                        template::apply(&mut conn, &project, name, parent.as_deref(), &values)?;
+                        template::apply(&mut conn, project, name, parent.as_deref(), &values)?;
                     if cli.json {
                         print_json(&applied);
                     } else {
@@ -3251,7 +3302,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     Ok(ExitCode::SUCCESS)
                 }
                 TemplateCommand::Rm { name } => {
-                    template::delete(&mut conn, &project, name, "-")?;
+                    template::delete(&mut conn, project.as_ref(), name, "-")?;
                     if cli.json {
                         print_json(&serde_json::json!({ "removed": true, "name": name }));
                     } else {
