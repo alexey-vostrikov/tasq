@@ -7,7 +7,8 @@
 //!
 //! Что именно проверяется:
 //!
-//! * за паузу без нажатий счётчик полных чтений не растёт, а `data_version` опрашивается;
+//! * за паузу без нажатий база не опрашивается ВООБЩЕ: экран спит в ожидании письма, а не
+//!   спрашивает `data_version` по таймеру;
 //! * запись, сделанная ДРУГИМ процессом, доводит до перечитывания — иначе «не читаем в простое»
 //!   достигалось бы ценой неработающего экрана, что хуже опроса.
 
@@ -46,12 +47,17 @@ fn init(tag: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(outcome.db_path)
 }
 
-/// Числа из строки `watch: N checks, M board reads on change, K board reads by hand, L idle`.
+/// Числа из строки `watch: N checks, M board reads on change, K board reads by hand, L idle,
+/// F full reads, D delta reads, last ...`.
 struct Counts {
     checks: u64,
     on_change: u64,
     by_hand: u64,
     idle: u64,
+    /// Полных чтений доски: на широкой базе каждое стоит сотни миллисекунд.
+    full: u64,
+    /// Чтений по изменениям: единицы строк вместо всей доски.
+    delta: u64,
 }
 
 fn parse_counts(frame: &str) -> Counts {
@@ -70,12 +76,19 @@ fn parse_counts(frame: &str) -> Counts {
         .filter(|part| !part.is_empty())
         .map(|part| part.parse::<u64>().expect("число"))
         .collect();
-    assert_eq!(numbers.len(), 4, "формат строки сторожа: {line}");
+    // Первые шесть — счётчики; дальше идёт описание последнего обновления, и число в нём
+    // («delta of 3 node(s)») к счётчикам не относится.
+    assert!(
+        numbers.len() >= 6,
+        "формат строки сторожа изменился: {line}"
+    );
     Counts {
         checks: numbers[0],
         on_change: numbers[1],
         by_hand: numbers[2],
         idle: numbers[3],
+        full: numbers[4],
+        delta: numbers[5],
     }
 }
 
@@ -103,7 +116,9 @@ fn run_pty(db_path: &std::path::Path, idle: Duration, before_quit: impl FnOnce()
 
     std::thread::sleep(idle);
     before_quit();
-    std::thread::sleep(Duration::from_millis(700));
+    // Пауза после действия короче часового тика (одна секунда) и заметно длиннее реакции на
+    // событие файла: так проверка отличает «экран проснулся от события» от «повезло с тиком».
+    std::thread::sleep(Duration::from_millis(400));
     // `q` живёт в шкале клавиш основного экрана: панель проектов и формы его не перехватывают,
     // пока фокус не ушёл в поле ввода.
     child
@@ -121,10 +136,11 @@ fn an_idle_screen_does_not_read_the_board() {
     let path = init("idle");
     let frame = run_pty(&path, Duration::from_millis(1500), || {});
     let counts = parse_counts(&frame);
-    assert!(
-        counts.checks >= 3,
-        "сторож обязан опрашивать базу на каждом тике: {counts_checks}, 1,5 с при тике 250 мс",
-        counts_checks = counts.checks
+    // Главное утверждение шага 12.2: в простое база не опрашивается вовсе. Не «реже», а ноль
+    // обращений: экран спит в ожидании письма от терминала или от наблюдения за каталогом.
+    assert_eq!(
+        counts.checks, 0,
+        "в простое база обязана не опрашиваться: ноль обращений к data_version"
     );
     assert_eq!(
         counts.on_change, 0,
@@ -138,6 +154,10 @@ fn an_idle_screen_does_not_read_the_board() {
         counts.idle, 0,
         "полных чтений доски в простое обязано быть ноль, а не «мало»"
     );
+    // Начальная сборка идёт мимо счётчиков (экран строится до цикла), поэтому в простое оба
+    // числа нулевые: доска не читается ни целиком, ни по изменениям.
+    assert_eq!(counts.full, 0, "полное чтение доски в простое");
+    assert_eq!(counts.delta, 0, "в простое нечего обновлять по изменениям");
     let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
 }
 
@@ -167,10 +187,22 @@ fn a_foreign_write_is_noticed_while_idle() {
     );
     let counts = parse_counts(&frame);
     assert!(
+        counts.checks >= 1,
+        "событие файла обязано дойти до сторожа, а через него до базы"
+    );
+    assert!(
         counts.on_change >= 1,
         "чужая запись обязана дойти до экрана: {counts_on_change}",
         counts_on_change = counts.on_change
     );
+    // И дойти ОБНОВЛЕНИЕМ, а не перечитыванием всей доски: иначе инкрементального пути нет.
+    assert!(
+        counts.delta >= 1,
+        "чужая запись пришла полным чтением, а не обновлением по изменениям"
+    );
+    // Начальная сборка мимо счётчиков, значит полных чтений в цикле быть не должно: чужая
+    // запись обязана прийти обновлением.
+    assert_eq!(counts.full, 0, "чужая запись вызвала полное чтение доски");
     assert_eq!(
         counts.idle, 0,
         "перечитывания по изменению — не работа в простое"

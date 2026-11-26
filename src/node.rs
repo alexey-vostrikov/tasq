@@ -996,6 +996,88 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
     Ok(nodes)
 }
 
+/// Узлы проекта по их идентификаторам — без фильтров, с вычисленным `incomplete`.
+///
+/// Нужен экрану для инкрементального обновления: после изменения в базе он перечитывает не доску
+/// целиком, а только затронутые узлы и их предков. Отбор здесь намеренно не применяется —
+/// фильтр доски живёт в одном месте (`overview::build_board`), и второй отбор по тем же правилам
+/// разошёлся бы с ним на первом же новом фильтре.
+///
+/// Вычисляемый статус считается по одному узлу (`apply_derived_one`), а не картой по всему
+/// проекту: у нас на руках единицы узлов, и карта на десять тысяч ради них была бы той же
+/// работой, что и полное чтение.
+pub fn by_ids(conn: &Connection, project: &Project, ids: &[i64]) -> Result<Vec<Node>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+    // Прогресс считается ОТДЕЛЬНЫМ запросом по нужным узлам, а не джойном с представлением.
+    // Причина измерена: `LEFT JOIN v_node_progress` заставляет SQLite материализовать всё
+    // представление (пары «предок — потомок» по всему проекту), даже когда в `IN` три
+    // идентификатора. На фикстуре 10 000 узлов это 38 мс против 0,01 мс у самого чтения строк —
+    // то есть вся дельта состояла из работы, которую она и должна была отменить.
+    let sql = format!(
+        // Нули на месте прогресса — заглушка для общей проекции строки: настоящие значения
+        // приходят из `progress_of` ниже, и второй способ читать одно и то же здесь не заводится.
+        "SELECT e.*, 0 AS progress_done, 0 AS progress_total FROM v_node_effective e
+         WHERE e.project_id = ? AND e.deleted_at IS NULL AND e.id IN ({placeholders})"
+    );
+    let mut values: Vec<Value> = Vec::with_capacity(ids.len() + 1);
+    values.push(Value::Integer(project.id));
+    values.extend(ids.iter().map(|id| Value::Integer(*id)));
+    let mut stmt = conn.prepare(&sql)?;
+    let mut nodes = stmt
+        .query_map(params_from_iter(values.iter()), |row| {
+            map_node(row, project)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let progress = progress_of(conn, ids)?;
+    for node in &mut nodes {
+        if let Some((done, total)) = progress.get(&node.id) {
+            node.progress_done = *done;
+            node.progress_total = *total;
+        }
+    }
+    for node in &mut nodes {
+        apply_derived_one(conn, project, node)?;
+    }
+    nodes.sort_by_key(|node| path_sort_key(&node.path));
+    Ok(nodes)
+}
+
+/// Прогресс поддерева для названных узлов — обходом только их поддеревьев.
+///
+/// Тот же смысл, что у представления `v_node_progress`, но с корнями, названными явно: обход
+/// начинается с них, а не со всех узлов базы. Считается одним запросом на весь набор, а не по
+/// одному: у дельты на руках единицы узлов, и N запросов стоили бы N раз столько же.
+fn progress_of(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, (f64, f64)>> {
+    let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "WITH RECURSIVE tree(root_id, node_id, steps) AS (
+           SELECT id, id, 0 FROM nodes WHERE id IN ({placeholders})
+           UNION ALL
+           SELECT t.root_id, n.id, t.steps + 1
+           FROM tree t JOIN nodes n ON n.parent_id = t.node_id
+           WHERE t.steps < {max}
+         )
+         SELECT t.root_id,
+                SUM(CASE WHEN n.status = 'done' THEN n.weight ELSE 0 END) AS done_weight,
+                SUM(n.weight) AS total_weight
+         FROM tree t
+         JOIN nodes n ON n.id = t.node_id AND n.deleted_at IS NULL
+         GROUP BY t.root_id",
+        max = MAX_DEPTH
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(ids.iter()), |row| {
+        Ok((row.get::<_, i64>(0)?, (row.get(1)?, row.get(2)?)))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
+}
+
 /// Список узлов по всем проектам базы, в порядке «проект, путь».
 ///
 /// dot-ID собирается из ключа СВОЕГО проекта (`pr.key || '-' || e.path`): адрес узла

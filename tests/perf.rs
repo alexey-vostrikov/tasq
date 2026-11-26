@@ -41,6 +41,13 @@ const BUDGET_LS_COMPACT_MS: u128 = 480;
 /// «оно и так быстро»: именно это число и есть выигрыш эпика, и его нельзя оставить без охраны.
 const BUDGET_CHECK_US: u128 = 100;
 
+/// Бюджет инкрементального обновления в миллисекундах.
+///
+/// Замерено 1-3 мс на фикстуре 10 000 узлов: перечитываются сам узел и его предки, остальное
+/// берётся из уже прочитанного. Бюджет с запасом: гейт обязан ловить «дельта снова читает всю
+/// доску» (это 134 мс), а не дрожание контейнера.
+const BUDGET_DELTA_MS: u128 = 60;
+
 /// Сколько раз мерить каждую операцию.
 const ROUNDS: usize = 40;
 
@@ -115,7 +122,7 @@ fn measure<F: FnMut()>(rounds: usize, mut run: F) -> Timing {
 #[test]
 #[ignore = "нагрузочный замер: make perf (release, в одиночку)"]
 fn reading_a_ten_thousand_node_project_stays_within_budget() {
-    let (dir, conn, project) = fixture("read");
+    let (dir, mut conn, project) = fixture("read");
 
     let board = measure(ROUNDS, || {
         overview::board(&conn, &project).expect("board");
@@ -174,6 +181,83 @@ fn reading_a_ten_thousand_node_project_stays_within_budget() {
         short.p95,
         short.max
     );
+    // Инкрементальное обновление: доска читается целиком один раз, дальше — только затронутый
+    // узел и его предки. Мерится именно обновление, а не чтение: смысл шага в том, что после
+    // чужой правки экран платит не за доску.
+    let mut state =
+        tasq::overview::BoardState::full(&conn, &project, tasq::overview::BoardFilter::default())
+            .expect("state");
+    let victim = node::list(&conn, &project, &Filter::default())
+        .expect("ls")
+        .into_iter()
+        .find(|candidate| candidate.depth >= 3)
+        .expect("узел глубины три: у него есть предки, прогресс которых меняется");
+    // Текущий приоритет ведётся в переменной: правка «в то же значение» не пишет строки журнала,
+    // и обновление честно ответило бы «ничего не изменилось» — замер мерил бы пустоту.
+    let mut priority = victim.priority.clone();
+    let mut delta_total = 0u128;
+    const DELTA_ROUNDS: u128 = 20;
+    for _ in 0..DELTA_ROUNDS {
+        // Меняется приоритет, а не статус: мерится стоимость обновления (перечитать узел и его
+        // предков), а она от того, какое поле изменилось, не зависит. Статус пришлось бы вести по
+        // матрице переходов — у микро-задачи `done` из `todo` не разрешён, и замер мерил бы не то.
+        priority = if priority == "high" {
+            "low".to_string()
+        } else {
+            "high".to_string()
+        };
+        node::update(
+            &mut conn,
+            &project,
+            &victim.dot_id,
+            node::Patch {
+                priority: Some(&priority),
+                actor: Some("bench"),
+                ..node::Patch::default()
+            },
+        )
+        .expect("update");
+        let started = Instant::now();
+        let outcome = state
+            .refresh(&conn, &project, tasq::overview::BoardFilter::default())
+            .expect("refresh");
+        delta_total += started.elapsed().as_millis();
+        assert!(
+            matches!(outcome, tasq::overview::Refresh::Delta { .. }),
+            "обновление пошло полным чтением: {outcome:?}"
+        );
+    }
+    let delta_ms = delta_total / DELTA_ROUNDS;
+    // Из чего складывается дельта: чтение строк и сборка доски из них. Разделение нужно, чтобы
+    // следующий шаг оптимизации начинался с числа, а не с догадки: если дешёвая часть — сборка,
+    // то сокращать чтение дальше бессмысленно.
+    let today = 20_000;
+    let all_nodes = node::list(&conn, &project, &Filter::default()).expect("ls");
+    let assembly = measure(ROUNDS, || {
+        tasq::overview::build_board(
+            &project.key,
+            &all_nodes,
+            &tasq::overview::BoardFilter::default(),
+            today,
+        );
+    });
+    println!(
+        "дельта по частям: перечитывание строк {} мс, сборка доски из готовых узлов {} мс",
+        delta_ms.saturating_sub(assembly.median),
+        assembly.median
+    );
+    println!(
+        "инкремент: обновление после правки одного узла {} мс против полной доски {} мс — \
+         отношение {}×",
+        delta_ms,
+        board.median,
+        board.median / delta_ms.max(1)
+    );
+    assert!(
+        delta_ms <= BUDGET_DELTA_MS,
+        "обновление по изменениям {delta_ms} мс при бюджете {BUDGET_DELTA_MS}: дельта перестала быть дельтой"
+    );
+
     println!(
         "сторож: data_version {}.{:03} мкс на проверку, доска {} мс — отношение {}×",
         check_ns / 1000,

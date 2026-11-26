@@ -43,6 +43,35 @@ pub fn log(conn: &Connection, entry: &Entry<'_>) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// Номер последней записи журнала: точка отсчёта для «что изменилось с прошлого раза».
+///
+/// Берётся `MAX(id)`, а не время: `id` растёт строго по порядку и не имеет ни склейки в одну
+/// миллисекунду, ни зависимости от часов машины. Ноль означает пустой журнал — это законное
+/// состояние свежей базы, а не ошибку.
+pub fn watermark(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM activity_log", [], |row| {
+            row.get(0)
+        })?,
+    )
+}
+
+/// Узлы проекта, которых коснулись записи журнала после `since`.
+///
+/// Журнал пишется в той же транзакции, что и мутация, поэтому «что изменилось» не приходится
+/// угадывать по `updated_at`: тот не поднимается намеренно при замене ссылок, а в одной
+/// миллисекунде помещаются две правки. Узлы других проектов отсеиваются здесь же — иначе
+/// правка в соседнем проекте заставила бы перечитывать свой.
+pub fn touched_since(conn: &Connection, project_id: i64, since: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT node_id FROM activity_log
+         WHERE id > ?1 AND project_id = ?2 AND node_id IS NOT NULL
+         ORDER BY node_id",
+    )?;
+    let rows = stmt.query_map(params![since, project_id], |row| row.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Строка лога в выдаче.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Record {

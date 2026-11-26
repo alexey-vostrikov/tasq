@@ -26,6 +26,11 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 # зависимости «в нагрузку» он не тянет. Нужен, чтобы `kill` не оставлял терминал в raw mode с
 # захваченной мышью — при сигнале размотки стека нет, и `Drop` не срабатывает.
 signal-hook = "0.3"
+# Пробуждение по событию каталога с базой (TASQDEV-12.2). Крейт без `unsafe` в публичном API и
+# без своей модели состояния: событие приходит колбэком в потоке, который крейт и заводит.
+# Каталог, а не файл: `.tasq/tasq.db` — симлинк, а `load`/`restore` пересоздают файл, и
+# наблюдение за inode тихо умерло бы после первой же перезаписи.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [dev-dependencies]
 # Property-тесты вместо cargo-fuzz: fuzz-раннер требует nightly и ASAN, а гейт должен

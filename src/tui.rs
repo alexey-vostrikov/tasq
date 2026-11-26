@@ -43,21 +43,21 @@ use crate::overview;
 /// ширину неоткуда взять: у терминала она своя (см. [`once_width`]).
 pub const ONCE_WIDTH: u16 = 140;
 
-/// Как часто просыпаться, чтобы спросить терминал о нажатии.
+/// Как долго ждать письма, прежде чем проверить сигнал.
 ///
-/// Это НЕ период перечитывания доски. Ноль событий — не повод крутиться на 100 % процессора,
-/// но и не повод запаздывать с реакцией на клавишу: четверть секунды — та граница, за которой
-/// нажатие начинает ощущаться запаздывающим. База проверяется здесь же, но одним `PRAGMA`
-/// (1,4 мкс), а доска читается только когда сторож увидел изменение.
-const TICK: Duration = Duration::from_millis(250);
+/// Нажатие и изменение в базе приходят письмом (`crate::wake`), поэтому эта пауза больше НЕ
+/// задаёт ни задержку реакции, ни цену простоя: она нужна, чтобы цикл замечал `SIGTERM` без
+/// задержки. Секунда — цена одного `recv_timeout`, который просыпается вхолостую.
+const TICK: Duration = Duration::from_secs(1);
 
-/// Как часто перерисовывать кадр, если ничего не произошло.
+/// Как часто перерисовывать кадр без повода, только ради времени.
 ///
-/// Кадр не бесплатен: на десяти тысячах узлов он стоит около тридцати миллисекунд (замер — в
-/// `docs/tui.md`), и четыре кадра в секунду без единого изменения давали 12 % ядра в простое —
-/// вдвое меньше, чем было, но всё равно за ничто. Секунды достаточно: аренда истекает минутами,
-/// сроки считаются днями, и единственное, что живёт в кадре от времени, — обратный отсчёт.
-const CLOCK: Duration = Duration::from_secs(1);
+/// Кадр не бесплатен: на десяти тысячах узлов он стоит около 27 мс, и перерисовка раз в секунду
+/// стоила 3,4 % ядра за ничто — это и было всё, что осталось от прежних 70 %. Меняется в кадре
+/// от времени ровно две вещи: наступление просрочки (считается днями) и «аренда до HH:MM»
+/// (минутами). Полминуты — точность, которая этих данных не искажает, и за этот период
+/// бесполезных кадров не бывает вовсе.
+const REDRAW_EVERY: Duration = Duration::from_secs(30);
 
 /// Ширина панели проектов.
 ///
@@ -145,9 +145,14 @@ fn build(conn: &Connection, start: Option<&str>, theme: Option<&str>) -> Result<
         None => 0,
     };
     let project = crate::project::select(conn, Some(&projects[index].key))?;
-    let board = overview::board(conn, &project)?;
+    // Доска берётся у состояния, а не отдельным чтением: начальная сборка — это и есть первый
+    // полный снимок, и второе чтение тех же строк только ради того, чтобы «завести состояние»,
+    // было бы платой за одно и то же дважды.
+    let state = overview::BoardState::full(conn, &project, overview::BoardFilter::default())?;
+    let board = state.board().clone();
     let session = actions::session_id()?;
     let mut app = app::App::with_projects(board, session, projects, index, project.clone());
+    app.delta = Some(state);
     // Неизвестное имя темы — отказ с названным полем, а не тихий переход на умолчание:
     // «я просил nord, а получил gruvbox» — это ответ, которого человек не заметит.
     if let Some(name) = theme.map(str::trim).filter(|name| !name.is_empty()) {
@@ -166,8 +171,6 @@ fn event_loop<W>(mut out: W, conn: &mut Connection, app: &mut app::App, stats: b
 where
     W: std::io::Write,
 {
-    use ratatui::crossterm::event;
-
     // Порядок важен: сначала терминал приводится в состояние «чужой экран, мышь наша», потом
     // ставится сторож. Сторож снимает ЭТО состояние, поэтому он должен появиться после того, как
     // что снимать, и исчезнуть раньше, чем состояние снимут вручную.
@@ -184,27 +187,33 @@ where
     // выхода из него, а экран к этому моменту уже восстановлен — иначе строка уехала бы в чужой
     // буфер и исчезла вместе с ним.
     let mut watch = crate::watch::Watch::new(conn)?;
+    // Чем кончилось последнее обновление по изменению: печатается в `--stats` вместе с
+    // остальными числами, чтобы «дельта работает» было видно, а не подразумевалось.
+    let mut last_refresh: Option<crate::overview::Refresh> = None;
 
-    // Нужен ли кадр: поднимается любым событием, изменением в базе и собственным действием.
-    // Отдельный флаг, а не «рисуем всегда», потому что рисовать всегда — это 12 % ядра в простое
-    // на десяти тысячах узлов, и все они уходят на перерисовку того же самого.
+    // Почтовый ящик цикла: поток ввода и наблюдение за каталогом базы. Пока он жив, цикл спит в
+    // ожидании письма — ни опроса терминала, ни опроса базы по таймеру.
+    let inbox = crate::wake::Inbox::start(crate::wake::database_path(conn).as_deref())?;
+
+    // Нужен ли кадр. Поднимается письмом (нажатие, изменение в базе) и опускается после
+    // отрисовки; без повода кадр обновляется раз в `REDRAW_EVERY` — только ради времени.
     let mut redraw = true;
     let mut clock = std::time::Instant::now();
 
     let result = (|| -> Result<()> {
         loop {
-            if redraw || clock.elapsed() >= CLOCK {
+            if redraw || clock.elapsed() >= REDRAW_EVERY {
                 // Карта попаданий строится там же, где кадр: отрисовка — единственное место,
                 // которое знает, сколько строк влезло и с каким смещением.
                 let mut hits = Hits::default();
                 terminal.draw(|frame| hits = draw(frame, app))?;
                 app.hits = hits;
-                redraw = false;
-                clock = std::time::Instant::now();
                 // Пределы прокрутки уменьшились — окно могло стать выше, узел сменился, текст
                 // стал короче. Прокрутка подтягивается к новому пределу здесь, а не в момент
                 // нажатия: иначе первый же кадр после ресайза показал бы пустую панель.
                 app.clamp_panels();
+                redraw = false;
+                clock = std::time::Instant::now();
             }
             // Сигнал `kill` или закрытие терминала не должны оставить мышь захваченной: флаг
             // снимается здесь, а не в обработчике, потому что обработчик сигнала не имеет права
@@ -212,60 +221,69 @@ where
             if signals.received() {
                 break;
             }
-            if !event::poll(TICK)? {
-                // Пауза без событий. Доска меняется и без нажатий (истекает аренда, другой агент
-                // закрывает узел), но узнать об этом дёшево: `data_version` — счётчик коммитов
-                // ЧУЖИХ соединений, одно чтение которого стоит микросхему времени против
-                // полутора сотен миллисекунд полного чтения на десяти тысячах узлов.
-                //
-                // Ошибка чтения не выходит из цикла — она показывается в строке состояния:
-                // база, запертая другим процессом, не повод терять экран.
-                match watch.changed(&*conn) {
-                    Ok(true) => {
+
+            let mail = inbox.wait(TICK);
+            // Письма нет: пауза нужна была только чтобы заметить сигнал (проверяется в начале
+            // круга). Кадр при этом не рисуется — следующая итерация сама решит по `REDRAW_EVERY`.
+            let Some(mail) = mail else {
+                continue;
+            };
+
+            // Любое письмо — повод показать кадр: нажатие, изменение в базе, ресайз. Отдельно
+            // их перечислять значило бы завести список, который разойдётся с клавишами.
+            redraw = true;
+            match mail {
+                crate::wake::Mail::InputFailed(reason) => {
+                    return Err(crate::error::Error::NoTerminal { reason });
+                }
+                // Файл тронут — но тронуть его мог и `-wal` при нашем же чтении, и соседний
+                // процесс, ничего не записавший. Подтверждение берётся у базы: `data_version`
+                // растёт только на коммит ЧУЖОГО соединения.
+                crate::wake::Mail::DbTouched => {
+                    match watch.changed(&*conn) {
+                        Ok(true) => {
+                            // Изменение пришло ИЗВНЕ, поэтому читаем не всю доску, а затронутые
+                            // узлы и их предков: при работе нескольких агентов доска меняется
+                            // часто, а меняется в ней одна-две строки.
+                            let outcome = match app.project.clone() {
+                                Some(project) => app.refresh_delta(&*conn, &project),
+                                None => Ok(crate::overview::Refresh::Nothing),
+                            };
+                            match outcome {
+                                Ok(outcome) => last_refresh = Some(outcome),
+                                Err(err) => app.fail(app::describe(&err)),
+                            }
+                        }
+                        // Событие было на файл, которого база не заметила (открытие, чтение,
+                        // снятая блокировка). Делать нечего, и это не ошибка.
+                        Ok(false) => {}
+                        Err(err) => app.fail(app::describe(&err)),
+                    }
+                    app.stats = watch.stats();
+                }
+                crate::wake::Mail::Input(event) => match app.step(event) {
+                    model::Outcome::Quit => break,
+                    // `Act` — просьба модели. Здесь она превращается в вызов библиотеки: экран
+                    // не знает, что такое аренда, он знает, что человек нажал `c`.
+                    model::Outcome::Act(intent) => {
+                        let Some(project) = app.project.clone() else {
+                            app.fail("проект не загружен");
+                            continue;
+                        };
+                        app.perform(conn, &project, intent);
+                    }
+                    model::Outcome::Redraw | model::Outcome::Ask(_) => {
                         if let Err(err) = app.refresh_active(&*conn) {
                             app.fail(app::describe(&err));
                         }
-                        redraw = true;
+                        // Перечитывание по действию человека: `data_version` СВОЮ запись не видит
+                        // никогда, поэтому такие чтения учитываются отдельно и не считаются
+                        // работой в простое.
+                        watch.note_refresh();
+                        app.stats = watch.stats();
                     }
-                    // Изменений нет — делать нечего. Кадр рисуется в начале цикла и показывает
-                    // уже прочитанное: часы (истечение аренды, наступление просрочки) идут от
-                    // времени, а не от записи в базе, и обновляются на следующей отрисовке.
-                    Ok(false) => {}
-                    Err(err) => {
-                        app.fail(app::describe(&err));
-                        redraw = true;
-                    }
-                }
-                app.stats = watch.stats();
-                continue;
-            }
-            let event = event::read()?;
-            // Любое событие — повод показать кадр: курсор, прокрутка, открытая форма, ресайз.
-            // Отдельно их перечислять значило бы завести список, который разойдётся с клавишами.
-            redraw = true;
-            match app.step(event) {
-                model::Outcome::Quit => break,
-                // `Act` — просьба модели. Здесь она превращается в вызов библиотеки: экран не
-                // знает, что такое аренда, он знает, что человек нажал `c`.
-                model::Outcome::Act(intent) => {
-                    let Some(project) = app.project.clone() else {
-                        app.fail("проект не загружен");
-                        continue;
-                    };
-                    app.perform(conn, &project, intent);
-                }
-                model::Outcome::Redraw | model::Outcome::Ask(_) => {
-                    if let Err(err) = app.refresh_active(&*conn) {
-                        app.fail(app::describe(&err));
-                    }
-                    // Перечитывание по действию человека: `data_version` СВОЮ запись не видит
-                    // никогда, поэтому такие чтения учитываются отдельно и не считаются работой
-                    // в простое.
-                    watch.note_refresh();
-                    app.stats = watch.stats();
-                    redraw = true;
-                }
-                model::Outcome::Ignored => {}
+                    model::Outcome::Ignored => {}
+                },
             }
         }
         Ok(())
@@ -282,11 +300,20 @@ where
         // тестом на псевдотерминале, а не глазами по загрузке процессора.
         let counts = watch.stats();
         println!(
-            "watch: {} checks, {} board reads on change, {} board reads by hand, {} idle",
+            "watch: {} checks, {} board reads on change, {} board reads by hand, {} idle, \
+             {} full reads, {} delta reads, last {}",
             counts.checks,
             counts.changes,
             counts.refreshes.saturating_sub(counts.changes),
             counts.idle_refreshes(),
+            app.reads.full,
+            app.reads.delta,
+            match last_refresh {
+                Some(crate::overview::Refresh::Delta { nodes }) =>
+                    format!("delta of {nodes} node(s)"),
+                Some(crate::overview::Refresh::Full) => "full".to_string(),
+                Some(crate::overview::Refresh::Nothing) | None => "nothing".to_string(),
+            },
         );
     }
     result

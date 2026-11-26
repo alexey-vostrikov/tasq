@@ -39,6 +39,13 @@ pub enum Level {
 pub struct App {
     /// Доска в том виде, в каком её отдал `overview::board`.
     pub board: overview::Board,
+    /// Доска вместе с исходными узлами и точкой отсчёта по журналу — ради обновления по
+    /// изменениям. `None` означает «состояния нет, следующее обновление будет полным»: так
+    /// сбрасывается после собственного действия, когда проще прочитать заново, чем доказывать,
+    /// что дельта учла всё.
+    pub delta: Option<overview::BoardState>,
+    /// Сколько раз доска читалась целиком и сколько раз — по изменениям. Числа для `--stats`.
+    pub reads: crate::watch::Reads,
     /// Курсор, режим и ввод.
     pub state: State,
     /// Что сказать человеку в строке состояния (отказ последнего действия).
@@ -127,6 +134,8 @@ impl App {
             kinds: HashMap::new(),
             tokens: HashMap::new(),
             board_filter: overview::BoardFilter::default(),
+            delta: None,
+            reads: crate::watch::Reads::default(),
             stats: crate::watch::Stats::default(),
         }
     }
@@ -204,10 +213,66 @@ impl App {
     ///
     /// Перечитывание — отдельное действие, а не побочный эффект отрисовки: экран показывает то,
     /// что прочитано, и человек видит, когда данные обновились, а когда нет.
+    ///
+    /// Полное чтение заодно заводит состояние для дальнейших обновлений по изменениям: читать
+    /// базу дважды (один раз «доску», другой — «узлы для дельты») значило бы платить за одно и
+    /// то же дважды.
     pub fn refresh(
         &mut self,
         conn: &rusqlite::Connection,
         project: &crate::project::Project,
+    ) -> crate::Result<()> {
+        self.reads.full += 1;
+        let state = overview::BoardState::full(conn, project, self.board_filter.clone())?;
+        let board = state.board().clone();
+        self.delta = Some(state);
+        self.adopt(conn, project, board)
+    }
+
+    /// Обновляет доску по изменениям, не перечитывая её целиком.
+    ///
+    /// Это путь для чужой записи: соседний агент закрыл узел, а экран обязан показать это без
+    /// полного чтения. Перечитываются затронутые узлы и их предки; если сменился проект или
+    /// фильтр, честнее прочитать всё — и это делает [`overview::BoardState::refresh`] сам.
+    ///
+    /// Своё действие человека сюда не идёт: после него экран перечитывает доску целиком, потому
+    /// что там меняются вещи, о которых журнал молчит (курсор, панели, «что показано»), и
+    /// доказывать, что дельта их учла, дороже, чем прочитать.
+    pub fn refresh_delta(
+        &mut self,
+        conn: &rusqlite::Connection,
+        project: &crate::project::Project,
+    ) -> crate::Result<overview::Refresh> {
+        let Some(mut state) = self.delta.take() else {
+            self.refresh(conn, project)?;
+            return Ok(overview::Refresh::Full);
+        };
+        let outcome = state.refresh(conn, project, self.board_filter.clone())?;
+        match outcome {
+            // Ничего не изменилось: доска и курсор остаются как были.
+            overview::Refresh::Nothing => {
+                self.delta = Some(state);
+                return Ok(outcome);
+            }
+            overview::Refresh::Delta { .. } => self.reads.delta += 1,
+            overview::Refresh::Full => self.reads.full += 1,
+        }
+        let board = state.board().clone();
+        self.delta = Some(state);
+        self.adopt(conn, project, board)?;
+        Ok(outcome)
+    }
+
+    /// Ставит новую доску и подтягивает к ней курсор, панели и боковую панель.
+    ///
+    /// Общий путь для полного чтения и для обновления по изменениям: курсор обязан вести себя
+    /// одинаково в обоих случаях, а два экземпляра этого кода разошлись бы ровно на «после
+    /// обновления курсор прыгнул на соседа».
+    fn adopt(
+        &mut self,
+        conn: &rusqlite::Connection,
+        project: &crate::project::Project,
+        board: overview::Board,
     ) -> crate::Result<()> {
         // Узел под курсором запоминается ДО перечитывания и возвращается ПОСЛЕ: колонки
         // пересобираются по статусам, и узел, взятый в работу, переезжает из `todo` в
@@ -215,7 +280,7 @@ impl App {
         // отпустил бы не тот узел (в живом прогоне это и вышло: `NOT_YOUR_ATTEMPT` на верном
         // нажатии).
         let keep = self.selected().map(|row| row.dot_id.clone());
-        self.board = overview::board_with(conn, project, self.board_filter.clone())?;
+        self.board = board;
         self.state.rows = self
             .board
             .columns

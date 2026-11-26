@@ -286,7 +286,7 @@ fn parent_of(conn: &Connection, project: &Project, path: &str) -> Result<Option<
 }
 
 /// Строка доски: узел в разрезе статуса.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BoardRow {
     pub dot_id: String,
     pub title: String,
@@ -298,7 +298,7 @@ pub struct BoardRow {
 }
 
 /// Колонка доски.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct BoardColumn {
     pub status: String,
     pub count: usize,
@@ -306,7 +306,11 @@ pub struct BoardColumn {
 }
 
 /// Доска: узлы по эффективному статусу, с просрочкой и живыми арендами.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `PartialEq` — не для удобства, а для проверки: инкрементальное обновление обязано давать
+/// ровно ту же доску, что и полное чтение, и утверждать это словами бессмысленно — только
+/// сравнением.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Board {
     pub project: String,
     pub columns: Vec<BoardColumn>,
@@ -348,6 +352,10 @@ pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
 }
 
 pub fn board_with(conn: &Connection, project: &Project, filter: BoardFilter) -> Result<Board> {
+    // Отбор идёт и в SQL (там же, где остальные списки, и так дешевле на широкой базе), и в
+    // `build_board` — потому что экран держит узлы без отбора и применяет фильтр при сборке.
+    // Повторный отбор безвреден, а расходиться двум реализациям не даёт тест: он сверяет доску
+    // из состояния с доской из CLI для каждой комбинации переключателей.
     let nodes = node::list(
         conn,
         project,
@@ -359,6 +367,23 @@ pub fn board_with(conn: &Connection, project: &Project, filter: BoardFilter) -> 
         },
     )?;
     let today = today_days(conn)?;
+    Ok(build_board(&project.key, &nodes, &filter, today))
+}
+
+/// Собирает доску из уже прочитанных узлов.
+///
+/// Отделено от чтения, чтобы одна и та же сборка годилась и полному чтению, и инкрементальному
+/// обновлению: у них разный источник узлов и один и тот же ответ. Второй экземпляр этих правил
+/// (подсчёт просрочки, прогресса, `incomplete`) разошёлся бы с первым на первой же правке — и
+/// разошёлся бы молча, потому что оба ответа выглядят правдоподобно.
+///
+/// Отбор здесь повторяет SQL-отбор доски: он нужен, когда на руках узлы без отбора (экран).
+pub fn build_board(
+    project_key: &str,
+    nodes: &[node::Node],
+    filter: &BoardFilter,
+    today: i64,
+) -> Board {
     // Порядок колонок берётся из единственного списка статусов: своя копия здесь
     // расходится с `Status::all()` на первом же добавленном статусе.
     let order = crate::status::Status::all();
@@ -380,13 +405,33 @@ pub fn board_with(conn: &Connection, project: &Project, filter: BoardFilter) -> 
         rows: Vec::new(),
     });
 
+    // Указатель «статус -> колонка» строится один раз: поиск колонки по имени на каждом узле —
+    // это четырнадцать сравнений строк на строку доски, то есть бо́льшая часть стоимости сборки
+    // на десяти тысячах узлов. Замер: 35 мс -> 9 мс на фикстуре (make perf).
+    let by_status: std::collections::HashMap<String, usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.status.clone(), index))
+        .collect();
+
     let mut overdue = 0;
     let mut leased = 0;
     let mut open = 0;
     let mut done = 0;
     let mut incomplete = 0;
 
-    for node in &nodes {
+    for node in nodes {
+        if !filter.show_archived && node.archived_at.is_some() {
+            continue;
+        }
+        if let Some(branch) = &filter.branch
+            && node.branch.as_deref() != Some(branch.as_str())
+        {
+            continue;
+        }
+        if filter.hide_done && node.effective_status == "done" {
+            continue;
+        }
         let status = crate::status::Status::parse(&node.effective_status);
         // Закрытость и выполненность — разные вопросы. `incomplete` закрыт (работа прекращена),
         // поэтому в «открыто» не идёт, но и в `done` не попадает: работа не сделана.
@@ -429,25 +474,176 @@ pub fn board_with(conn: &Connection, project: &Project, filter: BoardFilter) -> 
             lease_holder: node.lease_holder.clone(),
             progress,
         };
-        if let Some(column) = columns
-            .iter_mut()
-            .find(|column| column.status == node.effective_status)
-        {
+        if let Some(index) = by_status.get(&node.effective_status) {
+            let column = &mut columns[*index];
             column.count += 1;
             column.rows.push(row);
         }
     }
     columns.retain(|column| column.count > 0);
 
-    Ok(Board {
-        project: project.key.clone(),
+    Board {
+        project: project_key.to_string(),
         columns,
         overdue,
         leased,
         open,
         done,
         incomplete,
-    })
+    }
+}
+
+/// Что дало инкрементальное обновление: сколько узлов перечитано и почему.
+///
+/// Число возвращается наружу, а не живёт в счётчике внутри: без него «стало легче» снова
+/// осталось бы на слово, а с ним видно, что правка одного узла стоит трёх строк, а не десяти
+/// тысяч.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Ничего не изменилось: доска осталась прежней.
+    Nothing,
+    /// Перечитаны только затронутые узлы и их предки.
+    Delta { nodes: usize },
+    /// Перечитана вся доска: сменился проект или фильтр.
+    Full,
+}
+
+/// Доска вместе с тем, из чего она собрана, — чтобы обновлять её по изменениям.
+///
+/// Зачем нужен второй тип рядом с [`Board`]. Доска — ответ для человека: строки по колонкам и
+/// четыре счётчика. Инкрементальное обновление требует держать исходные узлы и точку отсчёта по
+/// журналу; если положить это в `Board`, оно поедет в `tasq board --json` и станет частью
+/// публичного формата, где никому не нужно.
+#[derive(Debug, Clone)]
+pub struct BoardState {
+    project: String,
+    filter: BoardFilter,
+    /// Все живые и архивные узлы проекта — без отбора: фильтр применяется при сборке, иначе
+    /// узел, ставший `done`, нечем было бы убрать из доски, не перечитывая всё.
+    nodes: Vec<node::Node>,
+    /// `MAX(id)` журнала на момент чтения — «до какого места база уже учтена».
+    watermark: i64,
+    board: Board,
+}
+
+impl BoardState {
+    /// Полное чтение: стартовая точка для дальнейших обновлений.
+    pub fn full(conn: &Connection, project: &Project, filter: BoardFilter) -> Result<Self> {
+        // Архив читается всегда, даже когда скрыт: это цена одного условия на строку, зато
+        // включение `a` на экране не требует перечитать базу.
+        let nodes = node::list(
+            conn,
+            project,
+            &Filter {
+                include_archived: true,
+                ..Filter::default()
+            },
+        )?;
+        let watermark = crate::activity::watermark(conn)?;
+        let today = today_days(conn)?;
+        let board = build_board(&project.key, &nodes, &filter, today);
+        Ok(Self {
+            project: project.key.clone(),
+            filter,
+            nodes,
+            watermark,
+            board,
+        })
+    }
+
+    pub fn board(&self) -> &Board {
+        &self.board
+    }
+
+    /// Перечитывает то, чего коснулись изменения в базе, и пересобирает доску.
+    ///
+    /// Что именно перечитывается: узлы из журнала после точки отсчёта и их ПРЕДКИ. Предки —
+    /// потому что в строке доски стоит прогресс поддерева: закрытая подзадача меняет проценты у
+    /// родителя, не породив записи журнала про родителя.
+    ///
+    /// Переезд узла меняет адреса у всего поддерева, поэтому если у затронутого узла сменился
+    /// путь, его потомки (по прежнему пути) тоже попадают в перечитывание: иначе на доске
+    /// остались бы строки со старыми адресами — их не видно, но они ломают курсор и ссылки.
+    pub fn refresh(
+        &mut self,
+        conn: &Connection,
+        project: &Project,
+        filter: BoardFilter,
+    ) -> Result<Refresh> {
+        if self.project != project.key || self.filter != filter {
+            *self = Self::full(conn, project, filter)?;
+            return Ok(Refresh::Full);
+        }
+        let watermark = crate::activity::watermark(conn)?;
+        let touched = crate::activity::touched_since(conn, project.id, self.watermark)?;
+        if touched.is_empty() {
+            // Журнал мог вырасти записями других проектов и комментариями к отсутствующим узлам:
+            // доска от них не меняется, но точку отсчёта сдвинуть надо, иначе это же множество
+            // будет перечитываться на каждом круге.
+            self.watermark = watermark;
+            return Ok(Refresh::Nothing);
+        }
+
+        let by_path: std::collections::HashMap<String, i64> = self
+            .nodes
+            .iter()
+            .map(|node| (node.path.clone(), node.id))
+            .collect();
+        let mut targets: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        for id in &touched {
+            targets.insert(*id);
+            // Предки по пути: `2.1.3` -> `2.1`, `2`. Путь — единственное место, где связь
+            // «родитель» уже посчитана, и второй обход дерева ради этого не нужен.
+            if let Some(path) = self
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .map(|node| node.path.clone())
+            {
+                let mut prefix = path.as_str();
+                while let Some(cut) = prefix.rfind('.') {
+                    prefix = &prefix[..cut];
+                    if let Some(ancestor) = by_path.get(prefix) {
+                        targets.insert(*ancestor);
+                    }
+                }
+                // Потомки переехавшего узла: путь был `p`, все, кто начинался с `p.`.
+                let marker = format!("{path}.");
+                for node in &self.nodes {
+                    if node.path.starts_with(&marker) {
+                        targets.insert(node.id);
+                    }
+                }
+            }
+        }
+
+        let ids: Vec<i64> = targets.into_iter().collect();
+        let fresh = node::by_ids(conn, project, &ids)?;
+        let present: std::collections::HashSet<i64> = fresh.iter().map(|node| node.id).collect();
+
+        // Удалённые: их больше нет в базе (удаление узла ставит `deleted_at`, а журнал называет
+        // его id), поэтому из набора они уходят.
+        let dropped: std::collections::HashSet<i64> = ids
+            .iter()
+            .copied()
+            .filter(|id| !present.contains(id))
+            .collect();
+        self.nodes.retain(|node| !dropped.contains(&node.id));
+
+        for node in fresh {
+            match self.nodes.iter_mut().find(|old| old.id == node.id) {
+                Some(old) => *old = node,
+                None => self.nodes.push(node),
+            }
+        }
+        self.nodes
+            .sort_by_key(|node| node::path_sort_key(&node.path));
+
+        let today = today_days(conn)?;
+        self.board = build_board(&project.key, &self.nodes, &self.filter, today);
+        self.watermark = watermark;
+        Ok(Refresh::Delta { nodes: ids.len() })
+    }
 }
 
 /// Доски всех проектов базы — то, что нужно обзору без выбора проекта.
