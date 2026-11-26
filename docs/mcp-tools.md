@@ -8,9 +8,9 @@
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 46 | 6000 | 5530 |
-| `agent` | 30 | 4000 | 3793 |
-| `read-only` | 17 | 2000 | 1878 |
+| `full` | 46 | 6000 | 5562 |
+| `agent` | 30 | 4000 | 3825 |
+| `read-only` | 17 | 2000 | 1910 |
 | `migration` | 6 | 800 | 603 |
 
 ## Каталог
@@ -26,14 +26,14 @@
 | `node_create` | full, agent | 213 | `title` | Create a node; without parent it becomes a root epic |
 | `node_get` | full, agent, read-only, migration | 102 | `ref` | One node with children, comments and the parent chain |
 | `node_update` | full, agent | 198 | `ref` | Change node fields; only the given fields are touched |
-| `node_list` | full, agent, read-only | 243 | — | List nodes in tree order with light fields |
+| `node_list` | full, agent, read-only | 259 | — | List nodes in tree order with light fields |
 | `node_move` | full | 132 | `ref` | Move a node under another parent; descendant dot-IDs change |
 | `node_reorder` | full | 105 | `refs` | Set the order of siblings |
 | `node_archive` | full, agent | 111 | `ref` | Archive or unarchive a subtree; nothing is deleted |
 | `node_delete` | full | 99 | `ref` | Soft-delete a todo node; history stays in the database |
 | `node_restore` | full | 94 | `ref` | Bring back a soft-deleted node |
 | `tasq_context` | full, agent, read-only | 105 | `ref` | Context chain from the root epic down to the node: the why and the what |
-| `tasq_next` | full, agent, read-only | 97 | — | What to work on next, with the reason for the choice |
+| `tasq_next` | full, agent, read-only | 113 | — | What to work on next, with the reason for the choice |
 | `tasq_claim` | full, agent | 202 | `ref` | Take an expiring lease on a node; returns the token for renew and release |
 | `tasq_renew` | full, agent | 111 | `token` | Extend a lease before it expires |
 | `tasq_release` | full, agent | 144 | `token` | Close a lease: released, failed or completed |

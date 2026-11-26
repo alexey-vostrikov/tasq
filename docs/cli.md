@@ -63,7 +63,7 @@ tasq add [ОПЦИИ]
 | `--weight` | `WEIGHT` | — | Weight for burn-up, default 1 |
 | `--estimate` | `ESTIMATE` | — | Estimated hours |
 | `--source` | `SOURCE` | — | Reference to the code this work touches |
-| `--branch` | `BRANCH` | — | Git branch this node belongs to |
+| `--branch` | `NAME` | — | Git branch this node belongs to; without a value — the current branch |
 
 ## `show`
 
@@ -94,6 +94,7 @@ tasq ls [ОПЦИИ]
 | `-a`, `--archived` | — | — | Include archived nodes |
 | `-n`, `--no-done` | — | — | Hide nodes closed as done |
 | `--except-project` | `KEY` | — | Project to leave out of the listing (repeatable); unknown keys are refused |
+| `--branch` | `NAME` | — | Only nodes of this branch; without a value — the current branch |
 | `--fields` | `LIST` | — | Print only these fields, comma-separated (dot_id,title,status,...) |
 | `--offset` | `N` | — | Skip this many nodes after sorting (paging with --limit) |
 | `--limit` | `N` | — | Print at most this many nodes |
@@ -115,6 +116,8 @@ tasq set [ОПЦИИ]
 | `--due` | `DUE` | — |  |
 | `--assignee` | `ASSIGNEE` | — |  |
 | `--weight` | `WEIGHT` | — |  |
+| `--branch` | `NAME` | — | Git branch this node belongs to; without a value — the current branch |
+| `--no-branch` | — | — | Clear the branch |
 | `--force` | — | — | Allow guarded transitions (reopen a closed node, finish with open children) |
 | `--lock-desc` | — | — | Protect the description from rewrites |
 | `--unlock-desc` | — | — | Allow the description to change again |
@@ -333,6 +336,7 @@ tasq next [ОПЦИИ]
 | флаг | значение | по умолчанию | описание |
 | --- | --- | --- | --- |
 | `--limit` | `LIMIT` | `3` | How many candidates to show |
+| `--branch` | `NAME` | — | Only nodes of this branch; without a value — the current branch |
 
 ## `note`
 
