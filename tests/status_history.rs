@@ -12,11 +12,12 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 use tasq::db;
-use tasq::history::Cause;
+use tasq::history::{self, Cause};
 use tasq::lease::{self, ClaimRequest, Outcome};
 use tasq::node::{self, NewNode, Patch};
 use tasq::project::{self, Project};
 use tasq::status::Status;
+use tasq::transfer;
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -397,4 +398,180 @@ fn every_row_points_at_a_real_node_and_known_status() {
         [task.id],
     );
     assert!(bad_cause.is_err(), "схема приняла причину вне списка");
+}
+
+/// Путь `import` пишет историю той же формы, что и остальные: та же строка, та же причина.
+///
+/// Это единственный путь, который история проходит дважды — сначала в источнике, потом в
+/// приёмнике, — и именно поэтому он один раз уже выпадал из ряда: `burnup` на восстановленной
+/// базе показывал ноль закрытой работы, потому что даты закрытия искали в журнале.
+/// Сравниваются не счётчики строк, а сами записи: счётчик совпадёт и тогда, когда причина
+/// подменена или строки переставлены.
+#[test]
+fn the_import_path_keeps_the_shape_and_cause_of_every_row() {
+    let (mut conn, project, _epic, task) = fixture("import");
+    node::update(
+        &mut conn,
+        &project,
+        &task.dot_id,
+        Patch {
+            status: Some(Status::Todo),
+            actor: Some("человек"),
+            ..Patch::default()
+        },
+    )
+    .expect("todo");
+    let lease = claim(&mut conn, &project, &task.dot_id);
+    lease::release(
+        &mut conn,
+        &project,
+        &lease.token,
+        Outcome::Completed,
+        None,
+        false,
+    )
+    .expect("release");
+
+    let source = history::timeline(&conn, task.id).expect("timeline");
+    assert!(
+        source.iter().any(|row| row.cause == "lease_completed"),
+        "в источнике нет закрытия через аренду: {source:?}"
+    );
+
+    // Экспорт и импорт того же документа в чистую базу — тот же путь, что у `tasq load`.
+    let document = transfer::export(&conn, &project, false).expect("export");
+    let dir = temp_dir("import-target");
+    let outcome = db::init(&dir, "HIST", "history").expect("init target");
+    let mut target = db::open(std::path::Path::new(&outcome.db_path)).expect("open target");
+    let restored_project = project::first_project(&target).expect("project");
+    transfer::import(
+        &mut target,
+        &restored_project,
+        &document,
+        transfer::Mode::Replace,
+        "agent",
+    )
+    .expect("import");
+
+    let restored = node::resolve(&target, &restored_project, &task.dot_id).expect("node");
+    let received = history::timeline(&target, restored.id).expect("timeline");
+
+    let shape = |rows: &[history::Transition]| {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.from.clone(),
+                    row.to.clone(),
+                    row.cause.clone(),
+                    row.actor.clone(),
+                    row.reason,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&source),
+        shape(&received),
+        "история после импорта отличается от источника: {} строк против {}",
+        source.len(),
+        received.len()
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Свойство: у каждого узла, о котором история что-то знает, первый факт — `created`.
+///
+/// Проверяется по всей базе после всех путей сразу, а не по одному узлу: правило «первым идёт
+/// создание» живёт в одном месте, и его нарушение на любом пути обязано быть видно здесь.
+/// Узел, у которого история есть, но не начинается с создания, — это узел, чья история обрезана
+/// или начата с середины, и по ней нельзя ответить, откуда он пришёл.
+#[test]
+fn every_node_with_history_starts_with_creation() {
+    let (mut conn, project, epic, task) = fixture("property");
+    // Все пути, которые пишут историю, в одной базе: ручной переход, аренда, сдача, истечение,
+    // разблокировка при снятии ребра и уборка.
+    node::update(
+        &mut conn,
+        &project,
+        &task.dot_id,
+        Patch {
+            status: Some(Status::Todo),
+            actor: Some("человек"),
+            ..Patch::default()
+        },
+    )
+    .expect("todo");
+    let lease = claim(&mut conn, &project, &task.dot_id);
+    lease::release(
+        &mut conn,
+        &project,
+        &lease.token,
+        Outcome::Completed,
+        None,
+        false,
+    )
+    .expect("completed");
+
+    let blocker = add(&mut conn, &project, Some(&epic.dot_id), "Блокер");
+    node::update(
+        &mut conn,
+        &project,
+        &blocker.dot_id,
+        Patch {
+            status: Some(Status::Blocked),
+            actor: Some("человек"),
+            ..Patch::default()
+        },
+    )
+    .expect("blocked");
+    // Блокер ставится на ЗАДАЧУ, а не наоборот: ребро от предка к потомку запрещено
+    // (`AncestorBlockEdge`) — иначе предок оказался бы заблокирован собственным ребёнком.
+    tasq::edge::link(
+        &mut conn,
+        &project,
+        &blocker.dot_id,
+        &task.dot_id,
+        tasq::edge::Kind::Blocks,
+        "agent",
+    )
+    .expect("link");
+    tasq::edge::unlink(
+        &mut conn,
+        &project,
+        &blocker.dot_id,
+        &task.dot_id,
+        tasq::edge::Kind::Blocks,
+        "agent",
+    )
+    .expect("unlink");
+
+    let mut stmt = conn
+        .prepare(
+            // Адрес узла не колонка, а вывод из проекта и пути: в SQL его нет, и запрос с
+            // `dot_id` не собрался бы. Собирается здесь же, чтобы сообщение об ошибке называло
+            // узел так, как его называет человек.
+            "SELECT n.path, (SELECT cause FROM node_status_history h
+                             WHERE h.node_id = n.id ORDER BY h.id LIMIT 1)
+             FROM nodes n
+             WHERE EXISTS (SELECT 1 FROM node_status_history h WHERE h.node_id = n.id)
+             ORDER BY n.path",
+        )
+        .expect("prepare");
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map([], |row| {
+            let path: String = row.get(0)?;
+            Ok((format!("HIST-{path}"), row.get(1)?))
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows");
+    assert!(rows.len() >= 3, "фикстура не дала узлов с историей");
+    let wrong: Vec<(String, Option<String>)> = rows
+        .into_iter()
+        .filter(|(_, first)| first.as_deref() != Some(Cause::Created.as_str()))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "история этих узлов начинается не с создания: {wrong:?}"
+    );
 }
