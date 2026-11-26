@@ -564,6 +564,19 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
         }
         "node_move" => {
             let project = ctx.project(args)?;
+            // Перенос в другой проект — отдельная ветка: адрес перестраивается, и ответ обязан
+            // назвать прежний, новый и число переписанных ссылок.
+            if let Some(key) = arg_str(args, "to_project") {
+                let report = node::move_to_project(
+                    &mut ctx.conn,
+                    &project,
+                    req_str(args, "ref")?,
+                    key,
+                    arg_str(args, "parent"),
+                    arg_bool(args, "renumber"),
+                )?;
+                return Ok(text(&report));
+            }
             let moved = node::move_node(
                 &mut ctx.conn,
                 &project,
@@ -1281,6 +1294,8 @@ pub fn definition(name: &str) -> Option<Value> {
                 "properties": {
                     "ref": {"type": "string", "description": "Node to move"},
                     "parent": {"type": "string", "description": "New parent; omit for root"},
+                    "to_project": {"type": "string",
+                        "description": "Move into this project; the dot-ID is rebuilt"},
                     "renumber": {"type": "boolean", "description": "Take the next free number"}
                 },
                 "required": ["ref"]

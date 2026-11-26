@@ -23,6 +23,7 @@ pub mod node;
 pub mod note;
 pub mod overview;
 pub mod project;
+pub mod refs;
 pub mod resource;
 pub mod session;
 pub mod status;

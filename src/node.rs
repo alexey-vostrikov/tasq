@@ -1303,6 +1303,10 @@ pub fn move_node(
             actor: "-",
         },
     )?;
+    // Тот же пересчёт, что и при переносе в проект: `mv` внутри проекта тоже меняет глубину, а
+    // значит и вид узла. Без этого задача, перенесённая в корень, оставалась «задачей» глубины 1.
+    renormalise_after_move(&tx, project.id, node.id)?;
+
     for (id, old_path, old_depth) in &descendants {
         let suffix = &old_path[node.path.len()..];
         let moved = format!("{new_path}{suffix}");
@@ -1325,6 +1329,433 @@ pub fn move_node(
     }
     tx.commit()?;
     load_by_id(conn, &project, node.id)
+}
+
+/// Что получилось при переносе узла в другой проект.
+///
+/// Отчёт, а не просто узел: перенос меняет адрес, и вызывающий обязан увидеть все три следствия —
+/// новый адрес, число переписанных ссылок и то, что комментарий о прежнем месте добавлен. Молча
+/// вернуть другой `dot_id` значило бы заставить человека догадываться, что ещё изменилось.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MoveReport {
+    pub dot_id: String,
+    pub previous_dot_id: String,
+    pub project: String,
+    pub previous_project: String,
+    /// Узлов переехало (сам узел и его потомки).
+    pub nodes: usize,
+    /// Сколько записей получили новый адрес: узлы, комментарии, заметки.
+    pub references: ReferenceReport,
+    /// Узлам сменялся вид или статус: перенос меняет глубину, а вид — её следствие.
+    pub rekinded: usize,
+}
+
+/// Кого коснулось переписывание ссылок.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ReferenceReport {
+    pub nodes: usize,
+    pub comments: usize,
+    pub notes: usize,
+}
+
+impl ReferenceReport {
+    pub fn total(&self) -> usize {
+        self.nodes + self.comments + self.notes
+    }
+}
+
+/// Переносит узел с поддеревом в другой проект.
+///
+/// Что решено и почему (решение владельца, TASQDEV-16.1):
+///
+///   * адрес перестраивается: `RRL-3.1` становится `<новый ключ>-<seq>`. Алиасы не хранятся —
+///     второй способ разрешить ту же ссылку разошёлся бы с первым, и `NODE_NOT_FOUND` начал бы
+///     зависеть от того, какой базе верить;
+///   * ссылки переписываются во всех НЕархивных узлах базы: в заголовках, описаниях,
+///     `source_ref`, в комментариях к ним и в заметках. Архив — это застывшая история, и править
+///     в нём текст задним числом значит переписывать прошлое; архивные записи остаются с прежним
+///     адресом;
+///   * в перенесённый узел добавляется комментарий о прежнем месте: адрес сменился, и тот, кто
+///     откроет узел через полгода, должен видеть, откуда он приехал и почему в старых записях
+///     другой адрес.
+///
+/// История, аренды и комментарии переезжают сами: они ссылаются на `node_id`, а не на проект.
+pub fn move_to_project(
+    conn: &mut Connection,
+    project: &Project,
+    reference: &str,
+    target_key: &str,
+    new_parent: Option<&str>,
+    renumber: bool,
+) -> Result<MoveReport> {
+    let (source, node) = resolve_with_project(conn, project, reference)?;
+    let target =
+        crate::project::by_key(conn, target_key)?.ok_or_else(|| Error::ProjectNotFound {
+            key: target_key.to_string(),
+            known: crate::project::known_keys(conn).unwrap_or_default(),
+        })?;
+    if target.id == source.id {
+        return Err(Error::InvalidValue {
+            field: "to_project".to_string(),
+            value: format!(
+                "{} is already the node's project; use `mv` without --to-project",
+                target.key
+            ),
+        });
+    }
+
+    let (parent_id, new_depth, parent_path) = match new_parent {
+        Some(reference) => {
+            // Родитель ищется В ЦЕЛЕВОМ проекте: переносить узел под родителя чужого проекта
+            // нельзя, а разрешать ссылку в старом значило бы принять `RRL-1` за адрес в новом.
+            let parent = resolve(conn, &target, reference)?;
+            (Some(parent.id), parent.depth + 1, parent.path)
+        }
+        None => (None, 1, String::new()),
+    };
+
+    let snapshot: Vec<(i64, String, i64)> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, path, depth FROM nodes WHERE id IN ({}) ORDER BY path",
+            crate::tree::descendants_sql()
+        ))?;
+        stmt.query_map(params![node.id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let relative_deepest = snapshot
+        .iter()
+        .map(|(_, _, depth)| *depth - node.depth)
+        .max()
+        .unwrap_or(0);
+    let deepest = node.depth + relative_deepest;
+    let delta = new_depth - node.depth;
+    if deepest + delta > MAX_DEPTH {
+        return Err(Error::DepthLimit);
+    }
+
+    let tx = db::write_tx(conn)?;
+    // Номер в целевом проекте: тот же номер, если он свободен, иначе следующий свободный.
+    // Молча падать на `UNIQUE (project_id, path)` нельзя — перенос в занятую ветку обычная
+    // операция, а не ошибка вызывающего.
+    let next_free: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM nodes WHERE project_id = ?1 AND parent_id IS ?2",
+        params![target.id, parent_id],
+        |row| row.get(0),
+    )?;
+    let taken = |seq: i64| -> Result<bool> {
+        let path = if parent_path.is_empty() {
+            seq.to_string()
+        } else {
+            format!("{parent_path}.{seq}")
+        };
+        Ok(tx.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE project_id = ?1 AND path = ?2",
+            params![target.id, path],
+            |row| row.get::<_, i64>(0),
+        )? > 0)
+    };
+    let seq = if renumber || taken(node.seq)? {
+        next_free
+    } else {
+        node.seq
+    };
+    let new_path = if parent_path.is_empty() {
+        seq.to_string()
+    } else {
+        format!("{parent_path}.{seq}")
+    };
+    validate_path(&new_path)?;
+
+    let now = now_iso();
+    tx.execute(
+        "UPDATE nodes SET project_id = ?1, parent_id = ?2, depth = ?3, seq = ?4, path = ?5,
+                          updated_at = ?6
+         WHERE id = ?7",
+        params![target.id, parent_id, new_depth, seq, new_path, now, node.id],
+    )?;
+    let moved = tx.execute(
+        &format!(
+            "UPDATE nodes SET project_id = ?1, path = ?2 || substr(path, ?3), depth = depth + ?4,
+                              updated_at = ?5
+             WHERE id IN ({})",
+            crate::tree::descendants_sql()
+        ),
+        params![
+            target.id,
+            new_path,
+            node.path.len() as i64 + 1,
+            delta,
+            now,
+            node.id
+        ],
+    )? + 1;
+
+    // Вид подчиняется глубине: задача, поставленная в корень чужого проекта, становится эпиком,
+    // эпик, опущенный под задачу, — подзадачей, и дети едут вместе с ним.
+    let rekinded = renormalise_after_move(&tx, target.id, node.id)?;
+
+    let previous_dot = source.dot_id(&node.path);
+    let new_dot = target.dot_id(&new_path);
+
+    // Ссылки переписываются ПОСЛЕ смены адресов: старый адрес известен, новый посчитан, и обе
+    // записи уже в базе — если что-то упадёт, транзакция откатит всё вместе.
+    let references = rewrite_references(&tx, &previous_dot, &new_dot)?;
+
+    // Комментарий о прежнем месте: адрес сменился, и человек, открывший узел через полгода,
+    // обязан видеть, откуда он приехал — иначе архивная запись с другим адресом выглядит
+    // ошибкой, а не историей.
+    tx.execute(
+        "INSERT INTO comments (node_id, author, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            node.id,
+            "tasq",
+            format!(
+                "Перенесён из проекта {} в {}: {previous_dot} → {new_dot}. Ссылки в неархивных \
+                 записях обновлены; архивные хранят прежний адрес намеренно.",
+                source.key, target.key
+            ),
+            now
+        ],
+    )?;
+
+    // Сводка собирается заранее: `Entry` держит `&str`, и временная строка внутри литерала
+    // структуры жила бы короче самого вызова.
+    let summary = format!(
+        "{} -> {}, {} node(s), {} reference(s)",
+        source.key,
+        target.key,
+        moved,
+        references.total()
+    );
+    activity::log(
+        &tx,
+        &Entry {
+            project_id: target.id,
+            node_id: Some(node.id),
+            entity_type: "node",
+            entity_id: node.id,
+            action: "move_project",
+            field_name: Some("project_id"),
+            old_value: Some(previous_dot.as_str()),
+            new_value: Some(new_dot.as_str()),
+            summary: Some(summary.as_str()),
+            actor: "-",
+        },
+    )?;
+    tx.commit()?;
+
+    Ok(MoveReport {
+        dot_id: new_dot,
+        previous_dot_id: previous_dot,
+        project: target.key.clone(),
+        previous_project: source.key.clone(),
+        nodes: moved,
+        references,
+        rekinded,
+    })
+}
+
+/// Переписывает ссылки на старый адрес в текстах, которые читает человек.
+///
+/// Область — всё, что не архив: заголовок, описание и `source_ref` узла, комментарии к таким
+/// узлам, заметки (привязанные к неархивным узлам или ни к чему не привязанные). Архив
+/// намеренно не трогается: это застывшая история, и правка текста в нём задним числом
+/// переписала бы прошлое.
+///
+/// `updated_at` у узлов НЕ обновляется при правке текста: дата последней работы над задачей —
+/// это не дата переезда соседа, и поднимать её значило бы врать в отчётах о застое.
+fn rewrite_references(
+    tx: &rusqlite::Transaction<'_>,
+    previous: &str,
+    current: &str,
+) -> Result<ReferenceReport> {
+    let mut report = ReferenceReport::default();
+
+    // 1. Узлы: заголовок, описание, source_ref.
+    let rows: Vec<(i64, String, Option<String>, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, title, description, source_ref FROM nodes
+             WHERE archived_at IS NULL
+               AND (title LIKE ?1 OR description LIKE ?1 OR source_ref LIKE ?1)",
+        )?;
+        // `LIKE` — только грубый отбор: точное совпадение проверяет `refs::rewrite`, иначе
+        // `RRL-3.1` совпал бы с `RRL-3.10` ещё на этом шаге.
+        stmt.query_map(params![format!("%{previous}%")], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, title, description, source_ref) in rows {
+        let new_title = crate::refs::rewrite(&title, previous, current);
+        let new_description = description
+            .as_deref()
+            .and_then(|text| crate::refs::rewrite(text, previous, current));
+        let new_source = source_ref
+            .as_deref()
+            .and_then(|text| crate::refs::rewrite(text, previous, current));
+        if new_title.is_none() && new_description.is_none() && new_source.is_none() {
+            continue;
+        }
+        // Пустое значение — «оставить как есть»: без этого правка `title` затирала бы описание.
+        tx.execute(
+            "UPDATE nodes SET title = COALESCE(?1, title), description = COALESCE(?2, description),
+                              source_ref = COALESCE(?3, source_ref)
+             WHERE id = ?4",
+            params![new_title, new_description, new_source, id],
+        )?;
+        report.nodes += 1;
+    }
+
+    // 2. Комментарии к неархивным узлам.
+    let comments: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT c.id, c.content FROM comments c JOIN nodes n ON n.id = c.node_id
+             WHERE n.archived_at IS NULL AND c.is_deleted = 0 AND c.content LIKE ?1",
+        )?;
+        stmt.query_map(params![format!("%{previous}%")], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, content) in comments {
+        if let Some(updated) = crate::refs::rewrite(&content, previous, current) {
+            tx.execute(
+                "UPDATE comments SET content = ?1 WHERE id = ?2",
+                params![updated, id],
+            )?;
+            report.comments += 1;
+        }
+    }
+
+    // 3. Заметки: привязанные к неархивным узлам и свободные. Заметка проекта — тоже текст,
+    // который читают, и ссылка в ней стареет так же.
+    let notes: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT nt.id, nt.title, nt.content FROM notes nt
+             LEFT JOIN nodes n ON n.id = nt.node_id
+             WHERE (nt.node_id IS NULL OR n.archived_at IS NULL)
+               AND (nt.title LIKE ?1 OR nt.content LIKE ?1)",
+        )?;
+        stmt.query_map(params![format!("%{previous}%")], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, title, content) in notes {
+        let new_title = crate::refs::rewrite(&title, previous, current);
+        let new_content = crate::refs::rewrite(&content, previous, current);
+        if new_title.is_none() && new_content.is_none() {
+            continue;
+        }
+        tx.execute(
+            "UPDATE notes SET title = COALESCE(?1, title), content = COALESCE(?2, content),
+                              updated_at = ?3
+             WHERE id = ?4",
+            params![new_title, new_content, now_iso(), id],
+        )?;
+        report.notes += 1;
+    }
+
+    Ok(report)
+}
+
+/// Пересчитывает вид узлов поддерева по их НОВОЙ глубине и нормализует статус под вид.
+///
+/// Вид узла — не свободное поле, а следствие глубины (`Kind::from_depth`). Задача, поставленная
+/// в корень проекта, становится эпиком; эпик, опущенный под задачу, — подзадачей; её дети
+/// сдвигаются на уровень вниз вместе с ней. До этой правки перенос менял `depth` и `path`, но не
+/// `kind`, и в базе оказывался «эпик» глубины 3: набор допустимых статусов и подсказка матрицы
+/// начинали зависеть от того, каким путём узел сюда попал.
+///
+/// Статус нормализуется вместе с видом, потому что наборы статусов у видов разные: эпику запрещён
+/// `todo`, остальным — `planned`. Обе стороны НЕтерминальны, поэтому burn-up и отчёты о закрытии
+/// от такой замены не меняются — и строки в истории статусов здесь нет намеренно: история
+/// отвечает «когда узел стал done», а `todo ↔ planned` — не решение о работе, а следствие места
+/// в дереве. В журнал запись идёт: он отвечает «что произошло».
+///
+/// Возвращает число узлов, которым сменился вид или статус.
+fn renormalise_after_move(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: i64,
+    root_id: i64,
+) -> Result<usize> {
+    let rows: Vec<(i64, i64, String, String)> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, depth, kind, status FROM nodes WHERE id IN ({})",
+            crate::tree::subtree_sql()
+        ))?;
+        stmt.query_map(params![root_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut changed = 0;
+    for (id, depth, kind, status) in rows {
+        let want_kind = Kind::from_depth(depth);
+        let want_status = normalise_status_for(&status, want_kind);
+        let kind_changed = kind != want_kind.as_str();
+        let status_changed = status != want_status;
+        if !kind_changed && !status_changed {
+            continue;
+        }
+        tx.execute(
+            "UPDATE nodes SET kind = ?1, status = ?2 WHERE id = ?3",
+            params![want_kind.as_str(), want_status, id],
+        )?;
+        if kind_changed {
+            activity::log(
+                tx,
+                &Entry {
+                    project_id,
+                    node_id: Some(id),
+                    entity_type: "node",
+                    entity_id: id,
+                    action: "move",
+                    field_name: Some("kind"),
+                    old_value: Some(kind.as_str()),
+                    new_value: Some(want_kind.as_str()),
+                    summary: Some("вид пересчитан по новой глубине"),
+                    actor: "-",
+                },
+            )?;
+        }
+        if status_changed {
+            activity::log(
+                tx,
+                &Entry {
+                    project_id,
+                    node_id: Some(id),
+                    entity_type: "node",
+                    entity_id: id,
+                    action: "move",
+                    field_name: Some("status"),
+                    old_value: Some(status.as_str()),
+                    new_value: Some(want_status.as_str()),
+                    summary: Some("статус приведён к набору нового вида"),
+                    actor: "-",
+                },
+            )?;
+        }
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Статус, допустимый для вида: у эпика не бывает `todo`, у остальных — `planned`.
+///
+/// Замена, а не отказ: перенос — это структурное действие, и требовать от человека «сначала
+/// поменяй статус, потом переноси» значило бы перекладывать следствие на него. Обе пары
+/// нетерминальны, поэтому замена ничего не значит для отчётов.
+fn normalise_status_for(status: &str, kind: Kind) -> String {
+    match Status::parse(status) {
+        Some(parsed) if parsed.allowed_for(kind) => status.to_string(),
+        Some(Status::Todo) => Status::Planned.as_str().to_string(),
+        Some(Status::Planned) => Status::Todo.as_str().to_string(),
+        _ => status.to_string(),
+    }
 }
 
 /// Задаёт порядок сиблингов.

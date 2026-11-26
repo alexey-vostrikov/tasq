@@ -194,6 +194,9 @@ enum Command {
         /// New parent; omit to move to the project root
         #[arg(long, value_name = "REF")]
         parent: Option<String>,
+        /// Move the subtree into another project; the dot-ID is rebuilt there
+        #[arg(long = "to-project", value_name = "KEY")]
+        to_project: Option<String>,
         /// Take the next free number among the new siblings
         #[arg(long)]
         renumber: bool,
@@ -1766,10 +1769,40 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Mv {
             reference,
             parent,
+            to_project,
             renumber,
         } => {
             let (mut conn, project) =
                 open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
+            // Два вида переноса — два разных ответа, поэтому и ветки разные: обычный `mv`
+            // возвращает узел, перенос в проект возвращает ОТЧЁТ (прежний адрес, новый адрес,
+            // сколько ссылок переписано). Один общий ответ заставил бы гадать, что произошло.
+            if let Some(key) = to_project {
+                let report = node::move_to_project(
+                    &mut conn,
+                    &project,
+                    reference,
+                    key,
+                    parent.as_deref(),
+                    *renumber,
+                )?;
+                if cli.json {
+                    print_json(&report);
+                    return Ok(ExitCode::SUCCESS);
+                }
+                println!(
+                    "{} -> {}   {} node(s), {} re-kinded, references updated: {} node(s), \
+                     {} comment(s), {} note(s)",
+                    report.previous_dot_id,
+                    report.dot_id,
+                    report.nodes,
+                    report.rekinded,
+                    report.references.nodes,
+                    report.references.comments,
+                    report.references.notes
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
             let moved =
                 node::move_node(&mut conn, &project, reference, parent.as_deref(), *renumber)?;
             if cli.json {
