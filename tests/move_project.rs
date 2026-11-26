@@ -559,3 +559,85 @@ fn the_status_follows_the_new_kind() {
         "подзадаче запрещён planned — статус приведён к todo: {lowered}"
     );
 }
+
+/// Приёмка 16.3: после переноса цепочка контекста и журнал читаются на новом месте.
+///
+/// `ctx` идёт от корня к узлу по `parent_id`, а `log` — по журналу проекта: если бы перенос
+/// оставлял потомков в старом проекте или терял записи, оба ответа были бы неполными, и заметить
+/// это можно было бы только глазами.
+#[test]
+fn context_and_log_are_complete_after_the_move() {
+    let dir = seeded("ctx");
+    assert_eq!(
+        run(
+            &dir,
+            &[
+                "comment",
+                "add",
+                "SRC-1.1",
+                "решение по задаче",
+                "--project",
+                "SRC"
+            ]
+        )
+        .0,
+        0
+    );
+    json(&dir, &["mv", "SRC-1", "--to-project", "DST", "--json"]);
+
+    // `ctx` на самом глубоком узле: цепочка от нового эпика до него.
+    let chain = json(&dir, &["ctx", "DST-1.1.1", "--json", "--project", "DST"]);
+    let chain_text = serde_json::to_string(&chain).expect("json");
+    assert!(chain_text.contains("DST-1"), "{chain_text}");
+    assert!(
+        !chain_text.contains("\"SRC-"),
+        "в цепочке остался старый адрес: {chain_text}"
+    );
+
+    // Журнал целевого проекта знает о переезде и о правках, сделанных до него.
+    let log = json(
+        &dir,
+        &["log", "--json", "--limit", "50", "--project", "DST"],
+    );
+    let actions: Vec<&str> = log
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|row| row["action"].as_str().expect("action"))
+        .collect();
+    assert!(
+        actions.contains(&"move_project"),
+        "в журнале нет переезда: {actions:?}"
+    );
+    // Журнал — история ПРОЕКТА, и создание узла произошло в исходном: в журнале целевого его
+    // нет и быть не должно. Полнота истории узла живёт в другой таблице — `node_status_history`,
+    // которая держится за `node_id` и переезжает вместе с ним. Проверяется именно она.
+    assert!(
+        !actions.contains(&"create"),
+        "записи исходного проекта переехали в журнал целевого: {actions:?}"
+    );
+    let history = json(&dir, &["history", "DST-1.1", "--json", "--project", "DST"]);
+    let causes: Vec<&str> = history["transitions"]
+        .as_array()
+        .expect("transitions")
+        .iter()
+        .map(|row| row["cause"].as_str().expect("cause"))
+        .collect();
+    assert!(
+        causes.contains(&"created"),
+        "история узла обязана помнить создание: {causes:?}"
+    );
+
+    // Комментарий, написанный до переезда, читается на новом месте.
+    let comments = json(
+        &dir,
+        &["comment", "ls", "DST-1.1", "--json", "--project", "DST"],
+    );
+    let texts: Vec<&str> = comments
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|row| row["content"].as_str().expect("content"))
+        .collect();
+    assert!(texts.contains(&"решение по задаче"), "{texts:?}");
+}
