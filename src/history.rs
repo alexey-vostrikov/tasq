@@ -11,6 +11,7 @@
 //! он либо пишет факт, либо тест на этом пути падает.
 
 use rusqlite::Connection;
+use serde::Serialize;
 
 use crate::db::now_iso;
 use crate::error::Result;
@@ -80,6 +81,66 @@ impl Cause {
             Cause::Restore => "restore",
         }
     }
+}
+
+/// Один факт перехода в том виде, в каком его читают отчёты и человек.
+#[derive(Debug, Clone, Serialize)]
+pub struct Transition {
+    pub at: String,
+    /// Прежний статус; `None` только у первой записи узла.
+    pub from: Option<String>,
+    pub to: String,
+    /// Причина в машинном виде (`manual`, `lease_completed`, ...).
+    pub cause: String,
+    pub actor: Option<String>,
+    /// Та же причина человеческим словом: агент читает машинную, человек — эту.
+    pub reason: &'static str,
+}
+
+/// Человеческое имя причины.
+///
+/// Хранится кодом (по нему сравнивают и отбирают), а показывается словом: «lease_expired»
+/// человеку ничего не говорит, а «аренда истекла» отвечает на его вопрос. Неизвестная причина
+/// называется как есть, а не подменяется ближайшей понятной: подмена скрыла бы порчу данных.
+pub fn reason_of(cause: &str) -> &'static str {
+    match cause {
+        "created" => "создан",
+        "manual" => "переведён вручную",
+        "lease_claimed" => "взят в работу по аренде",
+        "lease_completed" => "закрыт через аренду",
+        "lease_released" => "аренда сдана без завершения",
+        "lease_expired" => "аренда истекла",
+        "unblock" => "разблокирован снятием ребра",
+        "gc" => "возвращён уборкой",
+        "import" => "восстановлен из файла",
+        "restore" => "восстановлен из дампа",
+        _ => "причина неизвестна",
+    }
+}
+
+/// Полная история статусов узла, по возрастанию времени.
+///
+/// Читается ровно одна таблица — `node_status_history`. Журнал (`activity_log`) для этого не
+/// годится: он отвечает «что менялось», а не «когда узел стал `done`», и держится на совпадении
+/// текста в местах записи. Порядок — по `at`, затем по `id`: две правки в одну миллисекунду
+/// обязаны читаться в том порядке, в каком были записаны.
+pub fn timeline(conn: &Connection, node_id: i64) -> Result<Vec<Transition>> {
+    let mut stmt = conn.prepare(
+        "SELECT at, from_status, to_status, cause, actor FROM node_status_history
+         WHERE node_id = ?1 ORDER BY at, id",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![node_id], |row| {
+        let cause: String = row.get(3)?;
+        Ok(Transition {
+            at: row.get(0)?,
+            from: row.get(1)?,
+            to: row.get(2)?,
+            cause: cause.clone(),
+            actor: row.get(4)?,
+            reason: reason_of(&cause),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Пишет факт перехода. Вызывается из той же транзакции, что и сама смена статуса.

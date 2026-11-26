@@ -2,7 +2,7 @@
 
 Файл сгенерирован командой `tasq docs` из пустой базы, созданной текущими миграциями: это фактические `CREATE TABLE` и `CREATE VIEW`, а не их пересказ.
 
-Версия схемы: **v11**.
+Версия схемы: **v10**.
 
 ## Таблицы
 
@@ -251,8 +251,7 @@ CREATE TABLE statuses (
   name     TEXT PRIMARY KEY,
   rank     INTEGER NOT NULL UNIQUE,
   terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1))
-, counts_done INTEGER NOT NULL DEFAULT 0
-  CHECK (counts_done IN (0, 1)))
+)
 ```
 
 ### `templates`
@@ -296,7 +295,7 @@ FROM edges e
 JOIN nodes b ON b.id = e.to_node
 WHERE e.kind = 'blocks'
   AND b.deleted_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM statuses s WHERE s.name = b.status AND s.terminal = 1)
+  AND b.status NOT IN ('done','cancelled')
 GROUP BY e.from_node
 ```
 
@@ -307,9 +306,7 @@ CREATE VIEW v_node_effective AS
 SELECT
   n.*,
   CASE
-    WHEN EXISTS (
-      SELECT 1 FROM statuses s WHERE s.name = n.status AND s.terminal = 1
-    ) THEN n.status
+    WHEN n.status IN ('done','cancelled') THEN n.status
     -- Живая аренда: работа идёт прямо сейчас.
     WHEN EXISTS (
       SELECT 1 FROM attempts a
@@ -324,8 +321,7 @@ SELECT
       SELECT 1 FROM edges e
       JOIN nodes b ON b.id = e.to_node
       WHERE e.from_node = n.id AND e.kind = 'blocks'
-        AND b.deleted_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM statuses s WHERE s.name = b.status AND s.terminal = 1)
+        AND b.deleted_at IS NULL AND b.status NOT IN ('done','cancelled')
     ) THEN 'blocked'
     ELSE n.status
   END AS effective_status,
@@ -362,18 +358,17 @@ WITH RECURSIVE tree(ancestor_id, node_id, steps) AS (
   SELECT t.ancestor_id, n.id, t.steps + 1
   FROM tree t
   JOIN nodes n ON n.parent_id = t.node_id
-  -- Сторож завершаемости и предел глубины — одно число (`16`, как в v10).
+  -- Сторож завершаемости и предел глубины — одно число.
   WHERE t.steps < 16
 )
 SELECT
   t.ancestor_id                                                       AS node_id,
   COUNT(*)                                                            AS total_count,
-  SUM(CASE WHEN s.counts_done = 1 THEN 1 ELSE 0 END)                  AS done_count,
+  SUM(CASE WHEN n.status = 'done' THEN 1 ELSE 0 END)                  AS done_count,
   SUM(n.weight)                                                       AS total_weight,
-  SUM(CASE WHEN s.counts_done = 1 THEN n.weight ELSE 0 END)           AS done_weight
+  SUM(CASE WHEN n.status = 'done' THEN n.weight ELSE 0 END)           AS done_weight
 FROM tree t
 JOIN nodes n ON n.id = t.node_id AND n.deleted_at IS NULL
-JOIN statuses s ON s.name = n.status
 GROUP BY t.ancestor_id
 ```
 
@@ -391,7 +386,7 @@ FROM nodes n
 WHERE n.due_date IS NOT NULL
   AND n.deleted_at IS NULL
   AND n.due_date < date('now')
-  AND NOT EXISTS (SELECT 1 FROM statuses s WHERE s.name = n.status AND s.terminal = 1)
+  AND n.status NOT IN ('done','cancelled')
 ```
 
 ## Индексы

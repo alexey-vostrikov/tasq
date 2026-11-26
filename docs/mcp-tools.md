@@ -2,15 +2,15 @@
 
 Файл сгенерирован командой `tasq docs` из каталога самого сервера: имя, описание и схема берутся из того же кода, что отвечает на `tools/list`.
 
-Всего инструментов: 45.
+Всего инструментов: 46.
 
 ## Профили
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 45 | 6000 | 5428 |
-| `agent` | 29 | 4000 | 3691 |
-| `read-only` | 16 | 2000 | 1776 |
+| `full` | 46 | 6000 | 5530 |
+| `agent` | 30 | 4000 | 3793 |
+| `read-only` | 17 | 2000 | 1878 |
 | `migration` | 6 | 800 | 603 |
 
 ## Каталог
@@ -56,6 +56,7 @@
 | `activity_log` | full, agent, read-only | 90 | — | Recent changes: what happened and when |
 | `session_diff` | full, agent, read-only | 102 | `since` | What changed since a timestamp: counts by action plus recent records |
 | `node_batch_update` | full | 136 | `refs`, `status` | Move several nodes to one status; failures are reported per node |
+| `tasq_history` | full, agent, read-only | 103 | `ref` | Status history of a node: when it changed, why, and who |
 | `tasq_search` | full, agent, read-only | 108 | `query` | Full-text search across nodes and notes; without a project it searches every project |
 | `tasq_dashboard` | full, agent, read-only | 106 | — | One-call overview: board, live leases, next candidates, at-risk nodes |
 | `tasq_burnup` | full, agent, read-only | 143 | — | Burn-up series and forecast by count, points or hours |

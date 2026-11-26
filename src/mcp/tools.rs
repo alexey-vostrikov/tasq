@@ -442,7 +442,7 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
         }
         "node_get" => {
             let project = ctx.project(args)?;
-            let node = node::resolve(&ctx.conn, &project, req_str(args, "ref")?)?;
+            let (_, node) = node::resolve_shown(&ctx.conn, &project, req_str(args, "ref")?)?;
             let parent = if node.depth > 1 {
                 node.path
                     .rsplit_once('.')
@@ -618,6 +618,16 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             let project = ctx.project(args)?;
             let chain = overview::context(&ctx.conn, &project, req_str(args, "ref")?)?;
             Ok(text(&chain))
+        }
+        "tasq_history" => {
+            let project = ctx.project(args)?;
+            let (_, node) = node::resolve_shown(&ctx.conn, &project, req_str(args, "ref")?)?;
+            let transitions = crate::history::timeline(&ctx.conn, node.id)?;
+            Ok(text(&serde_json::json!({
+                "dot_id": node.dot_id,
+                "status": node.status,
+                "transitions": transitions,
+            })))
         }
         "tasq_next" => {
             let limit = arg_i64(args, "limit").unwrap_or(3).clamp(1, 20) as usize;
@@ -1317,6 +1327,16 @@ pub fn definition(name: &str) -> Option<Value> {
         "tasq_context" => tool(
             name,
             "Context chain from the root epic down to the node: the why and the what",
+            json!({
+                "type": "object",
+                "properties": {"ref": {"type": "string", "description": "Target node"}},
+                "required": ["ref"]
+            }),
+            (true, false, true),
+        ),
+        "tasq_history" => tool(
+            name,
+            "Status history of a node: when it changed, why, and who",
             json!({
                 "type": "object",
                 "properties": {"ref": {"type": "string", "description": "Target node"}},

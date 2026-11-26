@@ -91,7 +91,7 @@ tasq ls [ОПЦИИ]
 | `--status` | `STATUS` | — | Filter by effective status |
 | `--assignee` | `ASSIGNEE` | — | Filter by assignee |
 | `--overdue` | — | — | Only overdue nodes |
-| `--archived` | — | — | Include archived nodes |
+| `-a`, `--archived` | — | — | Include archived nodes |
 | `-n`, `--no-done` | — | — | Hide nodes closed as done |
 | `--except-project` | `KEY` | — | Project to leave out of the listing (repeatable); unknown keys are refused |
 | `--fields` | `LIST` | — | Print only these fields, comma-separated (dot_id,title,status,...) |
@@ -173,6 +173,14 @@ tasq log [ОПЦИИ]
 | флаг | значение | по умолчанию | описание |
 | --- | --- | --- | --- |
 | `--limit` | `LIMIT` | `20` | How many records to show |
+
+## `history`
+
+Status history of one node: when it changed and why
+
+```
+tasq history [ОПЦИИ]
+```
 
 ## `claim`
 

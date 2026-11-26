@@ -80,6 +80,7 @@ impl Profile {
                 "note_search",
                 "activity_log",
                 "session_diff",
+                "tasq_history",
                 "tasq_search",
                 "tasq_dashboard",
                 "tasq_burnup",
@@ -97,6 +98,7 @@ impl Profile {
                 "note_search",
                 "activity_log",
                 "session_diff",
+                "tasq_history",
                 "tasq_search",
                 "tasq_dashboard",
                 "tasq_burnup",
@@ -166,10 +168,11 @@ pub const ALL_TOOLS: &[&str] = &[
     "template_list",
     "template_apply",
     "template_delete",
-    // Активность (3)
+    // Активность (4)
     "activity_log",
     "session_diff",
     "node_batch_update",
+    "tasq_history",
     // Поиск и обзоры (4)
     "tasq_search",
     "tasq_dashboard",
@@ -186,13 +189,13 @@ mod tests {
 
     #[test]
     fn full_profile_has_exactly_the_declared_catalogue() {
-        // 42 из ТЗ плюс tasq_risk (M6) и project_select/project_delete (проекты): 45.
-        assert_eq!(ALL_TOOLS.len(), 45, "каталог v1 — 45 инструментов");
+        // 42 из ТЗ, tasq_risk (M6), project_select/project_delete (проекты) и tasq_history: 46.
+        assert_eq!(ALL_TOOLS.len(), 46, "каталог — 46 инструментов");
         let mut unique: Vec<&str> = ALL_TOOLS.to_vec();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), ALL_TOOLS.len(), "имена не повторяются");
-        assert_eq!(Profile::Full.tools().len(), 45);
+        assert_eq!(Profile::Full.tools().len(), ALL_TOOLS.len());
     }
 
     #[test]

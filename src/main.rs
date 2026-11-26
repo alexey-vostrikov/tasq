@@ -19,7 +19,7 @@ use tasq::resource;
 use tasq::session;
 use tasq::status::{Kind, Status};
 use tasq::tui;
-use tasq::{activity, budget, burnup, comment, db, note, overview, template, transfer};
+use tasq::{activity, budget, burnup, comment, db, history, note, overview, template, transfer};
 
 #[derive(Parser)]
 #[command(
@@ -130,7 +130,7 @@ enum Command {
         #[arg(long)]
         overdue: bool,
         /// Include archived nodes
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         archived: bool,
         /// Hide nodes closed as done
         #[arg(short = 'n', long = "no-done")]
@@ -217,6 +217,11 @@ enum Command {
         /// How many records to show
         #[arg(long, default_value_t = 20)]
         limit: i64,
+    },
+    /// Status history of one node: when it changed and why
+    History {
+        /// Node reference
+        reference: String,
     },
     /// Take a lease on a node and print its token
     Claim {
@@ -999,24 +1004,6 @@ fn run_completions(shell: clap_complete::Shell, out: Option<&std::path::Path>) -
     Ok(ExitCode::SUCCESS)
 }
 
-/// Подсказка «закрыто, но не доведено, а хвостов больше нет».
-///
-/// Печатается после списка кандидатов и только когда такие узлы есть: пустая секция — шум, а
-/// молчание спрятало бы от человека решение, которое он уже почти принял.
-fn print_closable(closable: &[edge::Closable]) {
-    if closable.is_empty() {
-        return;
-    }
-    println!();
-    println!("closed as incomplete, but no open children left — move them to done:");
-    for node in closable {
-        match &node.project {
-            Some(project) => println!("  {:<18} {}  ({project})", node.dot_id, node.title),
-            None => println!("  {:<18} {}", node.dot_id, node.title),
-        }
-    }
-}
-
 /// Печать «что делать дальше» с указанием, откуда взялся кандидат.
 ///
 /// Пометка нужна, чтобы переход «в своём проекте брать нечего, предлагаю чужой» не выглядел как
@@ -1130,8 +1117,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 .map(|root| root.join("README.md"))
                 .unwrap_or_else(|| PathBuf::from("README.md"));
             let (tool_count, profiles) = docs::readme_facts();
+            let profile_sizes = docs::profile_sizes();
             if readme.is_file() {
-                drift.extend(docs::check_readme(&readme, tool_count, &profiles));
+                drift.extend(docs::check_readme(
+                    &readme,
+                    tool_count,
+                    &profiles,
+                    &profile_sizes,
+                ));
             } else if !cli.json {
                 // Не молчание: при `--out` в чужой каталог README рядом нет, и это стоит
                 // назвать вслух — иначе непонятно, почему числа остались непроверенными.
@@ -1530,7 +1523,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 }
                 return Ok(ExitCode::SUCCESS);
             }
-            let node = node::resolve(&conn, &project, reference)?;
+            let (_, node) = node::resolve_shown(&conn, &project, reference)?;
             if cli.json {
                 print_json(&node);
                 return Ok(ExitCode::SUCCESS);
@@ -1726,19 +1719,6 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     actor: None,
                 },
             )?;
-            // Замена цели `done` → `incomplete` — не ошибка, но и не то, о чём просили.
-            // Молча отдать другой статус значило бы заставить человека гадать, почему узел
-            // не закрыт как выполненный.
-            if status == Some(tasq::status::Status::Done)
-                && updated.status == "incomplete"
-                && !cli.json
-            {
-                eprintln!(
-                    "note: {} closed as incomplete: it still has unfinished children; \
-                     `--force` writes done",
-                    updated.dot_id
-                );
-            }
             if cli.json {
                 print_json(&updated);
             } else {
@@ -1907,6 +1887,40 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 println!(
                     "{} {:<10} {:<12} {}",
                     record.created_at, record.action, target, detail
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::History { reference } => {
+            let (conn, project) = open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
+            let (_, node) = node::resolve_shown(&conn, &project, reference)?;
+            let timeline = history::timeline(&conn, node.id)?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "dot_id": node.dot_id,
+                    "status": node.status,
+                    "transitions": timeline,
+                }));
+                return Ok(ExitCode::SUCCESS);
+            }
+            if timeline.is_empty() {
+                // Пустая история — не «ничего не было», а «мы не знаем»: у узла, созданного
+                // до схемы v4, истории нет вовсе, и сказать об этом честнее, чем напечатать
+                // пустоту, которую прочтут как «статус не менялся».
+                println!("{}: status history is unknown (no records)", node.dot_id);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!("{}  {}", node.dot_id, node.status);
+            for transition in &timeline {
+                let from = transition.from.as_deref().unwrap_or("-");
+                println!(
+                    "  {}  {:<12} -> {:<12}  {:<28} {}",
+                    transition.at,
+                    from,
+                    transition.to,
+                    transition.reason,
+                    transition.actor.as_deref().unwrap_or("-")
                 );
             }
             Ok(ExitCode::SUCCESS)
@@ -2204,7 +2218,6 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if let Some(key) = cli.project.as_deref() {
                 let (conn, project) = open(cli.db.as_deref(), Some(key))?;
                 let candidates = edge::next_candidates(&conn, &project, *limit)?;
-                let closable = edge::closable(&conn, &project)?;
                 if cli.json {
                     print_json(&candidates);
                     return Ok(ExitCode::SUCCESS);
@@ -2213,7 +2226,6 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     &candidates,
                     &[(project.key.clone(), edge::Origin::Affinity)],
                 );
-                print_closable(&closable);
                 return Ok(ExitCode::SUCCESS);
             }
 
@@ -2228,13 +2240,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 None => None,
             };
             let next = edge::next_across(&conn, affinity.as_deref(), *limit)?;
-            let closable = edge::closable_across(&conn)?;
             if cli.json {
                 print_json(&next.candidates);
                 return Ok(ExitCode::SUCCESS);
             }
             print_candidates(&next.candidates, &next.origin);
-            print_closable(&closable);
             Ok(ExitCode::SUCCESS)
         }
 
