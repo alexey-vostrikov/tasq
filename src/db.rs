@@ -201,13 +201,29 @@ pub fn write_tx(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
 
 /// Открывает базу и проверяет, что версия схемы не новее поддерживаемой.
 pub fn open_checked(path: &Path) -> Result<Connection> {
-    let conn = open(path)?;
+    let mut conn = open(path)?;
     let version = schema_version(&conn)?;
     if version > SUPPORTED_SCHEMA_VERSION {
         return Err(Error::SchemaTooNew {
             found: version,
             supported: SUPPORTED_SCHEMA_VERSION,
         });
+    }
+    // Миграция при открытии, а не только при `init` и восстановлении.
+    //
+    // Без этого бинарь новее базы работал бы на СТАРОЙ схеме и молчал об этом: запрос к объекту,
+    // которого нет, падал бы в запасной путь (так `find` по комментариям отвечал через `LIKE`,
+    // хотя индекса не существовало), а «схема v11» существовала бы только для новых баз. Цена
+    // проверки — одно чтение `meta` на команду; миграция идёт только когда версия отстала.
+    //
+    // Сообщение печатается в stderr и только когда миграция действительно произошла: тихое
+    // изменение чужой базы при первом запуске — не то, о чём стоит узнавать по косвенным
+    // признакам. `--json` оно не портит: поток ошибок в документ не попадает.
+    if version < SUPPORTED_SCHEMA_VERSION && apply_migrations(&mut conn)? {
+        eprintln!(
+            "schema: migrated v{version} -> v{SUPPORTED_SCHEMA_VERSION} ({})",
+            path.display()
+        );
     }
     Ok(conn)
 }

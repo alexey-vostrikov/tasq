@@ -220,3 +220,86 @@ fn schema_version_is_recorded() {
         .expect("schema_version");
     assert_eq!(version, db::SUPPORTED_SCHEMA_VERSION.to_string());
 }
+
+/// Отстающая база мигрирует при обычном открытии, а не только через `init` или восстановление.
+///
+/// Этот тест появился после дефекта: миграция v11 (поиск по комментариям) не применялась к
+/// существующим базам, потому что `open_checked` схему не поднимал. Снаружи это выглядело
+/// работающим: `find` по комментариям отвечал — но запасным путём `LIKE`, без индекса, и по
+/// десятитысячной базе такой ответ стоил бы секунд вместо миллисекунд. Молчаливая работа на
+/// старой схеме хуже отказа: отказ виден, а «работает, но иначе» — нет.
+#[test]
+fn an_outdated_database_is_migrated_on_open() {
+    let dir = temp_dir("migrate-on-open");
+    let outcome = db::init(&dir, "MIGR", "миграция").expect("init");
+    let path = std::path::Path::new(&outcome.db_path);
+
+    // Откатываем базу к состоянию до v11: убираем индекс с триггерами и ставим версию 10.
+    // Так воспроизводится ровно то, что лежит у человека, обновившего бинарь.
+    {
+        let conn = db::open(path).expect("open");
+        conn.execute_batch(
+            "DROP TRIGGER comments_fts_ai;
+             DROP TRIGGER comments_fts_ad;
+             DROP TRIGGER comments_fts_au;
+             DROP TABLE comments_fts;
+             UPDATE meta SET value = '10' WHERE key = 'schema_version';",
+        )
+        .expect("откат к v10");
+    }
+
+    // Обычное открытие — то же, с чего начинается любая команда CLI.
+    let conn = db::open_checked(path).expect("open_checked");
+    let version = db::schema_version_of(&conn).expect("версия");
+    assert_eq!(
+        version,
+        db::SUPPORTED_SCHEMA_VERSION,
+        "открытие не подняло схему до поддерживаемой"
+    );
+    let index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'comments_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("поиск индекса");
+    assert_eq!(index, 1, "индекс комментариев не создан миграцией");
+
+    // И база после миграции рабочая: комментарий пишется и находится.
+    let project = tasq::project::first_project(&conn).expect("проект");
+    let node = tasq::node::create(
+        &mut db::open_checked(path).expect("open"),
+        &project,
+        tasq::node::NewNode {
+            parent: None,
+            title: "Узел",
+            kind: None,
+            description: None,
+            priority: None,
+            due_date: None,
+            estimated_hours: None,
+            weight: None,
+            source_ref: None,
+            branch: None,
+            tags: None,
+        },
+    )
+    .expect("узел");
+    let mut writer = db::open_checked(path).expect("open");
+    tasq::comment::add(
+        &mut writer,
+        &project,
+        &node.dot_id,
+        "проверка слова фрегат",
+        "тест",
+    )
+    .expect("комментарий");
+    let hits = tasq::overview::search(&writer, &project, "фрегат").expect("поиск");
+    assert_eq!(
+        hits.len(),
+        1,
+        "поиск по комментарию не работает после миграции"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
