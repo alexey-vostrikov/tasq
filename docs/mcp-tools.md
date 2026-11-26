@@ -8,9 +8,9 @@
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 45 | 6000 | 5346 |
-| `agent` | 29 | 4000 | 3609 |
-| `read-only` | 16 | 2000 | 1694 |
+| `full` | 45 | 6000 | 5428 |
+| `agent` | 29 | 4000 | 3691 |
+| `read-only` | 16 | 2000 | 1776 |
 | `migration` | 6 | 800 | 603 |
 
 ## Каталог
@@ -26,7 +26,7 @@
 | `node_create` | full, agent | 213 | `title` | Create a node; without parent it becomes a root epic |
 | `node_get` | full, agent, read-only, migration | 102 | `ref` | One node with children, comments and the parent chain |
 | `node_update` | full, agent | 198 | `ref` | Change node fields; only the given fields are touched |
-| `node_list` | full, agent, read-only | 161 | — | List nodes in tree order with light fields |
+| `node_list` | full, agent, read-only | 243 | — | List nodes in tree order with light fields |
 | `node_move` | full | 132 | `ref` | Move a node under another parent; descendant dot-IDs change |
 | `node_reorder` | full | 105 | `refs` | Set the order of siblings |
 | `node_archive` | full, agent | 111 | `ref` | Archive or unarchive a subtree; nothing is deleted |

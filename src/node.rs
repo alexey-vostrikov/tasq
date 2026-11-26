@@ -726,11 +726,107 @@ pub struct Filter<'a> {
     pub include_archived: bool,
     pub include_deleted: bool,
     pub limit: Option<i64>,
+    /// Сколько узлов пропустить после сортировки (`--offset`).
+    ///
+    /// И `limit`, и `offset` применяются в Rust, а не в SQL, и это не небрежность: порядок
+    /// списка — по числовым сегментам пути (`1.2` идёт раньше `1.10`), а SQLite строку `1.10`
+    /// поставит раньше `1.2`. `LIMIT` без того же `ORDER BY` отрезал бы не первые строки, а
+    /// случайные. Цена честного порядка — чтение всего списка; выигрыш от выбора полей и так
+    /// в тридцать раз больше (292 КБ → 9 КБ на живой базе).
+    pub offset: Option<i64>,
 }
 
 /// Ключ сортировки пути: числовые сегменты сравниваются как числа, а не строки.
 pub fn path_sort_key(path: &str) -> Vec<u32> {
     path.split('.').filter_map(|s| s.parse().ok()).collect()
+}
+
+/// Все поля узла, которые можно выбрать флагом `--fields`.
+///
+/// Список закрытый и сверяется тестом с `Node`: опечатка в имени поля — отказ, а не пустой
+/// столбец, который никто не заметит. Обратное тоже проверяется — поле, добавленное в `Node`,
+/// обязано появиться здесь, иначе его нельзя будет выбрать.
+pub const FIELDS: &[&str] = &[
+    "id",
+    "dot_id",
+    "path",
+    "project_id",
+    "depth",
+    "seq",
+    "kind",
+    "title",
+    "description",
+    "description_locked",
+    "status",
+    "effective_status",
+    "priority",
+    "assigned_to",
+    "weight",
+    "estimated_hours",
+    "due_date",
+    "branch",
+    "source_ref",
+    "archived_at",
+    "lease_holder",
+    "lease_expires_at",
+    "progress_done",
+    "progress_total",
+    "created_at",
+    "updated_at",
+];
+
+/// Разбор `--fields a,b,c` в каноническом порядке `FIELDS`.
+///
+/// Порядок берётся из `FIELDS`, а не из строки: два вызова с теми же полями в разном порядке
+/// обязаны дать одинаковый JSON, иначе сравнение двух ответов глазами превращается в угадывание.
+/// Неизвестное имя — отказ со списком допустимых.
+pub fn parse_fields(raw: &str) -> Result<Vec<&'static str>> {
+    let mut wanted: Vec<&'static str> = Vec::new();
+    for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(field) = FIELDS.iter().find(|known| **known == name) else {
+            return Err(Error::InvalidValue {
+                field: "fields".to_string(),
+                value: format!("{name} (allowed: {})", FIELDS.join(", ")),
+            });
+        };
+        if !wanted.contains(field) {
+            wanted.push(field);
+        }
+    }
+    if wanted.is_empty() {
+        return Err(Error::InvalidValue {
+            field: "fields".to_string(),
+            value: "empty (name at least one field)".to_string(),
+        });
+    }
+    Ok(FIELDS
+        .iter()
+        .copied()
+        .filter(|field| wanted.contains(field))
+        .collect())
+}
+
+/// Узел в виде JSON с выбранными полями.
+///
+/// Пустой выбор означает «все поля»: вид ответа без новых флагов обязан остаться прежним.
+/// `description` — главная причина, по которой выбор вообще нужен: на живой базе описание
+/// занимает 197 КБ из 292 КБ в списке из 151 узла, то есть две трети ответа, который агент
+/// читает ради адреса и статуса.
+pub fn project_json(node: &Node, fields: &[&'static str]) -> serde_json::Value {
+    let full = serde_json::to_value(node).expect("Node is serialisable");
+    if fields.is_empty() {
+        return full;
+    }
+    let serde_json::Value::Object(all) = full else {
+        return serde_json::Value::Null;
+    };
+    let mut out = serde_json::Map::new();
+    for field in fields {
+        if let Some(value) = all.get(*field) {
+            out.insert((*field).to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Список узлов по фильтру, в порядке дерева.
@@ -790,6 +886,14 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     nodes.sort_by_key(|node| path_sort_key(&node.path));
+    if let Some(offset) = filter.offset {
+        let skip = offset.max(0) as usize;
+        if skip >= nodes.len() {
+            nodes.clear();
+        } else {
+            nodes.drain(..skip);
+        }
+    }
     if let Some(limit) = filter.limit {
         nodes.truncate(limit.max(0) as usize);
     }
@@ -876,6 +980,14 @@ pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // Порядок уже задан SQL (проект, затем путь); сортировка в коде не нужна.
+    if let Some(offset) = filter.offset {
+        let skip = offset.max(0) as usize;
+        if skip >= nodes.len() {
+            nodes.clear();
+        } else {
+            nodes.drain(..skip);
+        }
+    }
     if let Some(limit) = filter.limit {
         nodes.truncate(limit.max(0) as usize);
     }

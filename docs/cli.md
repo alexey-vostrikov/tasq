@@ -94,6 +94,9 @@ tasq ls [ОПЦИИ]
 | `--archived` | — | — | Include archived nodes |
 | `-n`, `--no-done` | — | — | Hide nodes closed as done |
 | `--except-project` | `KEY` | — | Project to leave out of the listing (repeatable); unknown keys are refused |
+| `--fields` | `LIST` | — | Print only these fields, comma-separated (dot_id,title,status,...) |
+| `--offset` | `N` | — | Skip this many nodes after sorting (paging with --limit) |
+| `--limit` | `N` | — | Print at most this many nodes |
 
 ## `set`
 

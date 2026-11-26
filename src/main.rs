@@ -138,6 +138,15 @@ enum Command {
         /// Project to leave out of the listing (repeatable); unknown keys are refused
         #[arg(long = "except-project", value_name = "KEY")]
         except_project: Vec<String>,
+        /// Print only these fields, comma-separated (dot_id,title,status,...)
+        #[arg(long, value_name = "LIST")]
+        fields: Option<String>,
+        /// Skip this many nodes after sorting (paging with --limit)
+        #[arg(long, value_name = "N")]
+        offset: Option<i64>,
+        /// Print at most this many nodes
+        #[arg(long, value_name = "N")]
+        limit: Option<i64>,
     },
     /// Change node fields; only the given fields are touched
     Set {
@@ -1561,6 +1570,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             archived,
             no_done,
             except_project,
+            fields,
+            offset,
+            limit,
         } => {
             // `ls` — обзорная команда: без селектора в базе с несколькими проектами
             // показываются все (узел опознаётся по ключу в dot-ID), `--project all` — явно.
@@ -1596,7 +1608,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         overdue: *overdue,
                         include_archived: *archived,
                         include_deleted: false,
-                        limit: None,
+                        limit: *limit,
+                        offset: *offset,
                     },
                 )?,
                 project::Scope::All => node::list_all(
@@ -1610,12 +1623,26 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         overdue: *overdue,
                         include_archived: *archived,
                         include_deleted: false,
-                        limit: None,
+                        limit: *limit,
+                        offset: *offset,
                     },
                 )?,
             };
+            let selected = match fields {
+                Some(raw) => Some(node::parse_fields(raw)?),
+                None => None,
+            };
             if cli.json {
-                print_json(&nodes);
+                match &selected {
+                    Some(fields) => {
+                        let rows: Vec<serde_json::Value> = nodes
+                            .iter()
+                            .map(|node| node::project_json(node, fields))
+                            .collect();
+                        print_json(&rows);
+                    }
+                    None => print_json(&nodes),
+                }
                 return Ok(ExitCode::SUCCESS);
             }
             if nodes.is_empty() {

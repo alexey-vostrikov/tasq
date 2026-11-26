@@ -122,6 +122,25 @@ fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Список строк из массива аргумента: `["dot_id","title"]`.
+///
+/// Строка вместо массива — отказ, а не молчаливое «одно поле из запятой»: клиенты MCP передают
+/// массивы массивами, и догадка о чужой форме ввода скрыла бы ошибку вызова.
+fn arg_strings(args: &Value, key: &str) -> Result<Vec<String>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => Ok(items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()),
+        Some(other) => Err(Error::InvalidValue {
+            field: key.to_string(),
+            value: format!("{other} (expected an array of strings)"),
+        }),
+    }
+}
+
 fn arg_status(args: &Value, key: &str) -> Result<Option<Status>> {
     match arg_str(args, key) {
         Some(value) => Status::parse(value)
@@ -525,9 +544,22 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                     include_archived: arg_bool(args, "include_archived"),
                     include_deleted: false,
                     limit: arg_i64(args, "limit"),
+                    offset: arg_i64(args, "offset"),
                 },
             )?;
-            Ok(text(&nodes))
+            // Выбор полей: без `fields` ответ прежний, с ним — только запрошенное. Это главный
+            // способ не отдавать агенту двести килобайт описаний ради адреса и статуса.
+            let fields = arg_strings(args, "fields")?;
+            if fields.is_empty() {
+                return Ok(text(&nodes));
+            }
+            let joined = fields.join(",");
+            let selected = node::parse_fields(&joined)?;
+            let rows: Vec<Value> = nodes
+                .iter()
+                .map(|node| node::project_json(node, &selected))
+                .collect();
+            Ok(text(&rows))
         }
         "node_move" => {
             let project = ctx.project(args)?;
@@ -1212,6 +1244,12 @@ pub fn definition(name: &str) -> Option<Value> {
                     "assignee": {"type": "string", "description": "Filter by assignee"},
                     "overdue": {"type": "boolean", "description": "Only overdue nodes"},
                     "include_archived": {"type": "boolean", "description": "Show archived too"},
+                    "exclude_done": {"type": "boolean", "description": "Hide nodes closed as done"},
+                    "exclude_projects": {"type": "array", "items": {"type": "string"},
+                        "description": "Projects to leave out"},
+                    "fields": {"type": "array", "items": {"type": "string"},
+                        "description": "Return only these fields (dot_id, title, status, ...)"},
+                    "offset": {"type": "integer", "description": "Skip this many rows"},
                     "limit": {"type": "integer", "description": "Max rows"}
                 }
             }),
@@ -1677,6 +1715,16 @@ const PROJECT_FREE: &[&str] = &[
     "project_delete",
 ];
 
+/// Инструменты, которым разрешено больше параметров, чем общий предел, — с причиной.
+///
+/// Предел существует ради бюджета схемы, а не ради симметрии: каждый параметр стоит токенов в
+/// КАЖДОМ сеансе. Но у `node_list` это единственный способ спросить список, и разнести его
+/// фильтры по двум инструментам стоило бы дороже (второй тул целиком: имя, описание, схема),
+/// чем пять параметров в уже существующем. Предел поднят адресно — одному инструменту, а не
+/// всем: общий потолок, поднятый ради одного, перестаёт сдерживать остальные.
+#[cfg(test)]
+const WIDER_THAN_USUAL: &[(&str, usize)] = &[("node_list", 10)];
+
 fn tool(name: &str, description: &str, mut schema: Value, hints: (bool, bool, bool)) -> Value {
     let (read_only, destructive, idempotent) = hints;
     // `project` объявлен у КАЖДОГО инструмента, работающего внутри проекта: аргумент
@@ -1742,7 +1790,12 @@ mod tests {
                 .keys()
                 .filter(|key| key.as_str() != "project")
                 .count();
-            assert!(own <= 8, "{name}: {own} параметров");
+            let ceiling = WIDER_THAN_USUAL
+                .iter()
+                .find(|(wide, _)| *wide == *name)
+                .map(|(_, allowed)| *allowed)
+                .unwrap_or(8);
+            assert!(own <= ceiling, "{name}: {own} параметров, предел {ceiling}");
             // Контракт селектора: он объявлен у всех, кто живёт внутри проекта, и отсутствует
             // у инструментов уровня базы. Иначе агент снова не узнает о возможности.
             assert_eq!(
