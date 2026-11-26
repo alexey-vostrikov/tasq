@@ -132,24 +132,22 @@ impl Status {
             Status::Deferred,
             Status::Done,
             Status::Cancelled,
-            Status::Incomplete,
         ]
     }
 
-    /// Закрыт ли узел: работа по нему прекращена (справочник `statuses.terminal`).
+    /// Закрыт ли узел: работа по нему прекращена.
     ///
-    /// Закрытость и выполненность — разные вопросы, и до v11 они были одним: закрытым считалось
-    /// `done` или `cancelled`, а «засчитать как сделанное» не спрашивал никто. С появлением
-    /// `incomplete` это перестало работать: он закрыт, но не выполнен.
+    /// Закрытость и выполненность — разные вопросы. Закрытыми считаются `done`, `cancelled` и
+    /// вычисляемый `incomplete`; выполненным — только `done`. Разделение нужно отчётам: эпик,
+    /// закрытый с открытыми задачами, не должен считаться сделанным.
     pub fn is_terminal(self) -> bool {
         matches!(self, Status::Done | Status::Cancelled | Status::Incomplete)
     }
 
-    /// Засчитывается ли узел как выполненный (справочник `statuses.counts_done`).
+    /// Засчитывается ли узел как выполненный.
     ///
-    /// Только `done`: `cancelled` и `incomplete` — исходы закрытия без выполненной работы.
-    /// По этому признаку считается прогресс и строится burn-up, иначе эпик, прекращённый с
-    /// четырьмя открытыми задачами, показывал бы 100 %.
+    /// Только `done`: `cancelled` — отказ от работы, `incomplete` — работа прекращена недоделанной.
+    /// По этому признаку считается прогресс и строится burn-up.
     pub fn counts_as_done(self) -> bool {
         self == Status::Done
     }
@@ -162,33 +160,26 @@ impl Status {
             // (`backlog`, `planned`, `todo`) и из отложенного — то есть из любого состояния
             // ДО начала работы, но не из закрытого.
             Idea => &[Backlog, Planned, Todo, Deferred],
-            Backlog => &[
-                Idea, Planned, Todo, InProgress, Blocked, Review, Deferred, Incomplete,
-            ],
-            Planned => &[Idea, Backlog, Deferred, Incomplete],
+            Backlog => &[Idea, Planned, Todo, InProgress, Blocked, Review, Deferred],
+            Planned => &[Idea, Backlog, Deferred],
             Todo => &[
-                Idea, Backlog, InProgress, Blocked, Deferred, Done, Cancelled, Incomplete,
+                Idea, Backlog, InProgress, Blocked, Deferred, Done, Cancelled,
             ],
-            InProgress => &[
-                Idea, Backlog, Planned, Todo, Review, Blocked, Done, Incomplete,
-            ],
+            InProgress => &[Idea, Backlog, Planned, Todo, Review, Blocked, Done],
             Blocked => &[Idea, Backlog, Planned, Todo, InProgress, Review],
-            Review => &[InProgress, Incomplete],
-            // `incomplete` здесь — не реоткрытие: узел закрыт, и его можно довести до `done`,
-            // когда хвосты убраны. Это единственный «прямой» путь из закрытого в выполненное,
-            // и он не требует `--force`: человек не отменяет решение, а доводит его.
-            Done => &[InProgress, Review, Incomplete],
+            Review => &[InProgress],
+            // `planned → done`: эпик, который так и не взяли в работу, всё равно можно закрыть —
+            // задачи под ним могли сделать другие ветви, или работа оказалась не нужна. Без
+            // этого перехода закрыть эпик из `planned` нельзя вовсе, а «недоведённость» —
+            // вычисляемое состояние, а не отдельная запись, которую можно было бы поставить.
+            Done => &[InProgress, Review, Planned],
             Cancelled => &[
-                Idea, Backlog, Planned, Todo, InProgress, Review, Blocked, Deferred, Incomplete,
+                Idea, Backlog, Planned, Todo, InProgress, Review, Blocked, Deferred,
             ],
             Deferred => &[Idea, Backlog, Planned, Todo, InProgress],
-            // Закрыть с хвостами можно из любого состояния, в котором работа уже начата (или
-            // признано, что её не будет): из очереди `todo`, из `planned` (эпик, до которого
-            // руки не дошли) и из работы. Из `idea` — только с `--force`: там ещё ничего не
-            // решено, и `incomplete` был бы преждевременным итогом.
-            Incomplete => &[
-                Backlog, Planned, Todo, InProgress, Review, Blocked, Deferred,
-            ],
+            // `Incomplete` в матрице пуст намеренно: он никогда не хранится и не является
+            // целью перехода. Это вычисляемое состояние «закрыт, но под ним есть незакрытые».
+            Incomplete => &[],
         }
     }
 
@@ -363,7 +354,8 @@ mod tests {
         assert!(Status::can_transition(Todo, Idea, Kind::Task));
         // запрещено
         assert!(!Status::can_transition(Todo, Review, Kind::Task));
-        assert!(!Status::can_transition(Planned, Done, Kind::Epic));
+        // planned -> done разрешено эпику: закрыть так и не начатый эпик — законное решение
+        assert!(Status::can_transition(Planned, Done, Kind::Epic));
         assert!(!Status::can_transition(Deferred, InProgress, Kind::Task));
         assert!(!Status::can_transition(Done, Cancelled, Kind::Task));
         assert!(!Status::can_transition(Idea, Done, Kind::Task));
@@ -400,7 +392,7 @@ mod tests {
             );
             seen.push(status.as_str());
         }
-        assert_eq!(seen.len(), 11, "добавили статус — добавьте его в all()");
+        assert_eq!(seen.len(), 10, "добавили статус — добавьте его в all()");
     }
 
     /// `deferred` — вход из любого состояния ДО начала работы и из `in_progress`, выход в
@@ -459,8 +451,11 @@ mod tests {
         assert!(check_transition(Status::Done, Status::Todo, Kind::Task, true).is_ok());
     }
 
-    /// `incomplete` — третий исход закрытия: закрыт, но не выполнен. Оба признака проверяются
-    /// здесь, потому что на них держится всё остальное: прогресс, burn-up, списки.
+    /// `incomplete` — вычисляемое состояние: закрыт, но не выполнен.
+    ///
+    /// В справочнике его нет и в матрице он целью не является: хранится только решение (`done`),
+    /// а «недоведённость» выводится из состояния детей. Поэтому проверяются здесь ровно две
+    /// вещи, на которых держится вывод: он закрыт и он не выполнен.
     #[test]
     fn incomplete_is_closed_but_not_done() {
         assert!(Status::Incomplete.is_terminal(), "закрыт");
@@ -470,37 +465,22 @@ mod tests {
         assert!(!Status::Todo.is_terminal() && !Status::Todo.counts_as_done());
     }
 
-    /// Из недоведённого эпика можно вернуться в работу без `--force`: смысл статуса в том, что
-    /// решение уже принято и признано неполным, а не в том, чтобы наказывать за честность.
+    /// Вычисляемого статуса нет в списке хранимых: разойдись они — справочник статусов получил бы
+    /// строку, которую код не пишет, или наоборот.
     #[test]
-    fn incomplete_reopens_without_force() {
-        use Status::*;
-        assert!(check_transition(Incomplete, Todo, Kind::Task, false).is_ok());
-        assert!(check_transition(Incomplete, InProgress, Kind::Task, false).is_ok());
-        assert!(check_transition(Incomplete, Planned, Kind::Epic, false).is_ok());
-        // Довести до `done`, когда хвосты убраны, — тоже без флага.
-        assert!(check_transition(Incomplete, Done, Kind::Epic, false).is_ok());
-        assert!(!Status::requires_force(Incomplete, Todo));
-        assert!(!Status::requires_force(Incomplete, InProgress));
-    }
-
-    /// Закрыть с хвостами можно из очереди и из работы, но не из `idea`: там ещё ничего не
-    /// решено, и `incomplete` был бы преждевременным итогом.
-    #[test]
-    fn incomplete_is_reachable_from_queue_and_work_only() {
-        use Status::*;
-        for from in [
-            Backlog, Planned, Todo, InProgress, Review, Blocked, Deferred,
-        ] {
+    fn incomplete_is_not_a_storable_status() {
+        assert!(
+            !Status::all().contains(&Status::Incomplete),
+            "incomplete не хранится, значит его нет в all()"
+        );
+        // Разбор нужен для чтения: `effective_status` приходит строкой из вычисления.
+        assert_eq!(Status::parse("incomplete"), Some(Status::Incomplete));
+        // Ни из одного статуса перейти в него нельзя: это не решение, а вывод.
+        for from in Status::all() {
             assert!(
-                Status::can_transition(from, Incomplete, Kind::Epic)
-                    || Status::can_transition(from, Incomplete, Kind::Task),
-                "{from:?} -> incomplete должно быть разрешено хотя бы одному виду"
+                !Status::can_transition(*from, Status::Incomplete, Kind::Epic),
+                "{from:?} -> incomplete не должен быть переходом"
             );
         }
-        assert!(!Status::can_transition(Idea, Incomplete, Kind::Epic));
-        assert!(!Status::can_transition(Idea, Incomplete, Kind::Task));
-        // Обратно в идею из недоведённого не возвращают: это уже не сырая мысль.
-        assert!(!Status::can_transition(Incomplete, Idea, Kind::Task));
     }
 }

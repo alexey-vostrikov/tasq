@@ -102,41 +102,38 @@ fn the_status_registry_matches_the_code() {
     let (conn, _dir, _path) = migrated("registry");
 
     let mut stmt = conn
-        .prepare("SELECT name, rank, terminal, counts_done FROM statuses ORDER BY rank")
+        .prepare("SELECT name, rank, terminal FROM statuses ORDER BY rank")
         .expect("prepare");
-    let rows: Vec<(String, i64, i64, i64)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("query")
         .collect::<Result<Vec<_>, _>>()
         .expect("rows");
 
     let code: Vec<&str> = Status::all().iter().map(|status| status.as_str()).collect();
-    let registry: Vec<&str> = rows.iter().map(|(name, _, _, _)| name.as_str()).collect();
+    let registry: Vec<&str> = rows.iter().map(|(name, _, _)| name.as_str()).collect();
     assert_eq!(
         registry, code,
         "справочник и Status::all() разошлись по составу и порядку"
     );
 
-    for (index, (name, rank, terminal, counts_done)) in rows.iter().enumerate() {
+    for (index, (name, rank, terminal)) in rows.iter().enumerate() {
         assert_eq!(
             *rank,
             index as i64 + 1,
             "{name}: rank должен идти подряд с единицы"
         );
         let parsed = Status::parse(name).expect("статус из справочника обязан быть в коде");
-        // Закрытость и выполненность — два разных вопроса, и оба живут в справочнике: код
-        // обязан читать их оттуда, а не держать свой список. Тест держит связь.
+        // Закрытость живёт в справочнике — код читает её оттуда, а не держит свой список.
+        // `incomplete` в справочнике нет вовсе: он вычисляется из состояния детей.
         assert_eq!(
             *terminal,
             i64::from(parsed.is_terminal()),
             "{name}: terminal означает «работа по узлу прекращена»"
         );
-        assert_eq!(
-            *counts_done,
-            i64::from(parsed.counts_as_done()),
-            "{name}: counts_done означает «работа сделана»"
+        assert!(
+            !matches!(parsed, Status::Incomplete),
+            "{name}: вычисляемое состояние не может быть в справочнике"
         );
     }
 

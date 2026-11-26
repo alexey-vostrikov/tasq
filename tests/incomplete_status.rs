@@ -1,12 +1,15 @@
-//! Закрытие с хвостами: `incomplete` — закрыт, но не выполнен (схема v11).
+//! `incomplete` — вычисляемое состояние, а не запись в базе.
 //!
-//! Проверяется поведение, а не поле: эпик с открытыми задачами закрывается без отказа и без
-//! ложного `done`; он остаётся видимым там, где видно закрытое, и не считается выполненным в
-//! прогрессе. `--force` по-прежнему пишет именно `done` — это осознанное «я знаю, что это ложь».
+//! Хранится только решение: узел закрыт — `done`. «Недоведённость» выводится из состояния
+//! детей, поэтому она не может разойтись с фактом: закрыли эпик с открытыми задачами — видно
+//! `incomplete`; доделали последнюю — эпик сам становится `done`; открыли новую — снова
+//! `incomplete`. Ни одной команды «перевести» для этого не нужно, и схемы это не касается.
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+
+use serde_json::Value;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_tasq")
@@ -35,194 +38,217 @@ fn run(dir: &std::path::Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// Эпик с двумя детьми: один в `todo` (открыт), второй закрыт как `done`.
-///
-/// Эпик переводится в `in_progress` через захват, чтобы переход в закрытое состояние был
-/// допустим матрицей, а не требовал `--force`.
+fn show(dir: &std::path::Path, reference: &str) -> Value {
+    let (code, stdout, stderr) = run(dir, &["show", reference, "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    serde_json::from_str(&stdout).expect("json")
+}
+
+/// Доводит задачу до `done` обычным путём: очередь, аренда, завершение.
+fn finish(dir: &std::path::Path, reference: &str) {
+    assert_eq!(run(dir, &["set", reference, "--status", "backlog"]).0, 0);
+    let (code, claim, stderr) = run(dir, &["claim", reference, "--holder", "t", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let lease: Value = serde_json::from_str(&claim).expect("json");
+    let token = lease["token"].as_str().expect("token").to_string();
+    assert_eq!(
+        run(dir, &["release", &token, "--outcome", "completed"]).0,
+        0
+    );
+}
+
+/// Переводит узел в `planned` обычным путём: из `idea` матрица закрывать не даёт.
+fn plan(dir: &std::path::Path, reference: &str) {
+    assert_eq!(run(dir, &["set", reference, "--status", "backlog"]).0, 0);
+    assert_eq!(run(dir, &["set", reference, "--status", "planned"]).0, 0);
+}
+
+/// Эпик в `planned` с одним открытым и одним закрытым ребёнком.
 fn seeded(tag: &str) -> PathBuf {
     let dir = temp_dir(tag);
     assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
     assert_eq!(run(&dir, &["add", "Эпик"]).0, 0);
     assert_eq!(run(&dir, &["add", "Открытая", "--parent", "TASQ-1"]).0, 0);
     assert_eq!(run(&dir, &["add", "Закрытая", "--parent", "TASQ-1"]).0, 0);
-
-    // TASQ-1.1 остаётся открытой (idea), TASQ-1.2 доводится до done через аренду.
-    for step in [
-        vec!["set", "TASQ-1.2", "--status", "backlog"],
-        vec!["set", "TASQ-1.2", "--status", "todo"],
-    ] {
-        assert_eq!(run(&dir, &step).0, 0);
-    }
-    let (code, claim, stderr) = run(&dir, &["claim", "TASQ-1.2", "--holder", "t", "--json"]);
-    assert_eq!(code, 0, "{stderr}");
-    let token = claim
-        .lines()
-        .find_map(|line| line.split("\"token\": \"").nth(1))
-        .and_then(|rest| rest.split('"').next())
-        .expect("token")
-        .to_string();
-    assert_eq!(
-        run(&dir, &["release", &token, "--outcome", "completed"]).0,
-        0
-    );
-
-    // Эпик — в работу, чтобы закрытие шло по матрице (in_progress -> done/cancelled разрешены).
-    assert_eq!(run(&dir, &["claim", "TASQ-1", "--holder", "t"]).0, 0);
+    finish(&dir, "TASQ-1.2");
+    plan(&dir, "TASQ-1");
     dir
 }
 
+/// Главное свойство: закрытие с хвостами хранится как `done`, а читается как `incomplete`.
 #[test]
-fn closing_with_open_children_gives_incomplete_not_done() {
+fn closing_with_open_children_stores_done_and_reads_incomplete() {
     let dir = seeded("close");
-
     let (code, stdout, stderr) = run(&dir, &["set", "TASQ-1", "--status", "done", "--json"]);
     assert_eq!(code, 0, "отказа быть не должно: {stderr}");
-    let node: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    assert_eq!(
-        node["status"], "incomplete",
-        "эпик с открытыми задачами не может быть done"
-    );
-    assert_eq!(node["effective_status"], "incomplete");
+    let node: Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(node["status"], "done", "хранится решение, не вывод");
+    assert_eq!(node["effective_status"], "incomplete", "читается состояние");
 
     // Прогресс не 100 %: закрыто не значит выполнено.
-    let (code, stdout, stderr) = run(&dir, &["ls", "--parent", "TASQ-1", "--json"]);
-    assert_eq!(code, 0, "{stderr}");
-    let nodes: Vec<serde_json::Value> = serde_json::from_str(&stdout).expect("valid json");
-    let epic = nodes
-        .iter()
-        .find(|node| node["dot_id"] == "TASQ-1")
-        .expect("эпик в списке");
-    let done = epic["progress_done"].as_f64().expect("progress_done");
-    let total = epic["progress_total"].as_f64().expect("progress_total");
-    assert!(
-        done < total,
-        "эпик с открытым ребёнком показал {done}/{total} — это ложь"
+    let listed = show(&dir, "TASQ-1");
+    let done = listed["progress_done"].as_f64().expect("done");
+    let total = listed["progress_total"].as_f64().expect("total");
+    assert!(done < total, "эпик показал {done}/{total}");
+}
+
+/// Хвосты убрали — состояние меняется само, без команды.
+#[test]
+fn closing_the_last_child_makes_the_epic_done_by_itself() {
+    let dir = seeded("heal");
+    assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
+    assert_eq!(show(&dir, "TASQ-1")["effective_status"], "incomplete");
+
+    finish(&dir, "TASQ-1.1");
+
+    let node = show(&dir, "TASQ-1");
+    assert_eq!(node["status"], "done");
+    assert_eq!(
+        node["effective_status"], "done",
+        "хвостов нет — недоведённость должна исчезнуть сама"
     );
 }
 
+/// Открыли новую задачу под закрытым эпиком — он снова недоведён.
 #[test]
-fn no_done_still_shows_incomplete() {
+fn a_new_open_child_makes_the_epic_incomplete_again() {
+    let dir = temp_dir("again");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Эпик"]).0, 0);
+    plan(&dir, "TASQ-1");
+    assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
+    assert_eq!(
+        show(&dir, "TASQ-1")["effective_status"],
+        "done",
+        "пустой эпик выполнен"
+    );
+
+    assert_eq!(run(&dir, &["add", "Позже", "--parent", "TASQ-1"]).0, 0);
+    assert_eq!(
+        show(&dir, "TASQ-1")["effective_status"],
+        "incomplete",
+        "появился хвост — эпик снова недоведён"
+    );
+}
+
+/// Отменённая задача — законный исход, а не хвост: эпик с ней доведён.
+#[test]
+fn a_cancelled_child_does_not_make_the_epic_incomplete() {
+    let dir = temp_dir("cancelled");
+    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Эпик"]).0, 0);
+    assert_eq!(run(&dir, &["add", "Отменим", "--parent", "TASQ-1"]).0, 0);
+    assert_eq!(
+        run(&dir, &["set", "TASQ-1.1", "--status", "cancelled"]).0,
+        0
+    );
+    plan(&dir, "TASQ-1");
+    assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
+    assert_eq!(show(&dir, "TASQ-1")["effective_status"], "done");
+}
+
+/// `ls -n` (скрыть выполненное) не прячет недоведённое: это единственный сигнал о хвостах.
+#[test]
+fn no_done_keeps_incomplete_visible() {
     let dir = seeded("visible");
     assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
 
-    let (code, full, stderr) = run(&dir, &["ls"]);
-    assert_eq!(code, 0, "{stderr}");
-    assert!(full.contains("TASQ-1 "), "эпик виден:\n{full}");
-
-    let (code, short, stderr) = run(&dir, &["ls", "-n"]);
+    let (code, short, stderr) = run(&dir, &["ls", "-n", "--fields", "dot_id"]);
     assert_eq!(code, 0, "{stderr}");
     assert!(
         short.contains("TASQ-1 "),
-        "-n спрятал эпик с открытыми задачами — пропал сигнал о хвостах:\n{short}"
+        "-n спрятал эпик с открытыми задачами:\n{short}"
     );
-    // Закрытая задача под ним скрыта: `-n` гасит ровно `done`.
     assert!(
         !short.contains("TASQ-1.2"),
-        "-n должен скрывать закрытую задачу:\n{short}"
+        "-n должен скрывать выполненную задачу:\n{short}"
     );
 }
 
+/// Отбор по вычисляемому состоянию работает так же, как по хранимому.
 #[test]
-fn force_still_writes_done() {
-    let dir = seeded("force");
-    let (code, stdout, stderr) = run(
-        &dir,
-        &["set", "TASQ-1", "--status", "done", "--force", "--json"],
-    );
-    assert_eq!(code, 0, "{stderr}");
-    let node: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    assert_eq!(
-        node["status"], "done",
-        "--force означает «запиши done, я знаю, что остались хвосты»"
-    );
-}
-
-#[test]
-fn epic_without_open_children_closes_as_done() {
-    let dir = temp_dir("clean");
-    assert_eq!(run(&dir, &["init", "--key", "TASQ"]).0, 0);
-    assert_eq!(run(&dir, &["add", "Эпик"]).0, 0);
-    assert_eq!(run(&dir, &["claim", "TASQ-1", "--holder", "t"]).0, 0);
-
-    let (code, stdout, stderr) = run(&dir, &["set", "TASQ-1", "--status", "done", "--json"]);
-    assert_eq!(code, 0, "{stderr}");
-    let node: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    assert_eq!(node["status"], "done", "пустой эпик закрывается как done");
-}
-
-#[test]
-fn incomplete_reopens_without_force() {
-    let dir = seeded("reopen");
+fn status_filter_sees_the_derived_state() {
+    let dir = seeded("filter");
     assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
 
-    // Возврат в работу: «закрыто, но не закончено» открывается без флага.
-    let (code, stdout, stderr) = run(&dir, &["set", "TASQ-1", "--status", "planned", "--json"]);
-    assert_eq!(code, 0, "--force не должен требоваться: {stderr}");
-    let node: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    assert_eq!(node["status"], "planned");
+    let (code, stdout, stderr) = run(
+        &dir,
+        &[
+            "ls",
+            "--status",
+            "incomplete",
+            "--json",
+            "--fields",
+            "dot_id",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let rows: Vec<Value> = serde_json::from_str(&stdout).expect("json");
+    let ids: Vec<&str> = rows
+        .iter()
+        .map(|row| row["dot_id"].as_str().expect("dot_id"))
+        .collect();
+    assert_eq!(ids, vec!["TASQ-1"], "{stdout}");
 }
 
+/// Закрытый узел в работу не берётся — недоведённость закрытости не отменяет.
 #[test]
-fn closed_node_cannot_be_claimed() {
+fn a_closed_node_cannot_be_claimed() {
     let dir = seeded("claim");
     assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
 
     let (code, stdout, stderr) = run(&dir, &["claim", "TASQ-1", "--holder", "other", "--json"]);
     assert_ne!(code, 0, "закрытый узел не берут в работу: {stdout}");
-    assert!(
-        stderr.contains("NODE_CLOSED") || stdout.contains("NODE_CLOSED"),
-        "ожидался NODE_CLOSED: {stderr}"
-    );
+    let text = format!("{stdout}{stderr}");
+    assert!(text.contains("NODE_CLOSED"), "{text}");
 }
 
-/// Подсказка «хвостов нет — переведите в done»: пока дети открыты, её нет; когда последний
-/// ребёнок закрыт, `next` называет эпик. Автоперехода при этом не происходит.
+/// Доска подчиняется тем же двум переключателям, что и `ls`: `-n` прячет `done`, но не
+/// `incomplete`, `-a` добавляет архив. Проверяется на живой базе, а не на кадре: правило
+/// принадлежит доске, а не отрисовке.
 #[test]
-fn next_points_at_the_epic_once_the_leftovers_are_gone() {
-    let dir = seeded("closable");
+fn the_board_hides_done_but_keeps_incomplete() {
+    use tasq::db;
+    use tasq::overview::{BoardFilter, board_with};
+
+    let dir = seeded("board");
     assert_eq!(run(&dir, &["set", "TASQ-1", "--status", "done"]).0, 0);
 
-    let (code, before, stderr) = run(&dir, &["next"]);
-    assert_eq!(code, 0, "{stderr}");
-    assert!(
-        !before.contains("closed as incomplete"),
-        "подсказка не должна появляться при открытом ребёнке:\n{before}"
-    );
+    let path = dir.join(".tasq/tasq.db");
+    let conn = db::open(&path).expect("open");
+    let project = tasq::project::first_project(&conn).expect("project");
 
-    // Закрываем последнего открытого ребёнка обычным путём: очередь → аренда → done.
-    for step in [
-        vec!["set", "TASQ-1.1", "--status", "backlog"],
-        vec!["set", "TASQ-1.1", "--status", "todo"],
-    ] {
-        assert_eq!(run(&dir, &step).0, 0);
-    }
-    let (code, claim, stderr) = run(&dir, &["claim", "TASQ-1.1", "--holder", "t", "--json"]);
-    assert_eq!(code, 0, "{stderr}");
-    let token = claim
-        .lines()
-        .find_map(|line| line.split("\"token\": \"").nth(1))
-        .and_then(|rest| rest.split('"').next())
-        .expect("token")
-        .to_string();
+    let full = board_with(&conn, &project, BoardFilter::default()).expect("board");
+    let column = |board: &tasq::overview::Board, name: &str| {
+        board
+            .columns
+            .iter()
+            .find(|column| column.status == name)
+            .map(|column| column.count)
+            .unwrap_or(0)
+    };
     assert_eq!(
-        run(&dir, &["release", &token, "--outcome", "completed"]).0,
-        0
+        column(&full, "done"),
+        1,
+        "выполненная задача видна по умолчанию"
     );
+    assert_eq!(column(&full, "incomplete"), 1, "недоведённый эпик виден");
 
-    let (code, after, stderr) = run(&dir, &["next"]);
-    assert_eq!(code, 0, "{stderr}");
-    assert!(
-        after.contains("closed as incomplete"),
-        "подсказки нет, хотя хвостов не осталось:\n{after}"
+    let hidden = board_with(
+        &conn,
+        &project,
+        BoardFilter {
+            hide_done: true,
+            show_archived: false,
+        },
+    )
+    .expect("board");
+    assert_eq!(column(&hidden, "done"), 0, "-n не спрятал done");
+    assert_eq!(
+        column(&hidden, "incomplete"),
+        1,
+        "-n спрятал недоведённое — пропал сигнал о хвостах"
     );
-    assert!(
-        after.contains("TASQ-1 "),
-        "в подсказке нет самого эпика:\n{after}"
-    );
-
-    // Автоперехода нет: эпик по-прежнему `incomplete`, пока человек не решит иначе.
-    let (code, stdout, stderr) = run(&dir, &["show", "TASQ-1", "--json"]);
-    assert_eq!(code, 0, "{stderr}");
-    let node: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
-    assert_eq!(node["status"], "incomplete");
+    assert_eq!(hidden.incomplete, 1);
+    assert_eq!(hidden.done, 0, "счётчик done обязан следовать фильтру");
 }

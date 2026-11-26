@@ -188,29 +188,22 @@ fn set_status_leased(
     )
 }
 
-/// Закрытие с открытыми детьми: без `force` — `incomplete` (не отказ и не ложное `done`),
-/// с `force` — именно `done`.
+/// Закрытие с открытыми детьми: хранится `done`, читается `incomplete`, `--force` не нужен.
 #[test]
-fn children_guard_turns_done_into_incomplete_unless_forced() {
+fn children_with_leftovers_close_as_done_and_read_as_incomplete() {
     let (mut conn, project) = fixture("guard");
     let epic = add(&mut conn, &project, None, "Epic");
     let task = add(&mut conn, &project, Some(&epic.dot_id), "Task");
     add(&mut conn, &project, Some(&task.dot_id), "Sub");
 
-    // todo -> in_progress (право даёт аренда) -> review -> done: матрица пропускает,
-    // дети не закрыты — узел закрывается как `incomplete`
+    // todo -> in_progress (право даёт аренда) -> review -> done.
     set_status_leased(&mut conn, &project, &task.dot_id, Status::InProgress, false)
         .expect("claim-like transition");
     set_status(&mut conn, &project, &task.dot_id, Status::Review, false).expect("review");
-    let undendum = set_status(&mut conn, &project, &task.dot_id, Status::Done, false)
+    let closed = set_status(&mut conn, &project, &task.dot_id, Status::Done, false)
         .expect("закрытие с хвостами — не отказ");
-    assert_eq!(undendum.status, "incomplete");
-
-    // Открыть обратно — без флага: это «закрыто, но не закончено».
-    set_status(&mut conn, &project, &task.dot_id, Status::Review, false).expect("reopen");
-
-    let forced = set_status(&mut conn, &project, &task.dot_id, Status::Done, true).expect("forced");
-    assert_eq!(forced.status, "done");
+    assert_eq!(closed.status, "done");
+    assert_eq!(closed.effective_status, "incomplete");
 }
 
 #[test]

@@ -249,14 +249,31 @@ fn resolve_any(conn: &Connection, project: &Project, reference: &str) -> Result<
     node.ok_or_else(|| Error::NodeNotFound(reference.to_string()))
 }
 
+/// Разрешение ссылки с вычисленным состоянием: `incomplete` — вывод, а не запись.
+///
+/// Отдельная обёртка, а не правка `resolve`: пути записи обход дерева не нужен, а читатели
+/// (`show`, `ctx`, ответ `release`) обязаны видеть то же, что список.
+pub fn resolve_shown(
+    conn: &Connection,
+    project: &Project,
+    reference: &str,
+) -> Result<(Project, Node)> {
+    let (project, mut node) = resolve_with_project(conn, project, reference)?;
+    apply_derived_one(conn, &project, &mut node)?;
+    Ok((project, node))
+}
+
 fn load_by_id(conn: &Connection, project: &Project, id: i64) -> Result<Node> {
-    conn.query_row(
-        &format!("{NODE_SELECT} WHERE e.id = ?1 AND e.project_id = ?2"),
-        params![id, project.id],
-        |row| map_node(row, project),
-    )
-    .optional()?
-    .ok_or_else(|| Error::NodeNotFound(format!("#{id}")))
+    let mut node = conn
+        .query_row(
+            &format!("{NODE_SELECT} WHERE e.id = ?1 AND e.project_id = ?2"),
+            params![id, project.id],
+            |row| map_node(row, project),
+        )
+        .optional()?
+        .ok_or_else(|| Error::NodeNotFound(format!("#{id}")))?;
+    apply_derived_one(conn, project, &mut node)?;
+    Ok(node)
 }
 
 /// Заявка на создание узла.
@@ -442,15 +459,82 @@ struct Change {
     new: Option<String>,
 }
 
-fn unfinished_children(conn: &Connection, node_id: i64) -> Result<i64> {
-    // Закрытость — из справочника, а не литералом: `incomplete` и любой будущий терминальный
-    // статус считаются закрытыми автоматически.
+/// Сколько незакрытых узлов лежит ПОД каждым узлом проекта — одним обходом.
+///
+/// Нужен для вычисляемого `incomplete`: «закрыто, но не доведено» — это не запись в базе, а
+/// вывод из состояния детей. Считать его в SQL-представлении значило бы держать второй источник
+/// правды рядом с самим `nodes.status`; здесь же обход идёт один раз на выборку, а не на строку.
+///
+/// Считаются все потомки любого уровня: у закрытой задачи с открытой подзадачей эпик тоже
+/// недоведён. `cancelled` в счёт не идёт — это законный исход, а не хвост.
+pub fn unfinished_under(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<std::collections::HashMap<i64, i64>> {
     let sql = format!(
-        "SELECT COUNT(*) FROM nodes
-         WHERE parent_id = ?1 AND deleted_at IS NULL AND {}",
-        crate::status::not_terminal_sql("status")
+        "WITH RECURSIVE tree(ancestor_id, node_id, steps) AS (
+           SELECT id, id, 0 FROM nodes WHERE project_id = ?1 AND deleted_at IS NULL
+           UNION ALL
+           SELECT t.ancestor_id, n.id, t.steps + 1
+           FROM tree t JOIN nodes n ON n.parent_id = t.node_id
+           WHERE t.steps < {max}
+         )
+         SELECT t.ancestor_id,
+                SUM(CASE WHEN {} THEN 1 ELSE 0 END) AS unfinished
+         FROM tree t
+         JOIN nodes n ON n.id = t.node_id AND n.deleted_at IS NULL
+         GROUP BY t.ancestor_id",
+        crate::status::not_terminal_sql("n.status"),
+        max = MAX_DEPTH
     );
-    Ok(conn.query_row(&sql, params![node_id], |row| row.get(0))?)
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
+}
+
+/// Подменяет эффективный статус закрытого узла на `incomplete`, если под ним есть незакрытые.
+///
+/// Хранимый статус остаётся `done`: это решение человека. `incomplete` — то, что читатель видит
+/// про фактическое состояние, и он изменится сам, как только закроют последнюю задачу или
+/// откроют новую. Именно поэтому автоперехода «переведите в done» не существует: он не нужен.
+pub fn apply_derived_status(nodes: &mut [Node], unfinished: &std::collections::HashMap<i64, i64>) {
+    for node in nodes.iter_mut() {
+        if node.status == "done" && unfinished.get(&node.id).copied().unwrap_or(0) > 0 {
+            node.effective_status = "incomplete".to_string();
+        }
+    }
+}
+
+/// То же для одного узла: считает незакрытых потомков на месте.
+///
+/// Отдельная функция, а не общий путь со списком: `show` и `ctx` читают один узел, и строить
+/// карту по всему проекту ради него значило бы платить за весь проект одним запросом.
+fn apply_derived_one(conn: &Connection, project: &Project, node: &mut Node) -> Result<()> {
+    if node.status != "done" {
+        return Ok(());
+    }
+    let sql = format!(
+        "WITH RECURSIVE tree(node_id, steps) AS (
+           SELECT ?1, 0
+           UNION ALL
+           SELECT n.id, t.steps + 1
+           FROM tree t JOIN nodes n ON n.parent_id = t.node_id
+           WHERE t.steps < {max}
+         )
+         SELECT COUNT(*) FROM tree t
+         JOIN nodes n ON n.id = t.node_id
+         WHERE t.node_id <> ?1 AND n.deleted_at IS NULL AND {}",
+        crate::status::not_terminal_sql("n.status"),
+        max = MAX_DEPTH
+    );
+    let _ = project;
+    let unfinished: i64 = conn.query_row(&sql, params![node.id], |row| row.get(0))?;
+    if unfinished > 0 {
+        node.effective_status = "incomplete".to_string();
+    }
+    Ok(())
 }
 
 fn unfinished_blockers(conn: &Connection, node_id: i64) -> Result<Option<String>> {
@@ -509,7 +593,6 @@ pub fn update(
         return Err(Error::LeaseRequired);
     }
 
-    let mut patch = patch;
     if let Some(target) = patch.status {
         // Политика реоткрытия — из проекта, а не из кода: где-то `--force` обязателен,
         // где-то мешает. Матрица (куда можно) остаётся общей.
@@ -520,27 +603,18 @@ pub fn update(
             patch.force,
             project.reopen,
         )?;
-        if target == Status::Done && !patch.force {
-            let unfinished = unfinished_children(conn, node.id)?;
-            if unfinished > 0 {
-                // Не отказ и не ложное `done`: работа по узлу прекращена, но не доведена.
-                // Цель заменяется на `incomplete`, и замена проходит ту же проверку матрицы —
-                // из `idea`/`backlog` такой переход запрещён, и тогда остаётся прежний явный
-                // отказ с числом детей: там ещё ничего не решено.
-                if Status::can_transition(node.stored_status(), Status::Incomplete, node.kind()) {
-                    patch.status = Some(Status::Incomplete);
-                } else {
-                    return Err(Error::ChildrenUnfinished {
-                        dot_id: node.dot_id.clone(),
-                        unfinished,
-                    });
-                }
-            } else if let Some(blockers) = unfinished_blockers(conn, node.id)? {
-                return Err(Error::UnmetPrerequisites {
-                    dot_id: node.dot_id.clone(),
-                    blockers,
-                });
-            }
+        // Закрытие с открытыми детьми разрешено и НЕ требует `--force`: узел закрывается как
+        // `done`, а недоведённость покажет вычисленный `incomplete` — пока под ним есть
+        // незакрытые. Хранить вывод было бы вторым источником правды: закрыли эпик, открыли
+        // задачу — и запись разошлась бы с фактом.
+        if target == Status::Done
+            && let Some(blockers) = unfinished_blockers(conn, node.id)?
+            && !patch.force
+        {
+            return Err(Error::UnmetPrerequisites {
+                dot_id: node.dot_id.clone(),
+                blockers,
+            });
         }
     }
 
@@ -861,12 +935,9 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
         sql.push(')');
         values.push(Value::Integer(root.id));
     }
-    if let Some(status) = filter.status {
-        sql.push_str(" AND e.effective_status = ?");
-        values.push(Value::Text(status.to_string()));
-    } else if filter.exclude_done {
-        sql.push_str(" AND e.effective_status <> 'done'");
-    }
+    // `status` и `exclude_done` НЕ переносятся в SQL: `incomplete` вычисляется в коде, и
+    // представление о нём не знает. Отбор идёт ниже, после `apply_derived_status`, — иначе
+    // `ls --status incomplete` молча вернул бы пустоту, а `ls -n` спрятал бы недоведённое.
     if let Some(assignee) = filter.assignee {
         sql.push_str(" AND e.assigned_to = ?");
         values.push(Value::Text(assignee.to_string()));
@@ -886,6 +957,14 @@ pub fn list(conn: &Connection, project: &Project, filter: &Filter<'_>) -> Result
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     nodes.sort_by_key(|node| path_sort_key(&node.path));
+    // Вычисляемый `incomplete` ставится до отбора и обрезки: отбор по нему — часть контракта.
+    let unfinished = unfinished_under(conn, project.id)?;
+    apply_derived_status(&mut nodes, &unfinished);
+    if let Some(status) = filter.status {
+        nodes.retain(|node| node.effective_status == status);
+    } else if filter.exclude_done {
+        nodes.retain(|node| node.effective_status != "done");
+    }
     if let Some(offset) = filter.offset {
         let skip = offset.max(0) as usize;
         if skip >= nodes.len() {
@@ -929,12 +1008,9 @@ pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
     if !filter.include_archived {
         sql.push_str(" AND e.archived_at IS NULL");
     }
-    if let Some(status) = filter.status {
-        sql.push_str(" AND e.effective_status = ?");
-        values.push(Value::Text(status.to_string()));
-    } else if filter.exclude_done {
-        sql.push_str(" AND e.effective_status <> 'done'");
-    }
+    // `status` и `exclude_done` НЕ переносятся в SQL: `incomplete` вычисляется в коде, и
+    // представление о нём не знает. Отбор идёт ниже, после `apply_derived_status`, — иначе
+    // `ls --status incomplete` молча вернул бы пустоту, а `ls -n` спрятал бы недоведённое.
     if let Some(assignee) = filter.assignee {
         sql.push_str(" AND e.assigned_to = ?");
         values.push(Value::Text(assignee.to_string()));
@@ -980,6 +1056,29 @@ pub fn list_all(conn: &Connection, filter: &Filter<'_>) -> Result<Vec<Node>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // Порядок уже задан SQL (проект, затем путь); сортировка в коде не нужна.
+    //
+    // Вычисляемый `incomplete` — до отбора и обрезки, по карте на каждый проект из ответа:
+    // отбор по этому состоянию (`ls --status incomplete`, `ls -n`) должен видеть его, а не
+    // только хранимые статусы.
+    let mut projects: Vec<i64> = nodes.iter().map(|node| node.project_id).collect();
+    projects.sort_unstable();
+    projects.dedup();
+    for project_id in &projects {
+        let unfinished = unfinished_under(conn, *project_id)?;
+        for node in nodes
+            .iter_mut()
+            .filter(|node| node.project_id == *project_id)
+        {
+            if node.status == "done" && unfinished.get(&node.id).copied().unwrap_or(0) > 0 {
+                node.effective_status = "incomplete".to_string();
+            }
+        }
+    }
+    if let Some(status) = filter.status {
+        nodes.retain(|node| node.effective_status == status);
+    } else if filter.exclude_done {
+        nodes.retain(|node| node.effective_status != "done");
+    }
     if let Some(offset) = filter.offset {
         let skip = offset.max(0) as usize;
         if skip >= nodes.len() {

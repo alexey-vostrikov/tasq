@@ -286,12 +286,12 @@ fn release_outcomes_drive_the_node_status() {
     assert_eq!(err.code(), "NOT_YOUR_ATTEMPT");
 }
 
-/// Сдача работы с открытыми детьми: без `force` — `incomplete`, с `force` — `done`.
+/// Сдача работы с открытыми детьми: хранится `done`, а читается `incomplete`.
 ///
-/// Отказа здесь быть не должно: раньше это был `CHILDREN_UNFINISHED`, и человек, решивший
-/// прекратить работу, не мог закрыть узел вовсе, а `--force` писал ложное `done`.
+/// Отказа нет намеренно: человек вправе закрыть узел, под которым остались задачи, и это
+/// решение не ложь — недоведённость видна читателю как вычисленный статус.
 #[test]
-fn completing_with_open_children_gives_incomplete_and_force_gives_done() {
+fn completing_with_open_children_stores_done_and_reads_incomplete() {
     let (_dir, mut conn, project, task) = fixture("children");
     node::create(
         &mut conn,
@@ -312,7 +312,7 @@ fn completing_with_open_children_gives_incomplete_and_force_gives_done() {
     .expect("subtask");
 
     let lease = claim(&mut conn, &project, &task.dot_id, "agent").expect("claim");
-    let undendum = lease::release(
+    let closed = lease::release(
         &mut conn,
         &project,
         &lease.token,
@@ -321,39 +321,8 @@ fn completing_with_open_children_gives_incomplete_and_force_gives_done() {
         false,
     )
     .expect("сдача с хвостами — не отказ");
-    assert_eq!(undendum.status, "incomplete");
-    assert_eq!(undendum.effective_status, "incomplete");
-
-    // Вторая попытка: узел уже закрыт, поэтому `--force` проверяется на свежем узле.
-    let (_dir2, mut conn, project, task) = fixture("children-force");
-    node::create(
-        &mut conn,
-        &project,
-        NewNode {
-            parent: Some(&task.dot_id),
-            title: "Sub",
-            kind: None,
-            description: None,
-            priority: None,
-            due_date: None,
-            estimated_hours: None,
-            weight: None,
-            source_ref: None,
-            branch: None,
-        },
-    )
-    .expect("subtask");
-    let lease = claim(&mut conn, &project, &task.dot_id, "agent").expect("claim");
-    let node = lease::release(
-        &mut conn,
-        &project,
-        &lease.token,
-        Outcome::Completed,
-        None,
-        true,
-    )
-    .expect("forced completion");
-    assert_eq!(node.status, "done");
+    assert_eq!(closed.status, "done");
+    assert_eq!(closed.effective_status, "incomplete");
 }
 
 #[test]

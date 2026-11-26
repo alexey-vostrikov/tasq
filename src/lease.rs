@@ -603,30 +603,19 @@ pub fn release(
         .unwrap_or_else(|| attempt.dot_id.clone());
     let node = node::resolve(conn, project, &format!("#{}", attempt.node_id))
         .or_else(|_| node::resolve(conn, project, &key))?;
-    let mut target = match outcome {
+    let target = match outcome {
         Outcome::Completed => crate::status::Status::Done,
         Outcome::Released | Outcome::Failed => crate::status::Status::Todo,
     };
-    if outcome == Outcome::Completed && node.stored_status() != crate::status::Status::Done {
-        let sql = format!(
-            "SELECT COUNT(*) FROM nodes
-             WHERE parent_id = ?1 AND deleted_at IS NULL AND {}",
-            crate::status::not_terminal_sql("status")
-        );
-        let unfinished: i64 = conn.query_row(&sql, params![node.id], |row| row.get(0))?;
-        if unfinished > 0 && !force {
-            // Работа сдана с хвостами: исход `completed` не делает узел выполненным.
-            target = crate::status::Status::Incomplete;
-        }
-        if let Some(paths) = blockers(conn, node.id)?
-            && !force
-            && target == crate::status::Status::Done
-        {
-            return Err(Error::UnmetPrerequisites {
-                dot_id: node.dot_id.clone(),
-                blockers: paths,
-            });
-        }
+    if outcome == Outcome::Completed
+        && node.stored_status() != crate::status::Status::Done
+        && let Some(paths) = blockers(conn, node.id)?
+        && !force
+    {
+        return Err(Error::UnmetPrerequisites {
+            dot_id: node.dot_id.clone(),
+            blockers: paths,
+        });
     }
 
     let tx = db::write_tx(conn)?;
@@ -674,7 +663,9 @@ pub fn release(
         },
     )?;
     tx.commit()?;
-    node::resolve(conn, project, &format!("#{}", node.id))
+    // Ответ читается как снимок состояния: под закрытым узлом могли остаться задачи, и
+    // `effective_status` обязан это показать.
+    node::resolve_shown(conn, project, &format!("#{}", node.id)).map(|(_, node)| node)
 }
 
 /// Закрывает просроченные попытки и снимает их резервы (README §8.3).

@@ -254,7 +254,7 @@ pub struct ContextEntry {
 /// Агент получает «зачем» от эпика и «что именно» от своего уровня в одном ответе —
 /// ровно то, ради чего заведён dot-notation.
 pub fn context(conn: &Connection, project: &Project, reference: &str) -> Result<Vec<ContextEntry>> {
-    let node = node::resolve(conn, project, reference)?;
+    let (_, node) = node::resolve_shown(conn, project, reference)?;
     let mut chain = Vec::new();
     let mut current = Some(node);
     while let Some(item) = current {
@@ -322,12 +322,30 @@ pub struct Board {
     pub incomplete: usize,
 }
 
+/// Что доска показывает: те же два переключателя, что у `ls -n` и `ls -a`.
+///
+/// Один тип на экран и на CLI, чтобы «скрыть выполненное» означало одно и то же в обоих местах:
+/// правило «`incomplete` виден там, где `done` скрыт» нарушилось бы ровно на расхождении фильтров.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoardFilter {
+    /// Скрыть выполненное (`ls -n`). Закрытое с хвостами (`incomplete`) при этом остаётся:
+    /// это единственный сигнал, что под узлом есть незакрытые задачи.
+    pub hide_done: bool,
+    /// Показать архив (`ls -a`).
+    pub show_archived: bool,
+}
+
 pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
+    board_with(conn, project, BoardFilter::default())
+}
+
+pub fn board_with(conn: &Connection, project: &Project, filter: BoardFilter) -> Result<Board> {
     let nodes = node::list(
         conn,
         project,
         &Filter {
-            include_archived: false,
+            include_archived: filter.show_archived,
+            exclude_done: filter.hide_done,
             ..Filter::default()
         },
     )?;
@@ -344,6 +362,14 @@ pub fn board(conn: &Connection, project: &Project) -> Result<Board> {
             rows: Vec::new(),
         })
         .collect();
+    // `incomplete` — вычисляемое состояние, в справочнике его нет, поэтому и в `Status::all()`.
+    // Колонка добавляется здесь, а не в списке статусов: иначе его пришлось бы держать в
+    // справочнике базы, то есть снова хранить вывод.
+    columns.push(BoardColumn {
+        status: "incomplete".to_string(),
+        count: 0,
+        rows: Vec::new(),
+    });
 
     let mut overdue = 0;
     let mut leased = 0;
@@ -522,7 +548,7 @@ pub fn time_report(
     // Отбор поддерева — по id: обход структуры вместо скана по `path GLOB` (см. `crate::tree`).
     let subtree_id = match reference {
         Some(reference) => {
-            let node = node::resolve(conn, project, reference)?;
+            let (_, node) = node::resolve_shown(conn, project, reference)?;
             Some(node.id)
         }
         None => None,
