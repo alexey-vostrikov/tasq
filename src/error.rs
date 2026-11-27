@@ -22,6 +22,15 @@ pub enum Error {
     #[error("database schema version {found} is newer than supported {supported}")]
     SchemaTooNew { found: i64, supported: i64 },
 
+    /// База старой схемы: открытие её не обновляет, это отдельное решение человека.
+    ///
+    /// Отдельный код, потому что действие здесь одно и его надо назвать: `tasq migrate`.
+    /// Пока открытие мигрировало само, любая волна команд на обновлённом бинаре и старом файле
+    /// превращалась в борьбу за блокировку записи — сто читателей теряли треть вызовов на
+    /// «database is locked», хотя собирались только читать (TASQDEV-19).
+    #[error("database schema v{found} is older than supported v{supported}")]
+    SchemaOutdated { found: i64, supported: i64 },
+
     /// База старой схемы, а миграцию прямо сейчас выполняет другая команда.
     ///
     /// Отдельная ошибка, а не общий `STORAGE_ERROR`: «база занята» не говорит, что делать, и
@@ -239,6 +248,7 @@ impl Error {
             Error::NoProject => "NO_PROJECT",
             Error::ProjectRequired { .. } => "PROJECT_REQUIRED",
             Error::SchemaTooNew { .. } => "SCHEMA_TOO_NEW",
+            Error::SchemaOutdated { .. } => "SCHEMA_OUTDATED",
             Error::MigrationBusy { .. } => "MIGRATION_BUSY",
             Error::DuplicateKey(_) => "DUPLICATE_KEY",
             Error::ProjectNotFound { .. } => "PROJECT_NOT_FOUND",
@@ -299,6 +309,9 @@ impl Error {
                  project_select or the `project` argument in MCP; `tasq list projects` lists the keys"
             }
             Error::SchemaTooNew { .. } => "upgrade the tasq binary; downgrades are not supported",
+            Error::SchemaOutdated { .. } => {
+                "run `tasq migrate`: opening a database never rewrites its schema"
+            }
             Error::MigrationBusy { .. } => {
                 "retry in a moment: the migration runs once and takes milliseconds"
             }

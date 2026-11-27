@@ -48,17 +48,27 @@ fn version_of(path: &Path) -> i64 {
     db::schema_version_of(&conn).expect("версия")
 }
 
-/// Волна команд на базе старой схемы: миграцию делает кто-то один, остальные не падают.
+/// Волна команд на базе старой схемы: все отказывают одинаково и ничего не пишут.
 ///
-/// Замер до правки на этой же волне: 12 процессов, 2 отказа через «database is locked» —
-/// устойчиво, в трёх кругах подряд. Ради этого числа волна и оставлена маленькой: тест должен
-/// краснеть на регрессии, а не ждать сотню процессов.
+/// Это проверка главной гарантии TASQDEV-20.2: открытие не обновляет схему. Раньше здесь
+/// проверялось обратное — что волна мигрирует ровно один раз и никто не падает на «база
+/// занята». Оба требования несовместимы: авто-миграция при открытии и есть та запись, за
+/// которую волна борется. Выбрано «не писать»: обновление — решение, у него своя команда.
+///
+/// Замер до правки на этой же волне: 12 процессов, 2 отказа через «database is locked»,
+/// три круга подряд. После: 12 отказов `SCHEMA_OUTDATED`, файл базы не изменён.
 #[test]
-fn a_wave_on_a_stale_schema_migrates_once_and_nobody_fails() {
+fn a_wave_on_a_stale_schema_refuses_and_writes_nothing() {
     let dir = temp_dir("wave");
     let outcome = db::init(&dir, "WAVE", "волна").expect("init");
     let path = PathBuf::from(&outcome.db_path);
     roll_back_to_v10(&path);
+
+    // Размер файла и журнала до волны: любая запись их изменит или создаст `-wal`.
+    let before = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let wal_before = fs::metadata(format!("{}-wal", path.display()))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
 
     let mut children = Vec::new();
     for _ in 0..12 {
@@ -71,39 +81,45 @@ fn a_wave_on_a_stale_schema_migrates_once_and_nobody_fails() {
         );
     }
 
-    let failures: Vec<String> = children
-        .iter()
-        .filter(|out| !out.status.success())
-        .map(|out| {
-            format!(
-                "код {:?}: {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )
-        })
-        .collect();
-    assert!(
-        failures.is_empty(),
-        "волна команд на старой схеме потеряла {} из 12:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+    let mut codes = Vec::new();
+    for out in &children {
+        assert!(
+            !out.status.success(),
+            "команда на старой схеме обязана отказать, а не работать"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("SCHEMA_OUTDATED"),
+            "ожидался отказ с кодом SCHEMA_OUTDATED, получено: {stderr}"
+        );
+        assert!(
+            stderr.contains("tasq migrate"),
+            "отказ обязан называть команду: {stderr}"
+        );
+        codes.push(stderr);
+    }
 
     assert_eq!(
         version_of(&path),
-        db::SUPPORTED_SCHEMA_VERSION,
-        "схема не поднялась"
+        10,
+        "волна подняла схему — значит кто-то всё-таки писал"
     );
-    // Индекс комментариев — свидетельство того, что миграция не «отметилась версией», а прошла.
-    let conn = db::open(&path).expect("open");
-    let index: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'comments_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("поиск индекса");
-    assert_eq!(index, 1, "миграция не создала индекс комментариев");
+    let after = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let wal_after = fs::metadata(format!("{}-wal", path.display()))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    assert_eq!(before, after, "размер базы изменился — открытие писало");
+    assert_eq!(wal_before, wal_after, "появился журнал — открытие писало");
+
+    // Отказов «занято» быть не должно вовсе: никто не просил запись.
+    let busy = codes
+        .iter()
+        .filter(|text| text.contains("database is locked") || text.contains("MIGRATION_BUSY"))
+        .count();
+    assert_eq!(
+        busy, 0,
+        "{busy} команд упёрлись в блокировку вместо отказа по схеме"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -140,25 +156,30 @@ fn a_reading_connection_cannot_write() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Читающей команде на старой схеме миграция всё-таки нужна — и она её получает.
+/// Читающее открытие на старой схеме отказывает, а не мигрирует: чтение не пишет никогда.
 ///
-/// Отказ был бы проще, но неверен: `find` на старой схеме ответил бы запасным путём `LIKE`,
-/// то есть неполно и медленно. Поэтому «только для чтения» — это про способ открытия, а не про
-/// отказ от обновления схемы.
+/// Отказ здесь — часть той же гарантии, что и у обычного открытия, но проверять его надо
+/// отдельно: `open_reading_checked` умеет отступать к обычному соединению, и однажды в этом
+/// отступлении может появиться ветка миграции — тогда чтение снова начнёт брать запись
+/// незаметно. Тест ловит именно это.
 #[test]
-fn a_reading_open_migrates_a_stale_database() {
+fn a_reading_open_refuses_a_stale_schema_without_writing() {
     let dir = temp_dir("readonly-stale");
     let outcome = db::init(&dir, "STAL", "старая").expect("init");
     let path = PathBuf::from(&outcome.db_path);
     roll_back_to_v10(&path);
 
-    let conn = db::open_reading_checked(&path).expect("открытие читающей команды");
+    let err = db::open_reading_checked(&path).expect_err("чтение старой схемы должно отказать");
+    assert_eq!(err.code(), "SCHEMA_OUTDATED", "{err}");
     assert_eq!(
-        db::schema_version_of(&conn).expect("версия"),
-        db::SUPPORTED_SCHEMA_VERSION,
-        "читающая команда не подняла схему"
+        version_of(&path),
+        10,
+        "читающее открытие подняло схему — значит писало"
     );
-    // И после миграции соединение действительно читает: индекс на месте.
+
+    // И после явной миграции то же открытие работает и видит индекс.
+    db::migrate(&path).expect("migrate");
+    let conn = db::open_reading_checked(&path).expect("чтение после миграции");
     let hits: i64 = conn
         .query_row("SELECT COUNT(*) FROM comments_fts", [], |row| row.get(0))
         .expect("чтение индекса комментариев");
@@ -201,7 +222,7 @@ fn a_busy_migration_names_itself_and_finishes_once_the_writer_leaves() {
         .expect("чужая запись");
 
     let started = std::time::Instant::now();
-    let result = db::open_checked(&path);
+    let result = db::migrate(&path);
     let elapsed_ms = started.elapsed().as_millis();
 
     match result {
@@ -226,7 +247,10 @@ fn a_busy_migration_names_itself_and_finishes_once_the_writer_leaves() {
     );
 
     holder.execute_batch("ROLLBACK").expect("снять блокировку");
-    let conn = db::open_checked(&path).expect("открытие после снятия блокировки");
+    let conn = db::open_checked(&path).expect_err("схема всё ещё старая, миграции не было");
+    assert_eq!(conn.code(), "SCHEMA_OUTDATED");
+    db::migrate(&path).expect("миграция после снятия блокировки");
+    let conn = db::open_checked(&path).expect("открытие после миграции");
     assert_eq!(
         db::schema_version_of(&conn).expect("версия"),
         db::SUPPORTED_SCHEMA_VERSION,

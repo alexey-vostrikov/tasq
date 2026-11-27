@@ -222,15 +222,20 @@ fn schema_version_is_recorded() {
 }
 
 /// Отстающая база мигрирует при обычном открытии, а не только через `init` или восстановление.
+/// Открытие отстающей базы отказывает и называет команду, а `tasq migrate` поднимает схему.
 ///
-/// Этот тест появился после дефекта: миграция v11 (поиск по комментариям) не применялась к
-/// существующим базам, потому что `open_checked` схему не поднимал. Снаружи это выглядело
-/// работающим: `find` по комментариям отвечал — но запасным путём `LIKE`, без индекса, и по
-/// десятитысячной базе такой ответ стоил бы секунд вместо миллисекунд. Молчаливая работа на
-/// старой схеме хуже отказа: отказ виден, а «работает, но иначе» — нет.
+/// Тест живёт в двух состояниях намеренно, и это история одного решения. Сначала открытие
+/// мигрировало само — потому что иначе `find` по комментариям молча отвечал запасным путём
+/// `LIKE`, без индекса, и «работает, но иначе» было незаметно. Потом оказалось, что платить за
+/// это приходится каждой волной команд: сто процессов на файле старой схемы все брались
+/// обновлять её и теряли треть вызовов на «database is locked» (TASQDEV-19). Теперь открытие
+/// только читает версию и отказывает кодом `SCHEMA_OUTDATED`, а обновление — отдельная команда.
+///
+/// Проверяется именно пара: отказ без записи, затем миграция с работающим индексом. Одного
+/// отказа мало — он был бы выполнен и «отказывать всегда», что тоже неверно.
 #[test]
-fn an_outdated_database_is_migrated_on_open() {
-    let dir = temp_dir("migrate-on-open");
+fn an_outdated_database_refuses_to_open_and_migrates_on_command() {
+    let dir = temp_dir("migrate-on-command");
     let outcome = db::init(&dir, "MIGR", "миграция").expect("init");
     let path = std::path::Path::new(&outcome.db_path);
 
@@ -249,13 +254,39 @@ fn an_outdated_database_is_migrated_on_open() {
     }
 
     // Обычное открытие — то же, с чего начинается любая команда CLI.
-    let conn = db::open_checked(path).expect("open_checked");
-    let version = db::schema_version_of(&conn).expect("версия");
-    assert_eq!(
-        version,
-        db::SUPPORTED_SCHEMA_VERSION,
-        "открытие не подняло схему до поддерживаемой"
-    );
+    let err = db::open_checked(path).expect_err("открытие старой схемы должно отказать");
+    match err {
+        tasq::error::Error::SchemaOutdated { found, supported } => {
+            assert_eq!(found, 10);
+            assert_eq!(supported, db::SUPPORTED_SCHEMA_VERSION);
+        }
+        other => panic!(
+            "ожидался SCHEMA_OUTDATED, получен {}: {other}",
+            other.code()
+        ),
+    }
+    assert!(err_hint_mentions_migrate(&err));
+
+    // И база при этом не тронута: индекс так и не появился.
+    {
+        let conn = db::open(path).expect("open");
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'comments_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("поиск индекса");
+        assert_eq!(index, 0, "открытие всё-таки записало схему");
+    }
+
+    // Явная миграция — и схема та, и индекс на месте.
+    let migration = db::migrate(path).expect("migrate");
+    assert!(migration.applied, "миграция не применилась");
+    assert_eq!(migration.from, 10);
+    assert_eq!(migration.to, db::SUPPORTED_SCHEMA_VERSION);
+
+    let conn = db::open_checked(path).expect("открытие после миграции");
     let index: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'comments_fts'",
@@ -301,5 +332,15 @@ fn an_outdated_database_is_migrated_on_open() {
         "поиск по комментарию не работает после миграции"
     );
 
+    // Повтор миграции — «делать нечего», а не ошибка: скрипт обновления запускают дважды.
+    let again = db::migrate(path).expect("повторная миграция");
+    assert!(!again.applied, "повторная миграция что-то применила");
+    assert_eq!(again.to, db::SUPPORTED_SCHEMA_VERSION);
+
     let _ = fs::remove_dir_all(dir);
+}
+
+/// Подсказка отказа должна называть команду: код без действия заставляет искать причину.
+fn err_hint_mentions_migrate(err: &tasq::error::Error) -> bool {
+    err.hint().contains("tasq migrate")
 }

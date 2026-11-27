@@ -394,88 +394,121 @@ pub fn write_tx(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
 pub fn open_checked(path: &Path) -> Result<Connection> {
     // Повтор охватывает и само открытие: `journal_mode = WAL` на базе, которую в этот момент
     // открывает сосед, тоже может ответить «занято».
-    let mut conn = with_busy(|| open(path))?;
-    let version = schema_version(&conn)?;
+    let conn = with_busy(|| open(path))?;
+    check_schema_version(&conn)?;
+    Ok(conn)
+}
+
+/// Сверяет версию схемы и отказывает, если она не та. Ничего не пишет.
+///
+/// Почему не мигрировать здесь. Открытие вызывается каждой командой, а миграция — это запись:
+/// сто процессов, запущенных одной волной на файле старой схемы, все видят одну и ту же версию
+/// и все берутся обновлять. Блокировку получает один, остальные ждут её и падают на
+/// «database is locked», хотя собирались только читать (замер: 60–67 из 100). Обновление схемы
+/// — решение, а не побочный эффект чтения: у него есть своя команда (`tasq migrate`), и её
+/// называет отказ.
+///
+/// Молчать тоже нельзя: команда на старой схеме прочитает то, чего в базе ещё нет, и ответит
+/// неполно — так `find` по комментариям отвечал запасным путём `LIKE`, пока индекс не
+/// существовал вовсе. Поэтому старая схема — отказ с кодом `SCHEMA_OUTDATED`.
+fn check_schema_version(conn: &Connection) -> Result<i64> {
+    let version = schema_version(conn)?;
     if version > SUPPORTED_SCHEMA_VERSION {
         return Err(Error::SchemaTooNew {
             found: version,
             supported: SUPPORTED_SCHEMA_VERSION,
         });
     }
-    // Миграция при открытии, а не только при `init` и восстановлении.
-    //
-    // Без этого бинарь новее базы работал бы на СТАРОЙ схеме и молчал об этом: запрос к объекту,
-    // которого нет, падал бы в запасной путь (так `find` по комментариям отвечал через `LIKE`,
-    // хотя индекса не существовало), а «схема v11» существовала бы только для новых баз. Цена
-    // проверки — одно чтение `meta` на команду; миграция идёт только когда версия отстала.
-    //
-    // Сообщение печатается в stderr и только когда миграция действительно произошла: тихое
-    // изменение чужой базы при первом запуске — не то, о чём стоит узнавать по косвенным
-    // признакам. `--json` оно не портит: поток ошибок в документ не попадает.
     if version < SUPPORTED_SCHEMA_VERSION {
-        // Гонка на обновлении — обычное дело, а не исключение: сто команд, запущенных одной
-        // волной на базе старой схемы, видят одну и ту же версию и все берутся мигрировать.
-        // Блокировку получает одна, остальные ждут её и падают, хотя работы для них нет вовсе.
-        //
-        // Повтор решает это без договоров между процессами: следующая попытка перечитывает
-        // версию (это делает `apply_migrations`), видит, что сосед уже поднял схему, и
-        // возвращает «нечего применять». Договориться о лидере здесь не на чем — файла
-        // блокировки нет, а `BEGIN EXCLUSIVE` на миграцию означал бы то же ожидание.
-        let migrated = match with_busy(|| apply_migrations(&mut conn)) {
-            Ok(migrated) => migrated,
-            // Отказ после всех повторов: отличаем «схема устарела, но занята» от прочих бед.
-            // Тихий отказ здесь был бы хуже ошибки — команда не должна работать на старой
-            // схеме, иначе поиск по комментариям молча уйдёт в запасной путь.
+        return Err(Error::SchemaOutdated {
+            found: version,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+    Ok(version)
+}
+
+/// Итог `tasq migrate`.
+#[derive(Debug, Serialize)]
+pub struct MigrateOutcome {
+    pub db_path: String,
+    /// Версия до обновления.
+    pub from: i64,
+    /// Версия после.
+    pub to: i64,
+    /// Что-либо применилось. `false` — база уже была актуальной.
+    pub applied: bool,
+}
+
+/// Обновляет схему до поддерживаемой. Единственное место, где открытие базы её меняет.
+///
+/// Повтор охватывает и миграцию, и открытие: несколько `tasq migrate`, запущенных разом (это
+/// бывает в скрипте обновления), не должны падать — `apply_migrations` перечитывает версию на
+/// каждой попытке, поэтому второй процесс видит, что работы уже нет, и выходит с `applied:
+/// false`. Если блокировку держит кто-то посторонний и все попытки истекли — `MIGRATION_BUSY`,
+/// а не «база занята»: причина названа.
+pub fn migrate(path: &Path) -> Result<MigrateOutcome> {
+    let mut conn = with_busy(|| open(path))?;
+    let from = schema_version(&conn)?;
+    if from > SUPPORTED_SCHEMA_VERSION {
+        return Err(Error::SchemaTooNew {
+            found: from,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+    let applied = if from < SUPPORTED_SCHEMA_VERSION {
+        match with_busy(|| apply_migrations(&mut conn)) {
+            Ok(applied) => applied,
             Err(err) if is_busy(&err) => {
-                // Последняя попытка могла разойтись с соседом на миллисекунду: он уже поднял
-                // схему, а мы получили «занято» на своей. Тогда работы нет и повторять нечего.
-                let now = schema_version(&conn).unwrap_or(version);
-                if now >= SUPPORTED_SCHEMA_VERSION {
-                    return Ok(conn);
-                }
                 return Err(Error::MigrationBusy {
-                    found: now,
+                    found: schema_version(&conn).unwrap_or(from),
                     supported: SUPPORTED_SCHEMA_VERSION,
                 });
             }
             Err(err) => return Err(err),
-        };
-        if migrated {
-            eprintln!(
-                "schema: migrated v{version} -> v{SUPPORTED_SCHEMA_VERSION} ({})",
-                path.display()
-            );
         }
+    } else {
+        false
+    };
+    let to = schema_version(&conn)?;
+    if to < SUPPORTED_SCHEMA_VERSION {
+        // Миграции прошли, а версия не поднялась — это дефект миграции, а не блокировка.
+        // Молчать нельзя: команда продолжила бы работу на схеме, которой не доверяет.
+        return Err(Error::SchemaOutdated {
+            found: to,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        });
     }
-    Ok(conn)
+    Ok(MigrateOutcome {
+        db_path: path.display().to_string(),
+        from,
+        to,
+        applied,
+    })
 }
 
 /// Открывает базу для команды, которая только читает.
 ///
-/// Схема проверяется здесь же: команде на старой схеме нельзя — она прочитает то, чего в базе
-/// ещё нет, и ответит неполно. Но и мигрировать ей нечем: соединение только для чтения. Поэтому
-/// старая схема — повод открыть обычное соединение и дать миграции произойти, а актуальная —
-/// повод к записи не прикасаться вовсе.
+/// Соединение только для чтения — не удобство, а запрет: такая команда не может взять запись,
+/// даже если захочет. Это снимает вопрос «а не мигрирует ли она случайно» целым классом, а не
+/// дисциплиной кода.
 ///
-/// Любая другая беда при открытии только для чтения (например, `-shm` недоступен на диске,
-/// смонтированном только для чтения) — тоже повод отступить к обычному открытию: поведение
+/// Схема проверяется здесь же и так же, как у обычного открытия: старая — отказ
+/// `SCHEMA_OUTDATED` с подсказкой про `tasq migrate`. Отдельной ветки «открыть на запись и
+/// мигрировать» больше нет — именно она превращала волну чтений в борьбу за блокировку.
+///
+/// Любая беда самого открытия только для чтения (например, `-shm` недоступен на диске,
+/// смонтированном только для чтения) — повод отступить к обычному соединению: поведение
 /// команды важнее способа открыть файл.
 pub fn open_reading_checked(path: &Path) -> Result<Connection> {
     let conn = match open_reading(path) {
         Ok(conn) => conn,
+        // Например, `-shm` недоступен на диске, смонтированном только для чтения: поведение
+        // команды важнее способа открыть файл, поэтому отступаем к обычному соединению.
         Err(_) => return open_checked(path),
     };
-    match schema_version(&conn) {
-        Ok(version) if version == SUPPORTED_SCHEMA_VERSION => Ok(conn),
-        Ok(version) if version > SUPPORTED_SCHEMA_VERSION => Err(Error::SchemaTooNew {
-            found: version,
-            supported: SUPPORTED_SCHEMA_VERSION,
-        }),
-        _ => {
-            drop(conn);
-            open_checked(path)
-        }
-    }
+    check_schema_version(&conn)?;
+    Ok(conn)
 }
 
 /// Версия схемы в соединении: публичная обёртка для дампа и внешних проверок.
@@ -654,6 +687,8 @@ pub struct DoctorReport {
     pub db_path: String,
     pub schema_version: i64,
     pub supported_version: i64,
+    /// Схема старше поддерживаемой: нужен `tasq migrate`.
+    pub schema_outdated: bool,
     pub integrity: String,
     pub foreign_key_violations: i64,
     pub projects: i64,
@@ -680,7 +715,20 @@ pub struct DoctorReport {
 
 /// Проверка целостности базы; ничего не меняет.
 pub fn doctor(path: &Path) -> Result<DoctorReport> {
-    let conn = open_checked(path)?;
+    // Открытие без проверки версии: `doctor` существует в том числе для того, чтобы назвать
+    // расхождение схемы, а отказ «запусти migrate» человек получит и без отчёта. Проверка ниже
+    // выставляет `schema_outdated`, и `ok` от неё зависит — то есть гейт `doctor --check` на
+    // отстающей базе краснеет, как и положено.
+    let conn = open(path)?;
+    // Слишком новую схему не читаем вовсе: столбцы могли переехать, и отчёт из неё был бы
+    // ложью. Это единственный отказ, который `doctor` себе позволяет.
+    let version = schema_version(&conn)?;
+    if version > SUPPORTED_SCHEMA_VERSION {
+        return Err(Error::SchemaTooNew {
+            found: version,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     let foreign_key_violations: i64 = {
         let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
@@ -734,10 +782,13 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
         // у узла не больше одного родителя — значит строк не больше, чем узлов на длину цепочки.
         progress_scan_bound: scalar("SELECT COUNT(*) FROM nodes WHERE deleted_at IS NULL")?
             .saturating_mul(crate::node::MAX_DEPTH + 1),
-        // Условия «схема не новее поддерживаемой» здесь нет намеренно: `doctor` открывает
-        // базу через `open_checked`, который на новой схеме уже отказал, поэтому такое
-        // слагаемое было бы всегда истинным (мёртвым), и его подмена не меняла бы отчёт.
-        ok: integrity == "ok" && foreign_key_violations == 0,
+        // Условия «схема не новее поддерживаемой» здесь нет намеренно: слишком новую схему
+        // отчёт не увидит вовсе — `open` вернул бы её без проверки, но читать её таблицы
+        // вслепую нельзя, и такая база отвергается ниже, до сборки отчёта.
+        schema_outdated: schema_version < SUPPORTED_SCHEMA_VERSION,
+        ok: integrity == "ok"
+            && foreign_key_violations == 0
+            && schema_version == SUPPORTED_SCHEMA_VERSION,
     };
     Ok(report)
 }

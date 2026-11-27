@@ -32,6 +32,18 @@ tasq init [ОПЦИИ]
 | `--key` | `KEY` | `TASQ` | Project key used in dot-notation IDs ([A-Z0-9]{2,8}) |
 | `--name` | `NAME` | — | Project name |
 
+## `migrate`
+
+Bring the database schema up to the version this binary supports
+
+Bring the database schema up to the version this binary supports
+
+Opening a database never rewrites its schema: a hundred commands started at once against a stale file would all try to migrate, and all but one would lose the write lock. Upgrading is a decision with its own command and its own confirmation in the output.
+
+```
+tasq migrate [ОПЦИИ]
+```
+
 ## `doctor`
 
 Check database integrity, schema version and lease hygiene

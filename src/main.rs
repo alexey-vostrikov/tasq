@@ -67,6 +67,13 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Bring the database schema up to the version this binary supports
+    ///
+    /// Opening a database never rewrites its schema: a hundred commands started at once against a
+    /// stale file would all try to migrate, and all but one would lose the write lock. Upgrading is
+    /// a decision with its own command and its own confirmation in the output.
+    Migrate,
+
     /// Check database integrity, schema version and lease hygiene
     Doctor {
         /// Only check, never modify (currently the default behaviour)
@@ -1463,6 +1470,30 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
         },
 
+        Command::Migrate => {
+            let cwd = std::env::current_dir()?;
+            let path = db::discover(&cwd, cli.db.as_deref())?;
+            let outcome = db::migrate(&path)?;
+            if cli.json {
+                print_json(&outcome);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if outcome.applied {
+                println!(
+                    "schema: v{} -> v{} ({})",
+                    outcome.from, outcome.to, outcome.db_path
+                );
+            } else {
+                // Второй запуск в скрипте обновления — обычное дело, и он не должен выглядеть
+                // как работа: «ничего не делал» — это тоже ответ.
+                println!(
+                    "schema: v{}, nothing to do ({})",
+                    outcome.to, outcome.db_path
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Doctor { check: _, gc } => {
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
@@ -1475,8 +1506,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             } else if !cli.json {
                 println!("database:  {}", report.db_path);
                 println!(
-                    "schema:    v{} (supported v{})",
-                    report.schema_version, report.supported_version
+                    "schema:    v{} (supported v{}){}",
+                    report.schema_version,
+                    report.supported_version,
+                    if report.schema_outdated {
+                        " — outdated, run `tasq migrate`"
+                    } else {
+                        ""
+                    }
                 );
                 println!("integrity: {}", report.integrity);
                 println!(
