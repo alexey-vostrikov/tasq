@@ -1049,14 +1049,16 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             let query = req_str(args, "query")?;
             // Без названного проекта поиск идёт по всей базе: ответ «не найдено» на
             // существующую задачу хуже, чем находка из чужого проекта — она хотя бы правдива.
-            let hits = match arg_str(args, "project") {
+            let found = match arg_str(args, "project") {
                 Some(_) => {
                     let project = ctx.project(args)?;
                     overview::search(&ctx.conn, &project, query)?
                 }
                 None => overview::search_all(&ctx.conn, query)?,
             };
-            Ok(text(&hits))
+            // Ответ едет целиком, с пометкой о качестве: агент, получивший список без
+            // ранжирования, должен знать это из ответа, а не догадываться по порядку строк.
+            Ok(text(&found))
         }
         "tasq_dashboard" => {
             // `all` — обзор по каждому проекту: один вызов вместо обхода проектов снаружи.

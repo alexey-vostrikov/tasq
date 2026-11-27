@@ -351,17 +351,21 @@ fn dashboard_and_search_answer_in_one_call() {
     assert!(dashboard["leases"].is_array());
     assert!(dashboard["next"].is_array());
 
-    let hits: Value = serde_json::from_str(
+    // Ответ поиска — конверт, а не голый массив: рядом с находками едет `complete`, чтобы
+    // агент видел, ответил ли индекс (иначе список без ранжирования выглядел бы как обычный).
+    let found: Value = serde_json::from_str(
         responses[2]["result"]["content"][0]["text"]
             .as_str()
             .unwrap(),
     )
     .expect("json");
+    assert_eq!(found["complete"], json!(true), "{found}");
     assert!(
-        hits.as_array()
+        found["hits"]
+            .as_array()
             .map(|list| !list.is_empty())
             .unwrap_or(false),
-        "поиск нашёл узел: {hits}"
+        "поиск нашёл узел: {found}"
     );
 }
 

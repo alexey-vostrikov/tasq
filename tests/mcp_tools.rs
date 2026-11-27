@@ -508,7 +508,17 @@ fn observability_tools() {
     let batch = out[2]["updated"].as_array().expect("updated");
     assert_eq!(batch.len(), 2, "отчёт по каждому узлу: {:?}", out[2]);
     assert_eq!(out[2]["failed"].as_array().map(Vec::len), Some(0));
-    assert!(out[3].as_array().map(|l| !l.is_empty()).unwrap_or(false));
+    // Поиск отвечает конвертом: находки плюс `complete`. Раньше это был голый массив, и
+    // неполный ответ (без индекса) выглядел так же, как полный.
+    assert_eq!(out[3]["complete"], json!(true), "{:?}", out[3]);
+    assert!(
+        out[3]["hits"]
+            .as_array()
+            .map(|l| !l.is_empty())
+            .unwrap_or(false),
+        "{:?}",
+        out[3]
+    );
     assert!(out[4]["board"].is_object());
     assert!(out[5]["chart"].is_string(), "ASCII-график: {:?}", out[5]);
     assert!(
@@ -1116,7 +1126,7 @@ fn overview_tools_cover_every_project() {
         json!("OTHER")
     );
 
-    let hits = out[1].as_array().expect("находки");
+    let hits = out[1]["hits"].as_array().expect("находки");
     let found: Vec<&str> = hits
         .iter()
         .filter_map(|hit| hit["dot_id"].as_str())

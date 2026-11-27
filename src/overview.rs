@@ -21,12 +21,112 @@ pub struct Hit {
     pub snippet: String,
 }
 
-/// Поиск по узлам и заметкам.
+/// Почему поверхность поиска ответила не индексом.
+///
+/// Два случая различаются принципиально, и смешивать их нельзя. `QueryNotUnderstood` — обычное
+/// дело: FTS5 не разбирает `файл:строка` или незакрытую кавычку, и отступить к поиску по словам
+/// здесь правильно. `IndexMissing` — дефект состояния базы: индекса нет, и ответ пришёл другим
+/// путём. Оба ведут к ответу худшего качества (без ранжирования и словоформ), поэтому оба
+/// называются, но чинятся по-разному: первый не чинится никак, второй — `tasq migrate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fallback {
+    /// Запрос не разобрался как выражение FTS5; искали по словам.
+    QueryNotUnderstood,
+    /// Индекса нет или он повреждён; искали полным перебором.
+    IndexMissing,
+}
+
+impl Fallback {
+    /// Код для документации и для тех, кто сравнивает строки, а не разбирает JSON.
+    pub fn code(self) -> &'static str {
+        match self {
+            Fallback::QueryNotUnderstood => "query_not_understood",
+            Fallback::IndexMissing => "index_missing",
+        }
+    }
+}
+
+/// Одна поверхность, ответившая запасным путём.
+#[derive(Debug, Clone, Serialize)]
+pub struct Degraded {
+    /// `nodes`, `notes` или `comments`.
+    pub surface: &'static str,
+    pub reason: Fallback,
+    /// Человеческая строка для stderr и для текстового вывода MCP.
+    pub note: String,
+}
+
+/// Ответ поиска вместе с честной пометкой о качестве.
+///
+/// Почему не просто `Vec<Hit>`. Запасной путь (`LIKE`, точнее — сравнение по словам) не
+/// ранжирует и не находит словоформы: «миграциях» он не найдёт по запросу «миграция», тогда как
+/// индекс найдёт. Раньше это отступление было молчаливым, и человек видел другой ответ, не зная
+/// об этом, — а на живой базе `find` вообще отвечал запасным путём, потому что схема оставалась
+/// старой и индекса не было (TASQDEV-19). Пометка в ответе — то, чего не хватало: «работает, но
+/// иначе» хуже видимой ошибки.
+///
+/// `Deref` до среза оставлен намеренно: большинству вызывающих нужен только список находок, и
+/// требовать от них разыменования поля значило бы менять десятки мест ради ничего. Но кто
+/// печатает ответ наружу, обязан посмотреть на `degraded`.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOutcome {
+    pub hits: Vec<Hit>,
+    /// Пусто — ответ целиком от индекса.
+    pub degraded: Vec<Degraded>,
+}
+
+impl SearchOutcome {
+    /// Ответ полон: все поверхности ответили индексом.
+    ///
+    /// В JSON это же значение едет полем `complete` — отдельным, а не выводом потребителя:
+    /// вычислять его на стороне клиента значило бы требовать аккуратного разбора `degraded` от
+    /// каждого, кто пишется на своём языке. Одно булево поле нельзя случайно не заметить.
+    pub fn is_complete(&self) -> bool {
+        self.degraded.is_empty()
+    }
+}
+
+impl Serialize for SearchOutcome {
+    /// `{"hits": […], "complete": true, "degraded": []}`.
+    ///
+    /// Массив находок верхним уровнем был бы удобнее для разбора, но он не оставляет места для
+    /// ответа на вопрос «а индекс ли это». Форма с конвертом дороже на одно поле и честнее.
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("SearchOutcome", 3)?;
+        state.serialize_field("hits", &self.hits)?;
+        state.serialize_field("complete", &self.is_complete())?;
+        state.serialize_field("degraded", &self.degraded)?;
+        state.end()
+    }
+}
+
+impl std::ops::Deref for SearchOutcome {
+    type Target = [Hit];
+    fn deref(&self) -> &[Hit] {
+        &self.hits
+    }
+}
+
+impl IntoIterator for SearchOutcome {
+    type Item = Hit;
+    type IntoIter = std::vec::IntoIter<Hit>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.hits.into_iter()
+    }
+}
+
+/// Поиск по узлам, заметкам и комментариям проекта.
 ///
 /// FTS5 понимает префиксы (`migr*`), фразы в кавычках и `OR`. Если запрос не разобрался
 /// как выражение FTS (например, в нём `-` или `:`), он трактуется как обычный текст:
-/// падение поиска из-за пунктуации пользователя — не ошибка, а повод искать иначе.
-pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<Vec<Hit>> {
+/// падение поиска из-за пунктуации пользователя — не ошибка, а повод искать иначе. Но это
+/// отступление теперь названо в `degraded`.
+pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<SearchOutcome> {
     search_in(conn, Some(project), query)
 }
 
@@ -35,11 +135,11 @@ pub fn search(conn: &Connection, project: &Project, query: &str) -> Result<Vec<H
 /// Нужен там, где проект не назван: искать «в первом проекте по порядку» значит отвечать
 /// «не найдено» на существующую задачу и выглядеть при этом уверенно. Адрес узла начинается
 /// с ключа проекта, поэтому найденное остаётся однозначным и открывается через `tasq show`.
-pub fn search_all(conn: &Connection, query: &str) -> Result<Vec<Hit>> {
+pub fn search_all(conn: &Connection, query: &str) -> Result<SearchOutcome> {
     search_in(conn, None, query)
 }
 
-fn search_in(conn: &Connection, project: Option<&Project>, query: &str) -> Result<Vec<Hit>> {
+fn search_in(conn: &Connection, project: Option<&Project>, query: &str) -> Result<SearchOutcome> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err(Error::InvalidValue {
@@ -49,30 +149,82 @@ fn search_in(conn: &Connection, project: Option<&Project>, query: &str) -> Resul
     }
 
     let fts_query = fts_expression(trimmed);
-    let mut hits = Vec::new();
+    let mut outcome = SearchOutcome::default();
 
-    let nodes: Vec<Hit> = match fts_nodes(conn, project, &fts_query) {
-        Ok(rows) => rows,
-        Err(_) => like_nodes(conn, project, trimmed)?,
+    // Три поверхности, один и тот же выбор: попробовать индекс, при отказе — по словам, и
+    // записать, почему отступили. Код отступления общий, различается только поверхность.
+    let mut surface = |name: &'static str,
+                       indexed: Result<Vec<Hit>>,
+                       fallback: &mut dyn FnMut() -> Result<Vec<Hit>>|
+     -> Result<Vec<Hit>> {
+        match indexed {
+            Ok(rows) => Ok(rows),
+            Err(err) => {
+                let reason = classify_fallback(&err);
+                let rows = fallback()?;
+                outcome.degraded.push(Degraded {
+                    surface: name,
+                    reason,
+                    note: fallback_note(name, reason),
+                });
+                Ok(rows)
+            }
+        }
     };
-    hits.extend(nodes);
 
-    let notes: Vec<Hit> = match fts_notes(conn, project, &fts_query) {
-        Ok(rows) => rows,
-        Err(_) => like_notes(conn, project, trimmed)?,
-    };
-    hits.extend(notes);
-
+    outcome.hits.extend(surface(
+        "nodes",
+        fts_nodes(conn, project, &fts_query),
+        &mut || like_nodes(conn, project, trimmed),
+    )?);
+    outcome.hits.extend(surface(
+        "notes",
+        fts_notes(conn, project, &fts_query),
+        &mut || like_notes(conn, project, trimmed),
+    )?);
     // Комментарии — третья поверхность поиска, и на живой базе самая содержательная: обоснования
     // решений живут в них, а не в описаниях узлов (250 комментариев против нуля заметок). Без них
     // `find` отвечал «ничего не найдено» на вопрос, ответ на который в базе был.
-    let comments: Vec<Hit> = match fts_comments(conn, project, &fts_query) {
-        Ok(rows) => rows,
-        Err(_) => like_comments(conn, project, trimmed)?,
-    };
-    hits.extend(comments);
+    outcome.hits.extend(surface(
+        "comments",
+        fts_comments(conn, project, &fts_query),
+        &mut || like_comments(conn, project, trimmed),
+    )?);
 
-    Ok(hits)
+    Ok(outcome)
+}
+
+/// Отличает «индекса нет» от «запрос не разобрался».
+///
+/// Разница важна действием: первое чинится `tasq migrate`, второе не чинится ничем и означает
+/// лишь, что искали по словам. Текст ошибки SQLite — единственный доступный признак: rusqlite
+/// отдаёт код `SQLITE_ERROR` и для отсутствующей таблицы, и для синтаксиса выражения MATCH.
+fn classify_fallback(err: &Error) -> Fallback {
+    let text = err.to_string().to_ascii_lowercase();
+    let missing = text.contains("no such table")
+        || text.contains("no such module")
+        || text.contains("no such column")
+        || text.contains("malformed database schema")
+        || text.contains("no such fts5");
+    if missing {
+        Fallback::IndexMissing
+    } else {
+        Fallback::QueryNotUnderstood
+    }
+}
+
+/// Строка для человека: что произошло и что с этим делать.
+fn fallback_note(surface: &str, reason: Fallback) -> String {
+    match reason {
+        Fallback::IndexMissing => format!(
+            "search: {surface} answered without an index (it is missing); results are unordered \
+             and word forms are not matched — run `tasq migrate`"
+        ),
+        Fallback::QueryNotUnderstood => format!(
+            "search: {surface} answered by words, not by the index (the query is not an FTS \
+             expression); results are unordered and word forms are not matched"
+        ),
+    }
 }
 
 /// Значение фильтра по проекту для SQL: `-1` — «любой проект».

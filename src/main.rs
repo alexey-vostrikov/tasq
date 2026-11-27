@@ -2693,19 +2693,25 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
             let conn = db::open_reading_checked(&path)?;
-            let hits = match project::scope(&conn, cli.project.as_deref())? {
+            let found = match project::scope(&conn, cli.project.as_deref())? {
                 project::Scope::One(project) => overview::search(&conn, &project, query)?,
                 project::Scope::All => overview::search_all(&conn, query)?,
             };
             if cli.json {
-                print_json(&hits);
+                print_json(&found);
                 return Ok(ExitCode::SUCCESS);
             }
-            if hits.is_empty() {
+            // Отступление от индекса называется ДО находок: иначе человек читает другой ответ и
+            // не знает, что он другой. В stdout оно не идёт — там только находки; в stderr его
+            // видно и в терминале, и в гейте, который сравнивает вывод.
+            for note in &found.degraded {
+                eprintln!("{}", note.note);
+            }
+            if found.hits.is_empty() {
                 println!("nothing found for {query:?}");
                 return Ok(ExitCode::SUCCESS);
             }
-            for hit in &hits {
+            for hit in &found.hits {
                 let target = hit.dot_id.as_deref().unwrap_or("-");
                 println!("{:<6} {:<14} {}", hit.entity, target, hit.title);
                 if !hit.snippet.is_empty() {
