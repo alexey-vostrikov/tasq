@@ -95,6 +95,12 @@ PERF_ROUNDS ?= 20
 perf: cache-init
 	$(RUN) cargo test --release --test perf -- --ignored --nocapture --test-threads=1
 
+# Очередь вызовов через MCP-сервер: сто агентов на одну базу (TASQDEV-20.8).
+# Отдельная цель, а не часть `perf`: там фикстура на 10 000 узлов и бюджеты p99, здесь — поведение
+# очереди и отсутствие отказов. Смешивать их значило бы получить одно число на два вопроса.
+queue: cache-init
+	$(RUN) cargo test --release --test mcp_queue -- --ignored --nocapture --test-threads=1
+
 build: cache-init
 	$(RUN) cargo build --release
 
