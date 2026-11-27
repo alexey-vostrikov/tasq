@@ -1,4 +1,4 @@
-//! Комментарии к узлам: хронологическая нить с мягким удалением (README §5).
+//! Комментарии к узлам: хронологическая нить с мягким удалением (spec §5).
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;

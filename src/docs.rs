@@ -322,22 +322,47 @@ pub fn drift_error(drift: &[String]) -> Error {
 ///
 /// Форма строк зафиксирована шаблоном, а не угадыванием: если строку перепишут так, что шаблон
 /// перестанет её находить, проверка скажет об этом прямо. Молча пропущенный шаблон — та же ложь,
-/// что и устаревшее число.
-pub fn check_readme(
-    readme: &Path,
+/// Числа в документации против бинаря.
+///
+/// Проверяются **все** файлы разом, а не только `README.md`: нормативная часть живёт в
+/// `docs/spec.md` (§5–19), вход — в README, и числа встречаются то там, то здесь. Требовать
+/// «строка обязана быть в README» значило бы после разделения документов либо продублировать
+/// числа (две копии — две правды), либо сломать гейт на ровном месте.
+///
+/// Поэтому: каждая нужная строка обязана найтись хотя бы в одном файле, а расхождение
+/// называется вместе с файлом и номером строки — иначе в каком из двух документов искать, не
+/// понять.
+pub fn check_facts(
+    files: &[std::path::PathBuf],
     tool_count: usize,
     profiles: &[(String, i64)],
     profile_tools: &[(String, usize)],
 ) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(readme) else {
-        return vec![format!("{} отсутствует", readme.display())];
-    };
+    let texts: Vec<(std::path::PathBuf, String)> = files
+        .iter()
+        .filter_map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|text| (path.clone(), text))
+        })
+        .collect();
+    if texts.is_empty() {
+        let names: Vec<String> = files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        return vec![format!("документация не найдена: {}", names.join(", "))];
+    }
+
     let mut drift = Vec::new();
 
-    // «| `docs/mcp-tools.md` | каталог `tools/list` | 45 инструмента, ...»
+    // «| `docs/mcp-tools.md` | каталог `tools/list` | 47 инструментов, ...»
     let mut tools_seen = false;
-    for (index, line) in text.lines().enumerate() {
-        if let Some(rest) = line.split("каталог `tools/list` | ").nth(1) {
+    for (path, text) in &texts {
+        for (index, line) in text.lines().enumerate() {
+            let Some(rest) = line.split("каталог `tools/list` | ").nth(1) else {
+                continue;
+            };
             tools_seen = true;
             let documented: usize = rest
                 .split_whitespace()
@@ -346,75 +371,83 @@ pub fn check_readme(
                 .unwrap_or_else(|| {
                     drift.push(format!(
                         "{}:{}: числа инструментов не разобрать",
-                        readme.display(),
+                        path.display(),
                         index + 1
                     ));
                     0
                 });
             if documented != tool_count {
                 drift.push(format!(
-                    "{}:{}: README обещает {documented} инструментов, в каталоге {tool_count}",
-                    readme.display(),
+                    "{}:{}: в тексте {documented} инструментов, в каталоге {tool_count}",
+                    path.display(),
                     index + 1
                 ));
             }
         }
     }
     if !tools_seen {
-        drift.push(format!(
-            "{}: строка «каталог `tools/list` | N инструмента» не найдена",
-            readme.display()
-        ));
+        drift.push("строка «каталог `tools/list` | N инструментов» не найдена".to_string());
     }
 
-    // «профили: full 5346 / agent 3609 / read-only 1694 / migration 603 токенов»
-    let needle = "профили: ";
+    // «профили: full 5785 / agent 3884 / read-only 1926 / migration 603 токенов»
     let mut tokens_seen = false;
-    for (index, line) in text.lines().enumerate() {
-        let Some(rest) = line.split(needle).nth(1) else {
-            continue;
-        };
-        tokens_seen = true;
-        for (name, actual) in profiles {
-            // Профиль ищется по имени и числу после него: «read-only 1694» — имя с дефисом,
-            // поэтому поиск по границе, а не по началу слова.
-            let Some(position) = rest.find(&format!("{name} ")) else {
-                drift.push(format!(
-                    "{}:{}: в строке профилей нет «{name}»",
-                    readme.display(),
-                    index + 1
-                ));
+    for (path, text) in &texts {
+        for (index, line) in text.lines().enumerate() {
+            let Some(rest) = line.split("профили: ").nth(1) else {
                 continue;
             };
-            let documented: i64 = rest[position + name.len() + 1..]
-                .split_whitespace()
-                .next()
-                .and_then(|word| word.parse().ok())
-                .unwrap_or_else(|| {
+            tokens_seen = true;
+            for (name, actual) in profiles {
+                // Профиль ищется по имени и числу после него: «read-only 1926» — имя с дефисом,
+                // поэтому поиск по границе, а не по началу слова.
+                let Some(position) = rest.find(&format!("{name} ")) else {
                     drift.push(format!(
-                        "{}:{}: стоимость «{name}» не разобрать",
-                        readme.display(),
+                        "{}:{}: в строке профилей нет «{name}»",
+                        path.display(),
                         index + 1
                     ));
-                    0
-                });
-            if documented != *actual {
-                drift.push(format!(
-                    "{}:{}: README обещает {name} {documented} токенов, в каталоге {actual}",
-                    readme.display(),
-                    index + 1
-                ));
+                    continue;
+                };
+                let documented: i64 = rest[position + name.len() + 1..]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|word| word.parse().ok())
+                    .unwrap_or_else(|| {
+                        drift.push(format!(
+                            "{}:{}: стоимость «{name}» не разобрать",
+                            path.display(),
+                            index + 1
+                        ));
+                        0
+                    });
+                if documented != *actual {
+                    drift.push(format!(
+                        "{}:{}: в тексте {name} {documented} токенов, в каталоге {actual}",
+                        path.display(),
+                        index + 1
+                    ));
+                }
             }
         }
     }
     if !tokens_seen {
-        drift.push(format!(
-            "{}: строка «профили: ...» не найдена",
-            readme.display()
-        ));
+        drift.push("строка «профили: …» не найдена".to_string());
     }
 
-    drift.extend(check_profile_table(readme, &text, profiles, profile_tools));
+    // Таблица профилей живёт в одном файле из набора (сейчас — в `docs/spec.md`), и требовать её
+    // от каждого значило бы запретить разделение документов. Ищем, где она есть, и проверяем там;
+    // отсутствие во всех файлах — отдельная жалоба, чтобы таблица не исчезла молча.
+    let mut table_seen = false;
+    for (path, text) in &texts {
+        if !text.contains("| профиль | инструментов |") {
+            continue;
+        }
+        table_seen = true;
+        drift.extend(check_profile_table(path, text, profiles, profile_tools));
+    }
+    if !table_seen {
+        drift.push("таблица профилей «| профиль | инструментов |» не найдена".to_string());
+    }
     drift
 }
 

@@ -1316,17 +1316,25 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         let files = docs::generate(&Cli::command())?;
         if *check {
             let mut drift = docs::check(out, &files)?;
-            // Числа в README проверяются тем же гейтом: «сколько инструментов» и «сколько
-            // токенов» известны бинарю, и разойтись с ним они не имеют права.
-            let readme = out
+            // Числа в документации проверяются тем же гейтом: «сколько инструментов» и «сколько
+            // токенов» известны бинарю, и разойтись с ним они не имеют права. Смотрим оба файла:
+            // вход (README) и нормативную часть (docs/spec.md) — числа живут и там, и там.
+            let root = out
                 .parent()
-                .map(|root| root.join("README.md"))
-                .unwrap_or_else(|| PathBuf::from("README.md"));
+                .map(|dir| dir.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let readme = root.join("README.md");
+            // Нормативная часть лежит рядом со справочниками, в том же каталоге, что и они.
+            let spec = out.join("spec.md");
             let (tool_count, profiles) = docs::readme_facts();
             let profile_sizes = docs::profile_sizes();
-            if readme.is_file() {
-                drift.extend(docs::check_readme(
-                    &readme,
+            let files: Vec<PathBuf> = [readme.clone(), spec.clone()]
+                .into_iter()
+                .filter(|path| path.is_file())
+                .collect();
+            if !files.is_empty() {
+                drift.extend(docs::check_facts(
+                    &files,
                     tool_count,
                     &profiles,
                     &profile_sizes,

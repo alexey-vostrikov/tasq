@@ -1,4 +1,4 @@
-//! Аренды с истечением: захват, продление, освобождение (README §8).
+//! Аренды с истечением: захват, продление, освобождение (spec §8).
 //!
 //! Статус `in_progress` не хранится как решение: он выводится из живой аренды
 //! (`v_node_effective`). Поэтому умерший агент не держит узел дольше своего TTL —
@@ -17,7 +17,7 @@ use crate::project::Project;
 use crate::resource;
 use crate::session;
 
-/// Значение TTL по умолчанию и допустимые границы (README §8.1).
+/// Значение TTL по умолчанию и допустимые границы (spec §8.1).
 pub const DEFAULT_TTL: i64 = 900;
 pub const MIN_TTL: i64 = 60;
 pub const MAX_TTL: i64 = 28_800;
@@ -109,7 +109,7 @@ fn new_token() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Проверка TTL: границы из README §8.1, никакой «мягкой» подстановки.
+/// Проверка TTL: границы из spec §8.1, никакой «мягкой» подстановки.
 pub fn validate_ttl(ttl_seconds: i64) -> Result<()> {
     if (MIN_TTL..=MAX_TTL).contains(&ttl_seconds) {
         return Ok(());
@@ -200,7 +200,7 @@ fn blockers(conn: &Connection, node_id: i64) -> Result<Option<String>> {
     })
 }
 
-/// Захватывает узел: одна транзакция, порядок проверок фиксирован (README §8.2).
+/// Захватывает узел: одна транзакция, порядок проверок фиксирован (spec §8.2).
 pub fn claim(
     conn: &mut Connection,
     project: &Project,
@@ -319,7 +319,7 @@ pub fn claim_as(
         });
     }
 
-    // Порядок проверок — по README §8.2: занятые файлы отказывают после аренды и блокеров,
+    // Порядок проверок — по spec §8.2: занятые файлы отказывают после аренды и блокеров,
     // чтобы сообщение было про то, что мешает раньше по смыслу.
     if let Some((existing, holder)) = resource::find_conflict(&tx, &reservations)? {
         return Err(Error::ResourceReservationConflict {
@@ -668,7 +668,7 @@ pub fn release(
     node::resolve_shown(conn, project, &format!("#{}", node.id)).map(|(_, node)| node)
 }
 
-/// Закрывает просроченные попытки и снимает их резервы (README §8.3).
+/// Закрывает просроченные попытки и снимает их резервы (spec §8.3).
 ///
 /// Явная команда `doctor --gc`. Тот же механизм работает и сам — [`release_expired`]
 /// вызывается на путях записи, поэтому аренды мёртвых сессий не накапливаются.

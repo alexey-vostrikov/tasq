@@ -1,4 +1,4 @@
-//! Domain errors with stable machine-readable codes (README §19).
+//! Domain errors with stable machine-readable codes (spec §19).
 
 use serde::Serialize;
 

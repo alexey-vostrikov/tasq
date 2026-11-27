@@ -1,6 +1,6 @@
 //! Узлы дерева: создание, чтение, изменение, перенос, архив, мягкое удаление.
 //!
-//! Одна таблица `nodes` на все уровни (README §5); dot-ID собирается из `path` и ключа проекта.
+//! Одна таблица `nodes` на все уровни (spec §5); dot-ID собирается из `path` и ключа проекта.
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
@@ -13,7 +13,7 @@ use crate::history;
 use crate::project::Project;
 use crate::status::{Kind, Status, check_with_policy};
 
-/// Предел глубины дерева (README §5.3, инвариант 2).
+/// Предел глубины дерева (spec §5.3, инвариант 2).
 ///
 /// Предел нужен не для аккуратности иерархии, а потому что адрес узла — это путь: он едет в
 /// dot-ID, в аргументы CLI и в текст задач. Шестнадцать уровней — это эпик → задача →
@@ -91,7 +91,7 @@ impl Node {
     }
 }
 
-/// Ссылка на узел в любой из трёх форм (README §6.2).
+/// Ссылка на узел в любой из трёх форм (spec §6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ref {
     Id(i64),
@@ -361,7 +361,7 @@ fn validate_priority(value: &str) -> Result<()> {
     }
 }
 
-/// `due_date` — календарная дата `YYYY-MM-DD` (README §5).
+/// `due_date` — календарная дата `YYYY-MM-DD` (spec §5).
 fn validate_due(value: &str) -> Result<()> {
     use time::Date;
     use time::format_description::well_known::Iso8601;
@@ -2249,7 +2249,7 @@ fn count_in_subtrees(conn: &Connection, roots: &[(i64, String)]) -> Result<usize
 }
 
 /// Мягкое удаление: только узлы до начала работы — `idea`, `backlog`, `todo`
-/// (README §5.3, инвариант 10).
+/// (spec §5.3, инвариант 10).
 pub fn delete(conn: &mut Connection, project: &Project, reference: &str) -> Result<()> {
     let (project, node) = resolve_with_project(conn, project, reference)?;
     if !matches!(

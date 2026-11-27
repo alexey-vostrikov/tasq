@@ -202,19 +202,20 @@ fn json_output_lists_written_files() {
     assert_eq!(written.len(), 3);
 }
 
-/// Таблица переходов в README §7 и матрица в коде — одно правило в двух местах, и расходятся
+/// Таблица переходов в spec §7 и матрица в коде — одно правило в двух местах, и расходятся
 /// они молча: правку вносят в одно, второе читают как контракт. Проверка машинная: разобрать
 /// таблицу и сравнить с публичным `can_transition` (по обоим видам узла, потому что
 /// ограничения по виду описаны отдельной таблицей в том же разделе).
 #[test]
-fn readme_transition_matrix_matches_the_code() {
+fn the_transition_matrix_in_the_spec_matches_the_code() {
     use tasq::status::{Kind, Status};
 
-    let readme = fs::read_to_string("README.md").expect("README рядом с тестами");
-    let start = readme
+    // Матрица живёт в нормативной части (spec §7): сверяется то, что читают как контракт.
+    let document = fs::read_to_string("docs/spec.md").expect("spec рядом с тестами");
+    let start = document
         .find("Матрица переходов")
-        .expect("в README есть раздел матрицы переходов");
-    let tail = &readme[start..];
+        .expect("в spec есть раздел матрицы переходов");
+    let tail = &document[start..];
     let end = tail
         .find("Флаги, меняющие строгость")
         .expect("таблица заканчивается разделом флагов");
@@ -325,14 +326,14 @@ fn readme_numbers_are_checked_against_the_binary() {
     let path = dir.join("README.md");
     fs::write(&path, &honest).expect("write");
     assert!(
-        docs::check_readme(&path, tools, &profiles, &sizes).is_empty(),
+        docs::check_facts(std::slice::from_ref(&path), tools, &profiles, &sizes).is_empty(),
         "верные числа не должны давать расхождений"
     );
 
     // Одно число испорчено — гейт обязан назвать файл и строку, а не промолчать.
     let stale = honest.replace(&format!("{tools} инструмента"), "43 инструмента");
     fs::write(&path, &stale).expect("write");
-    let drift = docs::check_readme(&path, tools, &profiles, &sizes);
+    let drift = docs::check_facts(std::slice::from_ref(&path), tools, &profiles, &sizes);
     assert_eq!(drift.len(), 1, "{drift:?}");
     assert!(drift[0].contains("README.md:1"), "{drift:?}");
     assert!(drift[0].contains("43"), "{drift:?}");
@@ -340,7 +341,7 @@ fn readme_numbers_are_checked_against_the_binary() {
 
     // Строка исчезла совсем — это тоже расхождение: молча пропущенный шаблон прячет ошибку.
     fs::write(&path, "ничего не написано\n").expect("write");
-    let drift = docs::check_readme(&path, tools, &profiles, &sizes);
+    let drift = docs::check_facts(std::slice::from_ref(&path), tools, &profiles, &sizes);
     assert!(
         drift.iter().any(|item| item.contains("не найдена")),
         "{drift:?}"
@@ -356,6 +357,66 @@ fn the_repository_readme_matches_the_binary() {
 
     let (tools, profiles) = docs::readme_facts();
     let sizes = docs::profile_sizes();
-    let drift = docs::check_readme(std::path::Path::new("README.md"), tools, &profiles, &sizes);
+    let drift = docs::check_facts(
+        &[
+            std::path::PathBuf::from("README.md"),
+            std::path::PathBuf::from("docs/spec.md"),
+        ],
+        tools,
+        &profiles,
+        &sizes,
+    );
     assert!(drift.is_empty(), "{drift:?}");
+}
+
+/// Команды и флаги на странице входа существуют: текст входа проверяется прогоном, а не памятью.
+///
+/// Зачем это отдельным тестом. README уже врал дважды — про `tasq init` и `--db` (флаг работал
+/// для всех команд, кроме той, что создаёт базу) и про пути в справочнике, который правили руками.
+/// Страница входа — то место, где ошибка дороже всего: по ней идут первый раз и, споткнувшись,
+/// уходят. Поэтому каждая строка вида `$ tasq <команда> …` проверяется вызовом `<команда> --help`:
+/// существует ли команда на самом деле.
+#[test]
+fn the_entry_page_mentions_only_real_commands() {
+    let readme = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let text = match fs::read_to_string(&readme) {
+        Ok(text) => text,
+        // Сборка из распакованного архива без README — не повод падать: проверять нечего.
+        Err(_) => return,
+    };
+
+    let mut commands: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("$ tasq ") else {
+            continue;
+        };
+        // Первый токен, не являющийся флагом: `tasq --json ls` тоже допустим.
+        let Some(word) = rest.split_whitespace().find(|part| !part.starts_with('-')) else {
+            continue;
+        };
+        // Подстановки вида `<token>` и скобочные формы — не команды.
+        if word.starts_with('<') || word.starts_with('«') {
+            continue;
+        }
+        let word = word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-');
+        if !word.is_empty() {
+            commands.push(word.to_string());
+        }
+    }
+    assert!(
+        !commands.is_empty(),
+        "на странице входа нет ни одной команды — проверка ничего не проверила"
+    );
+
+    for command in commands {
+        let out = Command::new(bin())
+            .args([command.as_str(), "--help"])
+            .output()
+            .expect("запуск tasq");
+        assert!(
+            out.status.success(),
+            "страница входа зовёт `tasq {command}`, а такой команды нет:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
