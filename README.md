@@ -129,12 +129,28 @@ DEMO-1.1 -> done
 Для агента тот же трекер доступен по MCP:
 
 ```
-$ tasq mcp --profile agent        # stdio, 30 инструментов, 3884 токена схемы
+$ tasq mcp --profile agent        # stdio, 31 инструмент, 3951 токен схемы
 ```
 
 Прописать сервер в конфиг клиента — `tasq connect <client> --scope project`; список клиентов
 печатает `tasq connect` без аргументов. HTTP-транспорт есть, но только по явному флагу и только
 на loopback: `tasq serve --http 127.0.0.1:8787`.
+
+Что происходило с трекером, отвечает одна команда — тем же числом человеку и агенту:
+
+```
+$ tasq stat --since 7d
+since 2026-11-20T12:58:37.154Z: 2 call(s), 0 failure(s), 0 lock retry(ies), 24 мс всего
+leases:    0 live, 1 expired open, 6 expired in window, 0 reservation(s); journal 0 КБ
+
+operations:
+  operation             calls      p50      p95      max   failed
+  doctor                    1       22       22       22        0
+  stat                      1        2        2        2        0
+```
+
+Метрики лежат в отдельном файле рядом с базой (`tasq-metrics.db`), а не в ней: счётчик в основной
+базе вернул бы блокировку записи каждой читающей команде.
 
 ## Куда читать дальше
 
