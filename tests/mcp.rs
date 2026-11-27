@@ -540,20 +540,47 @@ fn wal_size(dir: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-/// Ждёт, пока журнал усечётся, вместо фиксированной паузы.
+/// Данные, записанные до сброса, лежат в основном файле, а не только в журнале.
 ///
-/// Фиксированный `sleep` — это гонка с чужим таймером: сброс идёт по своему тику, а под
-/// параллельной нагрузкой (весь набор тестов в одном прогоне) тик легко опаздывает, и тест
-/// падает на исправном коде. Проверяемое свойство — «журнал в конце концов усечён», а не
-/// «усечён ровно через три секунды», поэтому и ждать надо до наступления, с потолком.
-fn wait_for_wal_truncated(dir: &std::path::Path, limit: std::time::Duration) -> u64 {
+/// Проверяется копией одного `.db`, без `-wal`: именно такая копия останется после отказа
+/// машины. Раньше здесь ждали, что журнал усечётся до нуля, — но усечение стало отдельным
+/// шагом, который выполняется только на выросшем журнале, чтобы не ждать читателей каждый
+/// тик. Долговечность от этого не изменилась: сброс переливает кадры и синхронизирует базу.
+///
+/// Копия делается, пока сервер жив, поэтому может попасть на середину переливки — тогда
+/// `quick_check` на копии не сойдётся, и попытка повторяется. Ожидание вместо фиксированной
+/// паузы: под параллельной нагрузкой тик сброса опаздывает, и тест падал бы на исправном коде.
+fn main_file_holds(dir: &std::path::Path, title: &str, limit: std::time::Duration) -> bool {
     let started = std::time::Instant::now();
+    let source = dir.join(".tasq/tasq.db");
+    let copy = dir.join("main-only.db");
     loop {
-        let size = wal_size(dir);
-        if size == 0 || started.elapsed() >= limit {
-            return size;
+        let _ = std::fs::remove_file(&copy);
+        if std::fs::copy(&source, &copy).is_ok() {
+            let opened = rusqlite::Connection::open_with_flags(
+                &copy,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            );
+            if let Ok(conn) = opened {
+                let check: Option<String> = conn
+                    .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                    .ok();
+                let found: Option<i64> = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM nodes WHERE title = ?1",
+                        [title],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if check.as_deref() == Some("ok") && found.unwrap_or(0) > 0 {
+                    return true;
+                }
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if started.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -608,15 +635,15 @@ fn unwritten_data_does_not_outlive_the_flush_interval() {
     let after_write = wal_size(&dir);
     assert!(after_write > 0, "сразу после записи журнал не пуст");
 
-    // Интервал 1 с, но проверяемое свойство — «журнал усекается», а не «ровно через секунду».
-    //
-    // Потолок — 30 с: весь набор тестов идёт параллельно (42 бинарника, каждый со своими
-    // дочерними процессами), и поток сброса на загруженной машине получает квант заметно
-    // позже. Фиксированные 6 с в таком режиме уже давали ложное падение на исправном коде.
-    let flushed = wait_for_wal_truncated(&dir, std::time::Duration::from_secs(30));
-    assert_eq!(
-        flushed, 0,
-        "журнал так и не усечён, хотя интервал сброса 1 с (было {after_write} байт)"
+    // Интервал 1 с, но проверяемое свойство — «данные оказались в основном файле», а не
+    // «ровно через секунду». Потолок — 30 с: весь набор идёт параллельно (десятки бинарников,
+    // каждый со своими дочерними процессами), и поток сброса на загруженной машине получает
+    // квант заметно позже; фиксированные 6 с уже давали ложное падение на исправном коде.
+    let flushed = main_file_holds(&dir, "Узел под сброс", std::time::Duration::from_secs(30));
+    assert!(
+        flushed,
+        "записанный узел не попал в основной файл за 30 с, хотя интервал сброса 1 с \
+         (журнал был {after_write} байт)"
     );
 
     let _ = child.kill();
@@ -666,7 +693,7 @@ fn a_held_read_transaction_is_reported_as_stalled_flush() {
     let output = child.wait_with_output().expect("wait");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("journal is not being flushed"),
+        stderr.contains("journal is not being emptied"),
         "сервер должен предупредить о застрявшем сбросе:\n{stderr}"
     );
     assert!(
@@ -682,8 +709,15 @@ fn a_held_read_transaction_is_reported_as_stalled_flush() {
     assert_eq!(response["result"]["isError"], json!(false), "{response}");
     // Сброс идёт по своему тику (`--flush 1`), поэтому ждём наступления, а не фиксированные
     // три секунды: под нагрузкой тик опаздывает, и тест падал бы на исправном коде.
-    let left = wait_for_wal_truncated(&dir, std::time::Duration::from_secs(30));
+    let reached = main_file_holds(
+        &dir,
+        "Узел после освобождения",
+        std::time::Duration::from_secs(30),
+    );
     let _ = child.kill();
     let _ = child.wait();
-    assert_eq!(left, 0, "после освобождения журнал так и не усечён");
+    assert!(
+        reached,
+        "после освобождения читателя данные так и не попали в основной файл"
+    );
 }

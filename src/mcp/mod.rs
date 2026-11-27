@@ -25,6 +25,11 @@ use profile::Profile;
 /// данные лежат в кэше страниц. Пока не сбросить их, они пропадут при отключении питания —
 /// независимо от того, сколько времени прошло. Поток закрывает это окно интервалом.
 ///
+/// Сброс — `PASSIVE`: он копирует кадры и синхронизирует базу, но читателя не ждёт и не
+/// отказывает. Усечение файла — отдельный редкий шаг внутри `db::checkpoint` (только когда
+/// журнал дорос до потолка): `TRUNCATE` ждёт освобождения читателей, а на базе с сотней
+/// агентов это значило бы «стоять в ожидании каждый тик».
+///
 /// Своё соединение к тому же файлу, а не общий `Connection`: rusqlite не `Sync`, и делить
 /// его между потоками пришлось бы под мьютексом, который блокировал бы обработку вызовов.
 /// Решение «пора предупреждать», отдельно от потока: его проверяет тест, а не время.
@@ -53,8 +58,8 @@ impl Stall {
         if self.silent_ticks >= Self::TICKS_BEFORE_WARNING && !self.warned {
             self.warned = true;
             return Some(
-                "tasq mcp: journal is not being flushed: another connection holds a read \
-                 transaction, so data stays unwritten until it finishes",
+                "tasq mcp: journal is not being emptied: a read transaction pins an older \
+                 snapshot, so the newest frames stay in the journal until it finishes",
             );
         }
         None
@@ -406,8 +411,11 @@ mod tests {
         assert_eq!(stall.observe(11), None);
         assert_eq!(stall.observe(11), None);
         let warning = stall.observe(11).expect("третий тик предупреждает");
+        // Проверяется смысл, а не вся строка: предупреждение объясняет, что кадры остались в
+        // журнале из-за занятого снимка, и это должно быть видно из текста.
         assert!(
-            warning.contains("journal is not being flushed"),
+            warning.contains("journal is not being emptied")
+                && warning.contains("read transaction"),
             "{warning}"
         );
         // Второй раз то же самое не печатается: иначе поток строк, который не читают.

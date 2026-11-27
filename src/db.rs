@@ -126,6 +126,12 @@ pub fn busy_timeout_from(raw: Option<&str>) -> u32 {
 /// Умолчание ожидания блокировки.
 pub const DEFAULT_BUSY_MS: u32 = 200;
 
+/// Потолок журнала: после полной переливки файл усекается, когда превысил это значение.
+///
+/// Восемь мегабайт — вдвое больше шага авто-переливки SQLite (1000 страниц по 4 КБ), поэтому
+/// усечение случается редко, но журнал не растёт безгранично на базе, которую долго не закрывают.
+pub const JOURNAL_LIMIT: i64 = 8_388_608;
+
 /// Сколько раз пробовать заново, если база занята чужим писателем.
 ///
 /// Три, а не десять: замер на ста процессах показал, что третий повтор уже не добавляет
@@ -190,14 +196,25 @@ fn backoff(round: usize) {
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     let timeout = busy_timeout_ms();
+    // Только прагмы, которые живут в соединении и ничего не меняют в файле. Их приходится
+    // повторять на каждом открытии: `synchronous`, `foreign_keys` и `busy_timeout` — свойства
+    // соединения, а не базы.
     conn.execute_batch(&format!(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
+        "PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = {timeout};
-         -- Потолок размера журнала: после checkpoint WAL не остаётся на максимуме.
-         PRAGMA journal_size_limit = 8388608;"
+         PRAGMA busy_timeout = {timeout};"
     ))?;
+    // Режим журнала — наоборот, свойство файла. Ставим его только когда он ДРУГОЙ: на базе,
+    // уже живущей в WAL, `journal_mode = WAL` ничего не меняет, но это запись в заголовок файла
+    // под блокировкой — и сто команд, открывающих базу волной, платили бы за неё зря.
+    // Перевод старого файла в WAL при этом остаётся: база, созданная до этой правки или
+    // восстановленная из дампа в режиме rollback, иначе осталась бы без WAL вовсе.
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    }
+    // `journal_size_limit` — тоже свойство соединения (замер: в новом соединении снова -1),
+    // поэтому ставится там, где усекают журнал, — в соединении фонового сброса (`open_light`).
     register_unicode(&conn)?;
     Ok(conn)
 }
@@ -206,9 +223,10 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// запись при открытии.
 ///
 /// Зачем отдельный вход, если `open` и так ничего не пишет явно. Пишет: `PRAGMA journal_mode`
-/// и `PRAGMA journal_size_limit` меняют заголовок файла, а миграция, включённая в открытие,
-/// берёт блокировку записи целиком. Замер: сто одновременных `ls` против базы, ждущей
-/// миграции, теряли треть команд на «database is locked», хотя читать им никто не мешал.
+/// меняет заголовок файла под блокировкой, а миграция, включённая в открытие, берёт блокировку
+/// записи целиком. Замер: сто одновременных `ls` против базы, ждущей миграции, теряли треть
+/// команд на «database is locked», хотя читать им никто не мешал — каждая бралась обновлять
+/// схему.
 /// Соединение только для чтения такой возможности не имеет вовсе — не «редко пишет», а «не может».
 ///
 /// Регистрация Unicode-функций остаётся: `find` и `ls` ищут по тексту, и без `uni_lower`
@@ -236,10 +254,13 @@ pub fn open_light(path: &Path) -> Result<Connection> {
     // Короткий `busy_timeout`: сброс — фоновая задача, и ждать блокировку пять секунд
     // ей нельзя. Пока читатель держит транзакцию, `wal_checkpoint(TRUNCATE)` вернёт busy
     // сразу, и поток успеет зафиксировать это предупреждением, а не зависнет на весь тик.
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 200;
-         PRAGMA journal_size_limit = 8388608;",
-    )?;
+    //
+    // `journal_size_limit` здесь потому, что он живёт в соединении, а усекает журнал именно
+    // это — фоновая задача. Ставить его всем командам подряд незачем.
+    conn.execute_batch(&format!(
+        "PRAGMA busy_timeout = {DEFAULT_BUSY_MS};
+         PRAGMA journal_size_limit = {JOURNAL_LIMIT};"
+    ))?;
     Ok(conn)
 }
 
@@ -265,15 +286,54 @@ fn loss_window(log: i64, copied: i64) -> i64 {
 }
 
 pub fn checkpoint(conn: &Connection) -> Result<i64> {
-    // TRUNCATE переливает кадры и, когда читателей нет, обнуляет журнал. При занятом
-    // читателе он переливает ровно столько же, сколько PASSIVE (замер: обе — 3 из 7
-    // кадров), но файл не усекает; поэтому отдельная запасная ветка ничего не добавляет,
-    // и остаток считается по числам этого же вызова.
-    let (_, log, copied): (i64, i64, i64) =
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+    checkpoint_with_limit(conn, JOURNAL_LIMIT)
+}
+
+/// То же с явным потолком: предел нужен тестам, а переменная окружения здесь не годится —
+/// она общая на процесс, а порог должен быть числом аргумента.
+///
+/// Порядок важен. Сначала PASSIVE: он никогда не ждёт читателя и никогда не отказывает —
+/// переливает сколько может и честно сообщает, сколько кадров осталось. TRUNCATE, наоборот,
+/// ждёт освобождения читателей до `busy_timeout` (замер: 5 000 мс при умолчании SQLite) и
+/// возвращает busy — то есть на базе с сотней агентов он либо стоит четверть секунды в каждом
+/// тике, либо не делает ничего. Поэтому усекаем только когда переливка прошла полностью И
+/// файл дорос до потолка: тогда ожидание ограничено, а размер журнала остаётся под контролем.
+///
+/// Почему усечение вообще нужно: PASSIVE не уменьшает файл (замер: 6,8 МБ до и после, при
+/// любом `journal_size_limit` — он действует только на усекающих переливках). Без TRUNCATE
+/// журнал рос бы до 8 МБ и оставался таким навсегда.
+pub fn checkpoint_with_limit(conn: &Connection, limit: i64) -> Result<i64> {
+    let (_, log, copied) = wal_checkpoint(conn, "PASSIVE")?;
+    let pending = loss_window(log, copied);
+    if pending > 0 {
+        // Читатель держит старые кадры. Усечение ждало бы его, а данные уже на диске —
+        // уменьшим файл на следующем тике, когда он отпустит снимок.
+        return Ok(pending);
+    }
+    if wal_size(conn) <= limit {
+        return Ok(0);
+    }
+    // Между PASSIVE и TRUNCATE читатель мог появиться: тогда TRUNCATE подождёт его не дольше
+    // busy_timeout и вернёт busy. Окно потерь от этого не растёт — кадры уже в основном файле,
+    // и следующий тик попробует снова.
+    let (_, log, copied) = wal_checkpoint(conn, "TRUNCATE")?;
     Ok(loss_window(log, copied))
+}
+
+/// Один вызов `wal_checkpoint`: (занято ли, кадров в журнале, перелито).
+fn wal_checkpoint(conn: &Connection, mode: &str) -> Result<(i64, i64, i64)> {
+    let sql = format!("PRAGMA wal_checkpoint({mode})");
+    Ok(conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?)
+}
+
+/// Размер файла журнала. Читается с диска, а не из базы: у SQLite нет прагмы «сколько весит WAL»,
+/// а `page_count` считает страницы основного файла.
+fn wal_size(conn: &Connection) -> i64 {
+    conn.path()
+        .map(|path| PathBuf::from(format!("{path}-wal")))
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|meta| meta.len() as i64)
+        .unwrap_or(0)
 }
 
 /// Регистрирует Unicode-осведомлённые `uni_lower` и `UNICODE_NOCASE`.
@@ -718,7 +778,10 @@ mod tests {
         };
         assert!(wal(&db_path) > 0, "после коммита кадры в журнале");
 
-        let pending = checkpoint(&conn).expect("checkpoint");
+        // Потолок 0 — «усекать при любой возможности»: маленькая база за восемь мегабайт не
+        // выйдет, а усечение здесь и проверяется. С умолчанием (`JOURNAL_LIMIT`) файл остался
+        // бы на месте — это отдельная проверка ниже.
+        let pending = checkpoint_with_limit(&conn, 0).expect("checkpoint");
         assert_eq!(wal(&db_path), 0, "после checkpoint журнал усечён");
         assert_eq!(pending, 0, "неперелитых кадров не осталось");
 

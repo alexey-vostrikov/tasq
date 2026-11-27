@@ -291,3 +291,114 @@ fn a_write_waits_for_a_released_lock() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Сброс журнала при занятом читателе не ждёт его, а честно сообщает остаток.
+///
+/// Раньше здесь стоял `wal_checkpoint(TRUNCATE)`: он не усекает файл, пока читатель держит
+/// снимок, и ждёт освобождения до `busy_timeout`. При сотне агентов это значит «фоновая задача
+/// стоит в ожидании каждый тик и не сбрасывает ничего» — то есть окно потерь не закрывается
+/// именно тогда, когда оно растёт. PASSIVE переливает столько, сколько можно, и сразу
+/// возвращает остаток.
+#[test]
+fn a_checkpoint_does_not_wait_for_a_reader() {
+    let dir = temp_dir("checkpoint-reader");
+    let outcome = db::init(&dir, "FLSH", "сброс").expect("init");
+    let path = PathBuf::from(&outcome.db_path);
+
+    let mut writer = db::open(&path).expect("writer");
+    let tx = db::write_tx(&mut writer).expect("tx");
+    tx.execute(
+        "INSERT INTO activity_log (project_id, entity_type, entity_id, action, created_at)
+         VALUES (1, 'project', 1, 'probe', '2026-01-01T00:00:00.000Z')",
+        [],
+    )
+    .expect("insert");
+    tx.commit().expect("commit");
+
+    // Читатель держит снимок до конца теста: кадры новее его — недоступны для переливки.
+    let reader = db::open(&path).expect("reader");
+    reader.execute_batch("BEGIN").expect("read tx");
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+        .expect("read");
+    let mut writer = db::open(&path).expect("writer второй");
+    let tx = db::write_tx(&mut writer).expect("tx второй");
+    tx.execute(
+        "INSERT INTO activity_log (project_id, entity_type, entity_id, action, created_at)
+         VALUES (1, 'project', 1, 'probe2', '2026-01-01T00:00:00.000Z')",
+        [],
+    )
+    .expect("insert второй");
+    tx.commit().expect("commit второй");
+
+    let flusher = db::open_light(&path).expect("flusher");
+    let started = std::time::Instant::now();
+    let pending = db::checkpoint(&flusher).expect("checkpoint");
+    let elapsed_ms = started.elapsed().as_millis();
+
+    assert!(
+        elapsed_ms < db::busy_timeout_ms() as u128,
+        "сброс ждал читателя {elapsed_ms} мс — значит усечение всё ещё впереди переливки"
+    );
+    assert!(
+        pending > 0,
+        "при занятом читателе должен остаться неперелитый остаток, получено {pending}"
+    );
+
+    reader.execute_batch("COMMIT").expect("release");
+    let after = db::checkpoint(&flusher).expect("checkpoint после читателя");
+    assert_eq!(after, 0, "после освобождения остатка нет");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Файл журнала усекается только когда дорос до потолка, а не на каждом тике.
+///
+/// PASSIVE не уменьшает WAL никогда (замер: 6,8 МБ до и после, при любом
+/// `journal_size_limit`), поэтому усечение — отдельный шаг. Делать его каждый тик значило бы
+/// платить ожиданием читателя постоянно; делать никогда — значит держать журнал на максимуме
+/// вечно. Порог и есть компромисс, и он проверяется с обеих сторон.
+#[test]
+fn the_journal_is_truncated_only_above_the_limit() {
+    let dir = temp_dir("journal-limit");
+    let outcome = db::init(&dir, "WALS", "журнал").expect("init");
+    let path = PathBuf::from(&outcome.db_path);
+    let conn = db::open(&path).expect("open");
+    // Авто-переливка выключена: иначе SQLite сам уменьшит журнал и замер потеряет смысл.
+    conn.pragma_update(None, "wal_autocheckpoint", 0)
+        .expect("pragma");
+
+    let mut writer = db::open(&path).expect("writer");
+    let tx = db::write_tx(&mut writer).expect("tx");
+    let blob = "ж".repeat(4000);
+    for _ in 0..120 {
+        tx.execute(
+            "INSERT INTO activity_log (project_id, entity_type, entity_id, action, created_at)
+             VALUES (1, 'project', 1, ?1, '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![blob],
+        )
+        .expect("insert");
+    }
+    tx.commit().expect("commit");
+
+    let wal = |path: &Path| {
+        fs::metadata(format!("{}-wal", path.display()))
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    };
+    let grown = wal(&path);
+    assert!(grown > 0, "после записи журнал должен быть непустым");
+
+    // Потолок выше файла — журнал остаётся: усечение не самоцель.
+    let pending =
+        db::checkpoint_with_limit(&conn, grown as i64 * 4).expect("checkpoint ниже порога");
+    assert_eq!(pending, 0, "кадры перелиты");
+    assert_eq!(wal(&path), grown, "файл не должен усекаться ниже порога");
+
+    // Потолок ниже файла — усекается до нуля.
+    let pending = db::checkpoint_with_limit(&conn, 0).expect("checkpoint выше порога");
+    assert_eq!(pending, 0, "кадры перелиты");
+    assert_eq!(wal(&path), 0, "выше потолка журнал усечён");
+
+    let _ = fs::remove_dir_all(&dir);
+}
