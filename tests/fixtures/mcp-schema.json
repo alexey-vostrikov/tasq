@@ -133,7 +133,7 @@
       "readOnlyHint": false,
       "title": "comment_update"
     },
-    "description": "Edit a comment's text: the date it was written stays",
+    "description": "Edit a comment's text; the date stays",
     "inputSchema": {
       "properties": {
         "content": {

@@ -1836,7 +1836,7 @@ pub const OPERATIONS: &[Operation] = &[
     },
     Operation {
         tool: "comment_update",
-        summary: "Edit a comment's text: the date it was written stays",
+        summary: "Edit a comment's text; the date stays",
         args: &[
             Arg {
                 name: "id",

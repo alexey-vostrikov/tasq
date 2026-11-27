@@ -8,7 +8,7 @@
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 47 | 6000 | 5788 |
+| `full` | 47 | 6000 | 5785 |
 | `agent` | 30 | 4000 | 3884 |
 | `read-only` | 17 | 2000 | 1926 |
 | `migration` | 6 | 800 | 603 |
@@ -45,7 +45,7 @@
 | `comment_add` | full, agent | 125 | `content`, `ref` | Add a comment to a node: a thread that survives sessions |
 | `comment_list` | full, agent, read-only | 108 | `ref` | Comments of a node in chronological order |
 | `comment_delete` | full | 126 | `id` | Soft-delete a comment, or restore it with restore=true |
-| `comment_update` | full | 125 | `content`, `id` | Edit a comment's text: the date it was written stays |
+| `comment_update` | full | 122 | `content`, `id` | Edit a comment's text; the date stays |
 | `note_save` | full, agent | 164 | — | Create or update a note: decision, context, meeting, blocker, release |
 | `note_list` | full, agent, read-only | 116 | — | Notes of the project, newest first |
 | `note_search` | full, agent, read-only | 90 | `query` | Search notes by keyword |
