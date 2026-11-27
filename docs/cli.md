@@ -32,6 +32,23 @@ tasq init [ОПЦИИ]
 | `--key` | `KEY` | `TASQ` | Project key used in dot-notation IDs ([A-Z0-9]{2,8}) |
 | `--name` | `NAME` | — | Project name |
 
+## `compact`
+
+Move journal and status history older than a horizon into a sibling archive file
+
+Move journal and status history older than a horizon into a sibling archive file
+
+The rows are not deleted: they move to `NAME-archive.db` and stay readable through the same commands (the archive is attached automatically). Without this the two append-only tables grow forever: on a ten-thousand-node fixture the status history alone is 43% of the file.
+
+```
+tasq compact [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--before` | `DATE` | — | Everything older than this date (YYYY-MM-DD) or timestamp moves; default is a year ago |
+| `--dry-run` | — | — | Only report what would move, change nothing |
+
 ## `migrate`
 
 Bring the database schema up to the version this binary supports

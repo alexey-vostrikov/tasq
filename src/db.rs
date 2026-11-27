@@ -216,6 +216,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     // `journal_size_limit` — тоже свойство соединения (замер: в новом соединении снова -1),
     // поэтому ставится там, где усекают журнал, — в соединении фонового сброса (`open_light`).
     register_unicode(&conn)?;
+    // Архив журнала и истории подключается к каждому соединению, если файл есть: читающие
+    // запросы видят объединение, и вынос старых строк не делает отчёты ложными. Файла нет —
+    // ничего не происходит (см. `archive::attach`).
+    crate::archive::attach(&conn, path)?;
     Ok(conn)
 }
 
@@ -239,6 +243,9 @@ pub fn open_reading(path: &Path) -> Result<Connection> {
          PRAGMA busy_timeout = {timeout};"
     ))?;
     register_unicode(&conn)?;
+    // Тот же архив на чтение: `history` и `find` — читающие команды, и именно они чаще всего
+    // спрашивают старые строки.
+    crate::archive::attach(&conn, path)?;
     Ok(conn)
 }
 
@@ -689,6 +696,11 @@ pub struct DoctorReport {
     pub supported_version: i64,
     /// Схема старше поддерживаемой: нужен `tasq migrate`.
     pub schema_outdated: bool,
+    /// Архив журнала и истории: есть ли он, сколько весит и сколько строк держит.
+    ///
+    /// Отчёт обязан называть это, а не только размер основного файла: после `tasq compact`
+    /// «база стала меньше» без второй половины картины читается как «данные пропали».
+    pub archive: crate::archive::ArchiveInfo,
     pub integrity: String,
     pub foreign_key_violations: i64,
     pub projects: i64,
@@ -786,6 +798,7 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
         // отчёт не увидит вовсе — `open` вернул бы её без проверки, но читать её таблицы
         // вслепую нельзя, и такая база отвергается ниже, до сборки отчёта.
         schema_outdated: schema_version < SUPPORTED_SCHEMA_VERSION,
+        archive: crate::archive::info(&conn, path),
         ok: integrity == "ok"
             && foreign_key_violations == 0
             && schema_version == SUPPORTED_SCHEMA_VERSION,

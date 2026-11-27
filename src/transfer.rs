@@ -146,7 +146,16 @@ pub fn dump(conn: &Connection) -> Result<Value> {
     for table in DUMP_TABLES {
         // Имя таблицы — из константы, а не из входа: подстановка пользовательских строк в SQL
         // здесь недопустима даже при том, что список закрыт.
-        let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY 1"))?;
+        //
+        // Две таблицы читаются через объединение с архивом: вынесенные строки — часть состояния
+        // базы, и дамп без них потерял бы историю молча. Именно молча: файл бы выгрузился,
+        // загрузился и «работал», просто без прошлого года.
+        let source: String = match *table {
+            "node_status_history" => format!("({})", crate::archive::history_source(conn)),
+            "activity_log" => format!("({})", crate::archive::log_source(conn)),
+            _ => (*table).to_string(),
+        };
+        let mut stmt = conn.prepare(&format!("SELECT * FROM {source} ORDER BY 1"))?;
         // `column_names()` возвращает ИТЕРАТОР `&str`, а не срез: `.iter()` у него нет, а
         // `.into_iter()` clippy с `-D warnings` отбивает как лишнее преобразование.
         let columns: Vec<String> = stmt.column_names().map(str::to_string).collect();

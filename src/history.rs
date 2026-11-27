@@ -125,10 +125,14 @@ pub fn reason_of(cause: &str) -> &'static str {
 /// текста в местах записи. Порядок — по `at`, затем по `id`: две правки в одну миллисекунду
 /// обязаны читаться в том порядке, в каком были записаны.
 pub fn timeline(conn: &Connection, node_id: i64) -> Result<Vec<Transition>> {
-    let mut stmt = conn.prepare(
-        "SELECT at, from_status, to_status, cause, actor FROM node_status_history
-         WHERE node_id = ?1 ORDER BY at, id",
-    )?;
+    // Источник — объединение с архивом, если он подключён: вынесенные переходы остаются
+    // частью истории узла, а не пропадают из неё (см. `crate::archive`).
+    let sql = format!(
+        "SELECT at, from_status, to_status, cause, actor FROM ({}) h
+         WHERE h.node_id = ?1 ORDER BY h.at, h.id",
+        crate::archive::history_source(conn)
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![node_id], |row| {
         let cause: String = row.get(3)?;
         Ok(Transition {

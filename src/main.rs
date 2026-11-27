@@ -20,7 +20,9 @@ use tasq::resource;
 use tasq::session;
 use tasq::status::{Kind, Status};
 use tasq::tui;
-use tasq::{activity, budget, burnup, comment, db, history, note, overview, template, transfer};
+use tasq::{
+    activity, archive, budget, burnup, comment, db, history, note, overview, template, transfer,
+};
 
 #[cfg(test)]
 #[path = "surface_checks.rs"]
@@ -71,6 +73,20 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Move journal and status history older than a horizon into a sibling archive file
+    ///
+    /// The rows are not deleted: they move to `NAME-archive.db` and stay readable through the same
+    /// commands (the archive is attached automatically). Without this the two append-only tables
+    /// grow forever: on a ten-thousand-node fixture the status history alone is 43% of the file.
+    Compact {
+        /// Everything older than this date (YYYY-MM-DD) or timestamp moves; default is a year ago
+        #[arg(long, value_name = "DATE")]
+        before: Option<String>,
+        /// Only report what would move, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Bring the database schema up to the version this binary supports
     ///
     /// Opening a database never rewrites its schema: a hundred commands started at once against a
@@ -873,6 +889,70 @@ fn open_ref_reading(
     Ok((conn, project))
 }
 
+/// Горизонт хранения: момент, до которого строки считаются старыми.
+///
+/// Принимается дата (`2025-11-27`) или полная метка времени; дата трактуется как начало суток
+/// UTC, потому что «старше года» — это про день, а не про час. Без аргумента — год назад
+/// (`archive::DEFAULT_HORIZON_DAYS`): умолчание должно быть безопасным, а год — это горизонт, за
+/// которым история перестаёт быть историей.
+fn horizon(value: Option<&str>) -> Result<String> {
+    match value {
+        None => {
+            let moment = time::OffsetDateTime::now_utc()
+                - time::Duration::days(archive::DEFAULT_HORIZON_DAYS);
+            Ok(db::iso_at(moment))
+        }
+        Some(text) => {
+            let text = text.trim();
+            // Дата без времени — начало суток; полная метка проверяется на разбор, чтобы
+            // опечатка не превратилась в «перенести всё».
+            if text.len() == 10 {
+                // Разбор вручную: макросы `time` не включены в зависимостях, а тянуть их ради
+                // одной даты незачем — формат фиксирован и проверяется по частям.
+                let mut parts = text.split('-');
+                let (Some(year), Some(month), Some(day), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(Error::InvalidValue {
+                        field: "before".to_string(),
+                        value: format!("{text} (expected YYYY-MM-DD)"),
+                    });
+                };
+                let number = |part: &str| part.parse::<i32>().ok();
+                let date = match (number(year), number(month), number(day)) {
+                    (Some(y), Some(m), Some(d)) => time::Date::from_calendar_date(
+                        y,
+                        time::Month::try_from(u8::try_from(m).unwrap_or(0)).map_err(|_| {
+                            Error::InvalidValue {
+                                field: "before".to_string(),
+                                value: format!("{text} (month out of range)"),
+                            }
+                        })?,
+                        u8::try_from(d).unwrap_or(0),
+                    )
+                    .ok(),
+                    _ => None,
+                };
+                let Some(date) = date else {
+                    return Err(Error::InvalidValue {
+                        field: "before".to_string(),
+                        value: format!("{text} (not a valid date)"),
+                    });
+                };
+                return Ok(db::iso_at(date.midnight().assume_utc()));
+            }
+            match time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+            {
+                Ok(moment) => Ok(db::iso_at(moment)),
+                Err(_) => Err(Error::InvalidValue {
+                    field: "before".to_string(),
+                    value: format!("{text} (expected YYYY-MM-DD or an RFC 3339 timestamp)"),
+                }),
+            }
+        }
+    }
+}
+
 /// Формат выходного документа: флаг → расширение `--out` → JSON.
 ///
 /// Явный флаг важнее расширения (файл без расширения — обычное дело), расширение важнее
@@ -1488,6 +1568,49 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
         },
 
+        Command::Compact { before, dry_run } => {
+            let cwd = std::env::current_dir()?;
+            let path = db::discover(&cwd, cli.db.as_deref())?;
+            let cutoff = horizon(before.as_deref())?;
+            let mut conn = db::open_checked(&path)?;
+            let report = archive::compact(&mut conn, &path, &cutoff, *dry_run)?;
+            if cli.json {
+                print_json(&report);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let verb = if report.dry_run {
+                "would move"
+            } else {
+                "moved"
+            };
+            println!(
+                "{verb}: {} history row(s), {} log row(s) older than {}",
+                report.history_rows, report.log_rows, report.before
+            );
+            if report.dry_run {
+                println!(
+                    "database: {} ({} КБ), estimate after: {} КБ",
+                    report.db_path,
+                    report.bytes_before / 1024,
+                    report.bytes_after / 1024
+                );
+                println!(
+                    "run without --dry-run to move them into {}",
+                    report.archive_path
+                );
+            } else {
+                println!(
+                    "database: {} КБ -> {} КБ (freed {} КБ), archive: {} КБ",
+                    report.bytes_before / 1024,
+                    report.bytes_after / 1024,
+                    report.freed() / 1024,
+                    report.archive_bytes / 1024
+                );
+                println!("archive: {}", report.archive_path);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Migrate => {
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
@@ -1542,6 +1665,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     "data:      {} project(s), {} node(s), {} live lease(s)",
                     report.projects, report.nodes, report.live_attempts
                 );
+                if report.archive.present {
+                    println!(
+                        "archive:   {} ({} КБ, {} history row(s), {} log row(s) moved out)",
+                        report.archive.archive_path,
+                        report.archive.bytes / 1024,
+                        report.archive.history_rows,
+                        report.archive.log_rows
+                    );
+                }
                 if report.expired_attempts > 0 {
                     println!(
                         "stale:     {} expired attempt(s), {} orphan reservation(s)",

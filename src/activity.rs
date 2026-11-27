@@ -89,15 +89,18 @@ pub struct Record {
 
 /// Последние записи проекта (свежие первыми).
 pub fn recent(conn: &Connection, project_id: i64, limit: i64) -> Result<Vec<Record>> {
-    let mut stmt = conn.prepare(
+    // Источник — объединение с архивом: «последние записи» не должны обрываться на границе
+    // выноса, иначе лента выглядит так, будто история началась в день усечения.
+    let source = crate::archive::log_source(conn);
+    let mut stmt = conn.prepare(&format!(
         "SELECT a.id, a.node_id, n.path, a.action, a.field_name, a.old_value, a.new_value,
                 a.summary, a.actor, a.created_at
-         FROM activity_log a
+         FROM ({source}) a
          LEFT JOIN nodes n ON n.id = a.node_id
          WHERE a.project_id = ?1
          ORDER BY a.id DESC
-         LIMIT ?2",
-    )?;
+         LIMIT ?2"
+    ))?;
     let rows = stmt.query_map(params![project_id, limit], |row| {
         Ok(Record {
             id: row.get(0)?,

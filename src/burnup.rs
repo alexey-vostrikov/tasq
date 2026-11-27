@@ -337,8 +337,12 @@ pub enum Transition {
 /// всеми путями мутации, поэтому дата закрытия в нём держалась на совпадении текста в шести
 /// местах записи. История — факт перехода, и её пишет каждый путь смены статуса.
 fn transition(conn: &Connection, node_id: i64, status: &str) -> Result<Transition> {
+    // Объединение с архивом: первый переход в `done` мог случиться год назад и уехать в архив, и
+    // без него закрытый узел стал бы «неизвестным» — то есть отчёт сказал бы «не сделано» про
+    // сделанное. Ошибка здесь дороже медленного запроса.
+    let source = crate::archive::history_source(conn);
     let recorded: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM node_status_history WHERE node_id = ?1",
+        &format!("SELECT COUNT(*) FROM ({source}) h WHERE h.node_id = ?1"),
         params![node_id],
         |row| row.get(0),
     )?;
@@ -347,9 +351,11 @@ fn transition(conn: &Connection, node_id: i64, status: &str) -> Result<Transitio
     }
     let text: Option<String> = conn
         .query_row(
-            "SELECT at FROM node_status_history
-             WHERE node_id = ?1 AND to_status = ?2
-             ORDER BY at, id LIMIT 1",
+            &format!(
+                "SELECT h.at FROM ({source}) h
+                 WHERE h.node_id = ?1 AND h.to_status = ?2
+                 ORDER BY h.at, h.id LIMIT 1"
+            ),
             params![node_id, status],
             |row| row.get(0),
         )

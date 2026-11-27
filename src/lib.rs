@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod activity;
+pub mod archive;
 pub mod bench;
 pub mod budget;
 pub mod burnup;
