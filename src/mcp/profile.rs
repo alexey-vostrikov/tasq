@@ -93,6 +93,7 @@ impl Profile {
                 "tasq_history",
                 "tasq_search",
                 "tasq_dashboard",
+                "tasq_stats",
                 "tasq_burnup",
             ],
             Profile::ReadOnly => &[
@@ -111,6 +112,7 @@ impl Profile {
                 "tasq_history",
                 "tasq_search",
                 "tasq_dashboard",
+                "tasq_stats",
                 "tasq_burnup",
                 "tasq_risk",
             ],
@@ -187,6 +189,7 @@ pub const ALL_TOOLS: &[&str] = &[
     // Поиск и обзоры (4)
     "tasq_search",
     "tasq_dashboard",
+    "tasq_stats",
     "tasq_burnup",
     "tasq_risk",
     // Перенос данных (2)

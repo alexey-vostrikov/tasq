@@ -176,6 +176,10 @@ fn with_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
 /// Разброс обязателен: без него повторы всех процессов идут в одну фазу и сталкиваются снова
 /// тем же составом. Пауза остаётся короткой — вся волна обязана уложиться в доли секунды.
 fn backoff(round: usize) {
+    // Повтор — событие, которое видно только здесь: в отчёте он превращается в «сколько ждали
+    // из-за соседа». Считать его в вызывающем коде значило бы протащить счётчик через тридцать
+    // подписей ради одной цифры.
+    crate::metrics::count_retry();
     let spread = 5u64 + 10 * round as u64;
     let jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -696,6 +700,10 @@ pub struct DoctorReport {
     pub supported_version: i64,
     /// Схема старше поддерживаемой: нужен `tasq migrate`.
     pub schema_outdated: bool,
+    /// Размер файла метрик рядом с базой (0 — метрик ещё не было).
+    ///
+    /// Считается отдельно от базы: метрики живут своим файлом, чтобы чтение не писало в данные.
+    pub metrics_bytes: u64,
     /// Архив журнала и истории: есть ли он, сколько весит и сколько строк держит.
     ///
     /// Отчёт обязан называть это, а не только размер основного файла: после `tasq compact`
@@ -799,6 +807,7 @@ pub fn doctor(path: &Path) -> Result<DoctorReport> {
         // вслепую нельзя, и такая база отвергается ниже, до сборки отчёта.
         schema_outdated: schema_version < SUPPORTED_SCHEMA_VERSION,
         archive: crate::archive::info(&conn, path),
+        metrics_bytes: crate::metrics::size(path),
         ok: integrity == "ok"
             && foreign_key_violations == 0
             && schema_version == SUPPORTED_SCHEMA_VERSION,

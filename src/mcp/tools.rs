@@ -201,9 +201,19 @@ fn arg_resources(args: &Value) -> Vec<crate::resource::Resource> {
 
 /// Обработчик одного инструмента.
 pub fn call(ctx: &mut Context, name: &str, args: &Value) -> Value {
+    // Замер вокруг вызова: имя инструмента, длительность и код ошибки. Пишется после ответа и в
+    // отдельный файл (`crate::metrics`), поэтому чтение через MCP по-прежнему не трогает базу.
+    let started = std::time::Instant::now();
     // Типы проверяются по опубликованной схеме до обработчика: иначе `weight: "много"`
     // молча превращался в значение по умолчанию, и агент не узнавал, что ошибся.
     let result = check_arguments(name, args).and_then(|()| dispatch(ctx, name, args));
+    crate::metrics::record(
+        &ctx.db_path,
+        name,
+        started.elapsed(),
+        result.as_ref().err().map(|err| err.code()).unwrap_or("ok"),
+        crate::metrics::take_retries(),
+    );
     match result {
         Ok(value) => value,
         Err(err) => error_content(&err),
@@ -1073,6 +1083,15 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             // ранжирования, должен знать это из ответа, а не догадываться по порядку строк.
             Ok(text(&found))
         }
+        "tasq_stats" => {
+            // Метрики читаются из файла рядом с базой, а не из неё: сам трекер работы не пишет в
+            // данные, которые отслеживает (`crate::metrics`).
+            // Окно — сутки: у инструмента один вопрос и один ответ. Прune и произвольное окно
+            // остаются в CLI, где стоимость схемы никого не ограничивает.
+            let since = crate::metrics::parse_window(None)?;
+            let report = crate::metrics::report(&ctx.db_path, &since, false)?;
+            Ok(text(&report))
+        }
         "tasq_dashboard" => {
             // `all` — обзор по каждому проекту: один вызов вместо обхода проектов снаружи.
             if arg_bool(args, "all") {
@@ -1245,6 +1264,10 @@ fn schema(op: &crate::surface::Operation) -> Value {
 #[cfg(test)]
 const PROJECT_FREE: &[&str] = &[
     "tasq_init",
+    // Метрики считаются по всей базе, а не по проекту: файл рядом с базой один, и вопрос
+    // «сколько звали» не имеет проектного измерения. Подставить `project` значило бы обещать
+    // фильтр, которого нет.
+    "tasq_stats",
     "project_create",
     "project_select",
     "project_list",

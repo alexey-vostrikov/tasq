@@ -21,6 +21,7 @@ pub mod history;
 pub mod lease;
 pub mod mcp;
 pub mod meta;
+pub mod metrics;
 pub mod node;
 pub mod note;
 pub mod overview;

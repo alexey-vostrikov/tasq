@@ -1440,6 +1440,21 @@
     },
     "name": "tasq_search"
   },
+  "tasq_stats": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_stats"
+    },
+    "description": "Usage of this tracker: calls, timings, failures, retries",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "tasq_stats"
+  },
   "tasq_unlink": {
     "annotations": {
       "destructiveHint": false,

@@ -32,6 +32,23 @@ tasq init [ОПЦИИ]
 | `--key` | `KEY` | `TASQ` | Project key used in dot-notation IDs ([A-Z0-9]{2,8}) |
 | `--name` | `NAME` | — | Project name |
 
+## `stat`
+
+Show how the tracker has actually been used: calls, timings, failure codes, retries
+
+Show how the tracker has actually been used: calls, timings, failure codes, retries
+
+Read from the sidecar metrics file, never from the database: tracking work must not write to the data it tracks (that is what keeps a hundred readers from fighting over a write lock).
+
+```
+tasq stat [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--since` | `WINDOW` | — | Window to report on: `24h`, `7d`, `30d`, or an RFC 3339 timestamp; default is 24h |
+| `--prune` | — | — | Also drop entries older than the retention horizon (30 days) |
+
 ## `compact`
 
 Move journal and status history older than a horizon into a sibling archive file

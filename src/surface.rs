@@ -1835,6 +1835,26 @@ pub const OPERATIONS: &[Operation] = &[
         cli: Some("template save"),
     },
     Operation {
+        tool: "tasq_stats",
+        summary: "Usage of this tracker: calls, timings, failures, retries",
+        // Аргументов нет намеренно: схема стоит около 130 токенов, а `read-only` упирается в свои
+        // 2000 ровно на них (замер: 2060 с `since` и `prune`). Агенту нужен ответ «как дела за
+        // сутки», и он его получает; окно и чистку выбирает человек флагами CLI, где бюджет не
+        // считается.
+        args: &[],
+        cli_only: &[
+            (
+                "since",
+                "окно отчёта выбирает человек; агенту по умолчанию сутки",
+            ),
+            ("prune", "чистка старых метрик — обслуживание, а не чтение"),
+        ],
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        cli: Some("stat"),
+    },
+    Operation {
         tool: "comment_update",
         summary: "Edit a comment's text; the date stays",
         args: &[

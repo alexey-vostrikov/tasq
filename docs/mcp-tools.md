@@ -2,15 +2,15 @@
 
 Файл сгенерирован командой `tasq docs` из каталога самого сервера: имя, описание и схема берутся из того же кода, что отвечает на `tools/list`.
 
-Всего инструментов: 47.
+Всего инструментов: 48.
 
 ## Профили
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 47 | 6000 | 5785 |
-| `agent` | 30 | 4000 | 3884 |
-| `read-only` | 17 | 2000 | 1926 |
+| `full` | 48 | 6000 | 5852 |
+| `agent` | 31 | 4000 | 3951 |
+| `read-only` | 18 | 2000 | 1993 |
 | `migration` | 6 | 800 | 603 |
 
 ## Каталог
@@ -60,6 +60,7 @@
 | `tasq_history` | full, agent, read-only | 103 | `ref` | Status history of a node: when it changed, why, and who |
 | `tasq_search` | full, agent, read-only | 108 | `query` | Full-text search across nodes and notes; without a project it searches every project |
 | `tasq_dashboard` | full, agent, read-only | 106 | — | One-call overview: board, live leases, next candidates, at-risk nodes |
+| `tasq_stats` | full, agent, read-only | 68 | — | Usage of this tracker: calls, timings, failures, retries |
 | `tasq_burnup` | full, agent, read-only | 143 | — | Burn-up series and forecast by count, points or hours |
 | `tasq_risk` | full, read-only | 99 | — | Nodes that fall behind their own due date |
 | `tasq_export` | full, migration | 94 | — | Export the project as JSON with a checksum |

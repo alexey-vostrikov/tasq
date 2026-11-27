@@ -14,6 +14,7 @@ use tasq::error::{Error, Result};
 use tasq::git;
 use tasq::lease;
 use tasq::mcp;
+use tasq::metrics;
 use tasq::node::{self, Filter, NewNode, Node, Patch};
 use tasq::project::{self, Project};
 use tasq::resource;
@@ -73,6 +74,19 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Show how the tracker has actually been used: calls, timings, failure codes, retries
+    ///
+    /// Read from the sidecar metrics file, never from the database: tracking work must not write to
+    /// the data it tracks (that is what keeps a hundred readers from fighting over a write lock).
+    Stat {
+        /// Window to report on: `24h`, `7d`, `30d`, or an RFC 3339 timestamp; default is 24h
+        #[arg(long, value_name = "WINDOW")]
+        since: Option<String>,
+        /// Also drop entries older than the retention horizon (30 days)
+        #[arg(long)]
+        prune: bool,
+    },
+
     /// Move journal and status history older than a horizon into a sibling archive file
     ///
     /// The rows are not deleted: they move to `NAME-archive.db` and stay readable through the same
@@ -600,6 +614,68 @@ enum Command {
     },
 }
 
+impl Command {
+    /// Имя команды для метрики: одно слово, без значений аргументов.
+    ///
+    /// Выписано руками, а не выведено из `Debug`: `format!("{:?}")` дал бы всю структуру с
+    /// параметрами, а метрика обязана складываться по команде — иначе `ls --limit 5` и `ls --tag x`
+    /// станут разными операциями, и перцентили посчитаются по одной строке.
+    ///
+    /// Проверка на полноту — в тесте `surface_checks`: у каждой команды обязано быть имя, иначе
+    /// метрика молча начнёт складывать всё в одну строку.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Init { .. } => "init",
+            Command::Compact { .. } => "compact",
+            Command::Stat { .. } => "stat",
+            Command::Migrate => "migrate",
+            Command::Serve { .. } => "serve",
+            Command::Doctor { .. } => "doctor",
+            Command::Add { .. } => "add",
+            Command::Show { .. } => "show",
+            Command::Ls { .. } => "ls",
+            Command::Set { .. } => "set",
+            Command::Mv { .. } => "mv",
+            Command::Rm { .. } => "rm",
+            Command::Restore { .. } => "restore",
+            Command::Archive { .. } => "archive",
+            Command::Log { .. } => "log",
+            Command::History { .. } => "history",
+            Command::Claim { .. } => "claim",
+            Command::Reserve { .. } => "reserve",
+            Command::Unreserve { .. } => "unreserve",
+            Command::Renew { .. } => "renew",
+            Command::Release { .. } => "release",
+            Command::Holders => "holders",
+            Command::Dep { .. } => "dep",
+            Command::Next { .. } => "next",
+            Command::Note { .. } => "note",
+            Command::Comment { .. } => "comment",
+            Command::Template { .. } => "template",
+            Command::Find { .. } => "find",
+            Command::Ctx { .. } => "ctx",
+            Command::Board { .. } => "board",
+            Command::Time { .. } => "time",
+            Command::Bulk { .. } => "bulk",
+            Command::Burnup { .. } => "burnup",
+            Command::Risk { .. } => "risk",
+            Command::Export { .. } => "export",
+            Command::Import { .. } => "import",
+            Command::Load { .. } => "load",
+            Command::Tui { .. } => "tui",
+            Command::Mcp { .. } => "mcp",
+            Command::Create { .. } => "create",
+            Command::List { .. } => "list",
+            Command::Update { .. } => "update",
+            Command::Delete { .. } => "delete",
+            Command::Docs { .. } => "docs",
+            Command::Tokens { .. } => "tokens",
+            Command::Connect { .. } => "connect",
+            Command::Completions { .. } => "completions",
+        }
+    }
+}
+
 /// Что создаётся командой `tasq create`.
 #[derive(Subcommand)]
 enum CreateWhat {
@@ -815,13 +891,47 @@ enum DepCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
+    // Замер вокруг всей работы: длительность и исход одной цифрой. Метрика пишется после того,
+    // как ответ уже отдан, и её сбой не влияет на код возврата.
+    let started = std::time::Instant::now();
+    let result = run(&cli);
+    record_call(&cli, started.elapsed(), result.as_ref().err());
+    match result {
         Ok(code) => code,
         Err(err) => {
             report_error(&err, cli.json);
             ExitCode::from(1)
         }
     }
+}
+
+/// Записать метрику вызова: имя команды, длительность, исход и число повторов.
+///
+/// Путь к базе ищется заново: `run` мог его не найти вовсе (команда до `init`), и тогда метрики
+/// просто не будет — это не ошибка. Файл метрик лежит рядом с базой (`metrics::path`), поэтому
+/// запись не трогает основную базу и не мешает чтению.
+fn record_call(cli: &Cli, elapsed: std::time::Duration, error: Option<&Error>) {
+    let db_path = match &cli.db {
+        Some(path) => path.clone(),
+        None => match std::env::current_dir() {
+            Ok(cwd) => match db::discover(&cwd, None) {
+                Ok(path) => path,
+                Err(_) => return,
+            },
+            Err(_) => return,
+        },
+    };
+    let outcome = match error {
+        Some(err) => err.code().to_string(),
+        None => "ok".to_string(),
+    };
+    metrics::record(
+        &db_path,
+        cli.command.name(),
+        elapsed,
+        &outcome,
+        metrics::take_retries(),
+    );
 }
 
 /// Открывает базу и проект; нужен почти каждой команде.
@@ -1576,6 +1686,63 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
         },
 
+        Command::Stat { since, prune } => {
+            let cwd = std::env::current_dir()?;
+            let path = db::discover(&cwd, cli.db.as_deref())?;
+            let since = metrics::parse_window(since.as_deref())?;
+            let report = metrics::report(&path, &since, *prune)?;
+            if cli.json {
+                print_json(&report);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !report.present {
+                // Пустой отчёт — ответ, а не ошибка: метрик ещё не было.
+                println!("no metrics yet ({})", report.metrics_path);
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "since {}: {} call(s), {} failure(s), {} lock retry(ies), {} мс всего",
+                report.since, report.calls, report.failures, report.retries, report.total_ms
+            );
+            if report.pruned > 0 {
+                println!(
+                    "pruned: {} row(s) older than {} days",
+                    report.pruned,
+                    metrics::KEEP_DAYS
+                );
+            }
+            if !report.by_outcome.is_empty() {
+                println!("\noutcomes:");
+                for row in &report.by_outcome {
+                    println!("  {:<28} {:>6}", row.outcome, row.calls);
+                }
+            }
+            if let Some(leases) = &report.leases {
+                println!(
+                    "leases:    {} live, {} expired open, {} expired in window, {} reservation(s); journal {} КБ",
+                    leases.live,
+                    leases.expired_open,
+                    leases.expired_in_window,
+                    leases.reservations,
+                    leases.journal_bytes / 1024
+                );
+            }
+            if !report.by_operation.is_empty() {
+                println!("\noperations:");
+                println!(
+                    "  {:<20} {:>6} {:>8} {:>8} {:>8} {:>8}",
+                    "operation", "calls", "p50", "p95", "max", "failed"
+                );
+                for row in &report.by_operation {
+                    println!(
+                        "  {:<20} {:>6} {:>8} {:>8} {:>8} {:>8}",
+                        row.operation, row.calls, row.p50_ms, row.p95_ms, row.max_ms, row.failures
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Compact { before, dry_run } => {
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
@@ -1673,6 +1840,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     "data:      {} project(s), {} node(s), {} live lease(s)",
                     report.projects, report.nodes, report.live_attempts
                 );
+                if report.metrics_bytes > 0 {
+                    println!(
+                        "metrics:   {} КБ (tasq stat — что и сколько раз звали)",
+                        report.metrics_bytes / 1024
+                    );
+                }
                 if report.archive.present {
                     println!(
                         "archive:   {} ({} КБ, {} history row(s), {} log row(s) moved out)",
