@@ -67,6 +67,21 @@ pub struct Node {
 }
 
 impl Node {
+    /// Происхождение узла в системе-предшественнике, если он пришёл импортом.
+    ///
+    /// Единственный ключ `nodes.metadata`, который называет сам tasq (реестр — `crate::meta`).
+    /// Чтение через аксессор, а не через `metadata.get("saga_id")`: строковый литерал в двух
+    /// местах — это две возможности разойтись, и одна уже разошлась (число вместо строки).
+    ///
+    /// `None` — узел создан здесь. Пустое значение читается как отсутствие: `saga_id=""` в дампе
+    /// писал бы «происхождение неизвестно» вместо «не было», а это разные утверждения.
+    pub fn saga_id(&self) -> Option<&str> {
+        self.metadata
+            .get(crate::meta::NODE_SAGA_ID)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+    }
+
     pub fn kind(&self) -> Kind {
         Kind::parse(&self.kind).unwrap_or(Kind::Micro)
     }

@@ -1352,7 +1352,10 @@ pub fn import_saga(
         {
             // Текстом, а не числом: хранимое поле — объект строк, и значение-число сделало бы
             // чтение узла зависимым от того, кто его записал (см. `node::normalise_metadata_json`).
-            object.insert("saga_id".to_string(), json!(saga_id.to_string()));
+            object.insert(
+                crate::meta::NODE_SAGA_ID.to_string(),
+                json!(saga_id.to_string()),
+            );
         }
         tx.execute(
             "INSERT INTO nodes (project_id, parent_id, depth, seq, path, kind, title, description,

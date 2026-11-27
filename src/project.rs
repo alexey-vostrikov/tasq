@@ -29,7 +29,7 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         .ok()
         .and_then(|value| {
             value
-                .get("reopen")
+                .get(crate::meta::PROJECT_REOPEN)
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
         })
