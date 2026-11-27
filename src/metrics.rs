@@ -27,6 +27,10 @@ use serde::Serialize;
 use crate::error::Result;
 
 /// Имя файла метрик рядом с базой: `hermes.db` → `hermes-metrics.db`.
+///
+/// Рядом с найденным путём, а не рядом с файлом, на который он указывает: `~/.tasq/tasq.db` бывает
+/// символической ссылкой на базу в `~/.local/share`, и метрики тогда ложатся к ссылке. Это
+/// осознанно — один найденный путь даёт один файл метрик, и `TASQ_DB` не раздваивает счётчик.
 pub fn path(db_path: &Path) -> PathBuf {
     let stem = db_path
         .file_stem()
