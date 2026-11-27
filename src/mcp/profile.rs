@@ -158,6 +158,7 @@ pub const ALL_TOOLS: &[&str] = &[
     "comment_add",
     "comment_list",
     "comment_delete",
+    "comment_update",
     // Заметки (4)
     "note_save",
     "note_list",
@@ -189,12 +190,24 @@ mod tests {
 
     #[test]
     fn full_profile_has_exactly_the_declared_catalogue() {
-        // 42 из ТЗ, tasq_risk (M6), project_select/project_delete (проекты) и tasq_history: 46.
-        assert_eq!(ALL_TOOLS.len(), 46, "каталог — 46 инструментов");
-        let mut unique: Vec<&str> = ALL_TOOLS.to_vec();
-        unique.sort_unstable();
+        // Число больше не записано здесь: каталог обязан совпадать с объявлением
+        // (`crate::surface`), и сверка идёт по именам, а не по длине. Раньше тут стояло 46 —
+        // и добавление инструмента в объявление краснело сразу в трёх местах, каждое со своей
+        // цифрой.
+        let mut declared: Vec<&str> = crate::surface::OPERATIONS
+            .iter()
+            .map(|op| op.tool)
+            .collect();
+        declared.sort_unstable();
+        let mut catalogue: Vec<&str> = ALL_TOOLS.to_vec();
+        catalogue.sort_unstable();
+        assert_eq!(
+            catalogue, declared,
+            "каталог профиля full и объявление разошлись"
+        );
+        let mut unique = catalogue.clone();
         unique.dedup();
-        assert_eq!(unique.len(), ALL_TOOLS.len(), "имена не повторяются");
+        assert_eq!(unique.len(), catalogue.len(), "имена не повторяются");
         assert_eq!(Profile::Full.tools().len(), ALL_TOOLS.len());
     }
 

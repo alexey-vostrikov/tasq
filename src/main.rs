@@ -22,6 +22,10 @@ use tasq::status::{Kind, Status};
 use tasq::tui;
 use tasq::{activity, budget, burnup, comment, db, history, note, overview, template, transfer};
 
+#[cfg(test)]
+#[path = "surface_checks.rs"]
+mod surface_checks;
+
 #[derive(Parser)]
 #[command(
     name = "tasq",

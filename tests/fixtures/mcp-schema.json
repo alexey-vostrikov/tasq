@@ -1,0 +1,1597 @@
+{
+  "activity_log": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "activity_log"
+    },
+    "description": "Recent changes: what happened and when",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "How many records",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "activity_log"
+  },
+  "comment_add": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "comment_add"
+    },
+    "description": "Add a comment to a node: a thread that survives sessions",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "Comment text",
+          "type": "string"
+        },
+        "holder": {
+          "description": "Author name",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Target node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "comment_add"
+  },
+  "comment_delete": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "comment_delete"
+    },
+    "description": "Soft-delete a comment, or restore it with restore=true",
+    "inputSchema": {
+      "properties": {
+        "id": {
+          "description": "Comment id",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it is removed",
+          "type": "string"
+        },
+        "restore": {
+          "description": "Bring it back instead",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "comment_delete"
+  },
+  "comment_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "comment_list"
+    },
+    "description": "Comments of a node in chronological order",
+    "inputSchema": {
+      "properties": {
+        "include_deleted": {
+          "description": "Show removed ones",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Target node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "comment_list"
+  },
+  "comment_update": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "comment_update"
+    },
+    "description": "Edit a comment's text: the date it was written stays",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "New text",
+          "type": "string"
+        },
+        "holder": {
+          "description": "Author name",
+          "type": "string"
+        },
+        "id": {
+          "description": "Comment id",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "comment_update"
+  },
+  "node_archive": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_archive"
+    },
+    "description": "Archive or unarchive a subtree; nothing is deleted",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Subtree root",
+          "type": "string"
+        },
+        "undo": {
+          "description": "Unarchive instead",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "node_archive"
+  },
+  "node_batch_update": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_batch_update"
+    },
+    "description": "Move several nodes to one status; failures are reported per node",
+    "inputSchema": {
+      "properties": {
+        "force": {
+          "description": "Allow guarded transitions",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "refs": {
+          "description": "Nodes to update",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "description": "Target status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "refs",
+        "status"
+      ],
+      "type": "object"
+    },
+    "name": "node_batch_update"
+  },
+  "node_create": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_create"
+    },
+    "description": "Create a node; without parent it becomes a root epic",
+    "inputSchema": {
+      "properties": {
+        "description": {
+          "description": "The specification",
+          "type": "string"
+        },
+        "due_date": {
+          "description": "YYYY-MM-DD",
+          "type": "string"
+        },
+        "estimated_hours": {
+          "description": "Estimate in hours",
+          "type": "number"
+        },
+        "kind": {
+          "enum": [
+            "epic",
+            "task",
+            "subtask",
+            "micro"
+          ],
+          "type": "string"
+        },
+        "parent": {
+          "description": "Parent: dot-ID, path or #id",
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "tags": {
+          "description": "Labels (a set)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "description": "Node title",
+          "type": "string"
+        },
+        "weight": {
+          "description": "Points for burn-up, default 1",
+          "type": "number"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
+    "name": "node_create"
+  },
+  "node_delete": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_delete"
+    },
+    "description": "Soft-delete a todo node; history stays in the database",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Node to remove",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "node_delete"
+  },
+  "node_get": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "node_get"
+    },
+    "description": "One node with children, comments and the parent chain",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "dot-ID, path or #id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "node_get"
+  },
+  "node_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "node_list"
+    },
+    "description": "List nodes in tree order with light fields",
+    "inputSchema": {
+      "properties": {
+        "assignee": {
+          "description": "Filter by assignee",
+          "type": "string"
+        },
+        "branch": {
+          "description": "Only nodes of this git branch",
+          "type": "string"
+        },
+        "exclude_done": {
+          "description": "Hide nodes closed as done",
+          "type": "boolean"
+        },
+        "exclude_projects": {
+          "description": "Projects to leave out",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "fields": {
+          "description": "Return only these fields (dot_id, title, status, ...)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_archived": {
+          "description": "Show archived too",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max rows",
+          "type": "integer"
+        },
+        "offset": {
+          "description": "Skip this many rows",
+          "type": "integer"
+        },
+        "overdue": {
+          "description": "Only overdue nodes",
+          "type": "boolean"
+        },
+        "parent": {
+          "description": "Only this subtree",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "status": {
+          "description": "Filter by effective status",
+          "type": "string"
+        },
+        "tag": {
+          "description": "Only this tag (exact)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "node_list"
+  },
+  "node_move": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_move"
+    },
+    "description": "Move a node under another parent; descendant dot-IDs change",
+    "inputSchema": {
+      "properties": {
+        "parent": {
+          "description": "New parent; omit for root",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Node to move",
+          "type": "string"
+        },
+        "renumber": {
+          "description": "Take the next free number",
+          "type": "boolean"
+        },
+        "to_project": {
+          "description": "Move into this project; the dot-ID is rebuilt",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "node_move"
+  },
+  "node_reorder": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_reorder"
+    },
+    "description": "Set the order of siblings",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "refs": {
+          "description": "Siblings in the wanted order",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "refs"
+      ],
+      "type": "object"
+    },
+    "name": "node_reorder"
+  },
+  "node_restore": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_restore"
+    },
+    "description": "Bring back a soft-deleted node",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Removed node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "node_restore"
+  },
+  "node_update": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "node_update"
+    },
+    "description": "Change node fields; only the given fields are touched",
+    "inputSchema": {
+      "properties": {
+        "assigned_to": {
+          "description": "Who works on it",
+          "type": "string"
+        },
+        "description": {
+          "description": "New specification",
+          "type": "string"
+        },
+        "due_date": {
+          "description": "YYYY-MM-DD",
+          "type": "string"
+        },
+        "force": {
+          "description": "Allow guarded transitions",
+          "type": "boolean"
+        },
+        "priority": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "dot-ID, path or #id",
+          "type": "string"
+        },
+        "status": {
+          "description": "Target status",
+          "type": "string"
+        },
+        "tags": {
+          "description": "Replace the tag set",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "description": "New title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "node_update"
+  },
+  "note_delete": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "note_delete"
+    },
+    "description": "Delete a note",
+    "inputSchema": {
+      "properties": {
+        "id": {
+          "description": "Note id",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "note_delete"
+  },
+  "note_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "note_list"
+    },
+    "description": "Notes of the project, newest first",
+    "inputSchema": {
+      "properties": {
+        "limit": {
+          "description": "Max rows",
+          "type": "integer"
+        },
+        "note_type": {
+          "description": "Filter by type",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Filter by node",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "note_list"
+  },
+  "note_save": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "note_save"
+    },
+    "description": "Create or update a note: decision, context, meeting, blocker, release",
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "Note body",
+          "type": "string"
+        },
+        "id": {
+          "description": "Update this note",
+          "type": "integer"
+        },
+        "note_type": {
+          "enum": [
+            "general",
+            "decision",
+            "context",
+            "meeting",
+            "technical",
+            "blocker",
+            "progress",
+            "release"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Attach to a node",
+          "type": "string"
+        },
+        "title": {
+          "description": "Note title",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "note_save"
+  },
+  "note_search": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "note_search"
+    },
+    "description": "Search notes by keyword",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "query": {
+          "description": "Keyword",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "note_search"
+  },
+  "project_create": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "project_create"
+    },
+    "description": "Create another project in the same database",
+    "inputSchema": {
+      "properties": {
+        "description": {
+          "description": "What the project is about",
+          "type": "string"
+        },
+        "key": {
+          "description": "Unique key, A-Z and 0-9",
+          "type": "string"
+        },
+        "name": {
+          "description": "Project name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "project_create"
+  },
+  "project_delete": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "project_delete"
+    },
+    "description": "Delete a project with all of its nodes, notes and history",
+    "inputSchema": {
+      "properties": {
+        "force": {
+          "description": "Delete even if it still has live nodes or is the last one",
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Project to delete (default: this session's)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "project_delete"
+  },
+  "project_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "project_list"
+    },
+    "description": "List projects with their node counts",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "project_list"
+  },
+  "project_select": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "project_select"
+    },
+    "description": "Switch this session to another project; every later call uses it",
+    "inputSchema": {
+      "properties": {
+        "key": {
+          "description": "Project key to work in",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "name": "project_select"
+  },
+  "project_update": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "project_update"
+    },
+    "description": "Rename a project or change its description and status",
+    "inputSchema": {
+      "properties": {
+        "description": {
+          "description": "New description",
+          "type": "string"
+        },
+        "key": {
+          "description": "Project to change (default: this session's)",
+          "type": "string"
+        },
+        "name": {
+          "description": "New name",
+          "type": "string"
+        },
+        "new_key": {
+          "description": "New key; every dot-ID of the project changes",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "active",
+            "on_hold",
+            "completed",
+            "archived"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "project_update"
+  },
+  "session_diff": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "session_diff"
+    },
+    "description": "What changed since a timestamp: counts by action plus recent records",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "since": {
+          "description": "ISO-8601 timestamp",
+          "type": "string"
+        }
+      },
+      "required": [
+        "since"
+      ],
+      "type": "object"
+    },
+    "name": "session_diff"
+  },
+  "tasq_burnup": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_burnup"
+    },
+    "description": "Burn-up series and forecast by count, points or hours",
+    "inputSchema": {
+      "properties": {
+        "ascii": {
+          "description": "Include an ASCII chart",
+          "type": "boolean"
+        },
+        "metric": {
+          "enum": [
+            "count",
+            "points",
+            "hours"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "since": {
+          "description": "YYYY-MM-DD",
+          "type": "string"
+        },
+        "until": {
+          "description": "YYYY-MM-DD",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tasq_burnup"
+  },
+  "tasq_claim": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_claim"
+    },
+    "description": "Take an expiring lease on a node; returns the token for renew and release",
+    "inputSchema": {
+      "properties": {
+        "checkpoint": {
+          "description": "Note for the next holder",
+          "type": "string"
+        },
+        "force": {
+          "description": "Claim despite blockers",
+          "type": "boolean"
+        },
+        "holder": {
+          "description": "Agent name",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Node to claim",
+          "type": "string"
+        },
+        "reserve": {
+          "description": "Resources to reserve with the lease",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "steal": {
+          "description": "Take over a live lease",
+          "type": "boolean"
+        },
+        "ttl": {
+          "description": "Seconds, 60..28800",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_claim"
+  },
+  "tasq_context": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_context"
+    },
+    "description": "Context chain from the root epic down to the node: the why and the what",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Target node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_context"
+  },
+  "tasq_dashboard": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_dashboard"
+    },
+    "description": "One-call overview: board, live leases, next candidates, at-risk nodes",
+    "inputSchema": {
+      "properties": {
+        "all": {
+          "description": "One section per project instead of a single project",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tasq_dashboard"
+  },
+  "tasq_export": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_export"
+    },
+    "description": "Export the project as JSON with a checksum",
+    "inputSchema": {
+      "properties": {
+        "include_deleted": {
+          "description": "Keep removed nodes",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tasq_export"
+  },
+  "tasq_graph": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_graph"
+    },
+    "description": "Neighbourhood of a node: waits for, unblocks, transitive blockers, Mermaid",
+    "inputSchema": {
+      "properties": {
+        "depth": {
+          "description": "How deep to walk blockers",
+          "type": "integer"
+        },
+        "mermaid": {
+          "description": "Include a Mermaid diagram",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Node to inspect",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_graph"
+  },
+  "tasq_history": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_history"
+    },
+    "description": "Status history of a node: when it changed, why, and who",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "ref": {
+          "description": "Target node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_history"
+  },
+  "tasq_holdings": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_holdings"
+    },
+    "description": "Live leases and the resources they hold",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tasq_holdings"
+  },
+  "tasq_import": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_import"
+    },
+    "description": "Import an export document, from tasq or from saga-mcp",
+    "inputSchema": {
+      "properties": {
+        "document": {
+          "description": "Export payload",
+          "type": "object"
+        },
+        "from_saga": {
+          "description": "Read a saga tracker_export",
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "merge",
+            "replace"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "document"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_import"
+  },
+  "tasq_init": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_init"
+    },
+    "description": "Initialise the tracker in the current directory and register a project",
+    "inputSchema": {
+      "properties": {
+        "key": {
+          "description": "Project key for dot-IDs, A-Z and 0-9",
+          "type": "string"
+        },
+        "name": {
+          "description": "Project name",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tasq_init"
+  },
+  "tasq_link": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_link"
+    },
+    "description": "Link two nodes; blocks means from waits for to",
+    "inputSchema": {
+      "properties": {
+        "from": {
+          "description": "The node that waits",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "blocks",
+            "related",
+            "duplicates",
+            "discovered_from",
+            "split_from"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "to": {
+          "description": "The node it waits for",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_link"
+  },
+  "tasq_next": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_next"
+    },
+    "description": "What to work on next, with the reason for the choice",
+    "inputSchema": {
+      "properties": {
+        "branch": {
+          "description": "Only nodes of this git branch",
+          "type": "string"
+        },
+        "limit": {
+          "description": "How many candidates",
+          "type": "integer"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tasq_next"
+  },
+  "tasq_release": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_release"
+    },
+    "description": "Close a lease: released, failed or completed",
+    "inputSchema": {
+      "properties": {
+        "checkpoint": {
+          "description": "Note for the next holder",
+          "type": "string"
+        },
+        "force": {
+          "description": "Finish despite open children",
+          "type": "boolean"
+        },
+        "outcome": {
+          "enum": [
+            "released",
+            "failed",
+            "completed"
+          ],
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "token": {
+          "description": "Lease token",
+          "type": "string"
+        }
+      },
+      "required": [
+        "token"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_release"
+  },
+  "tasq_renew": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_renew"
+    },
+    "description": "Extend a lease before it expires",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "token": {
+          "description": "Lease token",
+          "type": "string"
+        },
+        "ttl": {
+          "description": "New TTL in seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "token"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_renew"
+  },
+  "tasq_reserve": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_reserve"
+    },
+    "description": "Add or drop resources on a live lease: paths, globs and logical keys",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "remove": {
+          "description": "Resource values to release",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reserve": {
+          "description": "path:src/api, glob:src/**/*.rs, port:8080",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "token": {
+          "description": "Lease token",
+          "type": "string"
+        }
+      },
+      "required": [
+        "token"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_reserve"
+  },
+  "tasq_risk": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_risk"
+    },
+    "description": "Nodes that fall behind their own due date",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "threshold": {
+          "description": "Allowed lag, 0..1",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tasq_risk"
+  },
+  "tasq_search": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "tasq_search"
+    },
+    "description": "Full-text search across nodes and notes; without a project it searches every project",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "query": {
+          "description": "Words or an FTS query",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_search"
+  },
+  "tasq_unlink": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "tasq_unlink"
+    },
+    "description": "Remove a link between two nodes",
+    "inputSchema": {
+      "properties": {
+        "from": {
+          "description": "Source node",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Relation kind, default blocks",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "to": {
+          "description": "Target node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "name": "tasq_unlink"
+  },
+  "template_apply": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "template_apply"
+    },
+    "description": "Create nodes from a template under a parent",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Template name",
+          "type": "string"
+        },
+        "parent": {
+          "description": "Parent node for the roots",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "values": {
+          "description": "Variable values by name",
+          "type": "object"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "template_apply"
+  },
+  "template_delete": {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "template_delete"
+    },
+    "description": "Delete a template",
+    "inputSchema": {
+      "properties": {
+        "name": {
+          "description": "Template name",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "template_delete"
+  },
+  "template_list": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "template_list"
+    },
+    "description": "List templates with their variables. Without a project, every template in the database is listed with its project key; global templates have no project.",
+    "inputSchema": {
+      "properties": {
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "template_list"
+  },
+  "template_save": {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "template_save"
+    },
+    "description": "Create or replace a template: a node tree with {variable} placeholders",
+    "inputSchema": {
+      "properties": {
+        "description": {
+          "description": "What it is for",
+          "type": "string"
+        },
+        "name": {
+          "description": "Template name",
+          "type": "string"
+        },
+        "project": {
+          "description": "Project key; default: the session project",
+          "type": "string"
+        },
+        "tree": {
+          "description": "Array of nodes or {nodes: [...]}",
+          "type": "object"
+        }
+      },
+      "required": [
+        "name",
+        "tree"
+      ],
+      "type": "object"
+    },
+    "name": "template_save"
+  }
+}

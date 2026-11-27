@@ -859,6 +859,19 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
             )?;
             Ok(text(&comments))
         }
+        "comment_update" => {
+            // Правка комментария, а не удаление и запись заново: дата «когда это решили»
+            // принадлежит истории, и подменять её датой переписывания нельзя (см. `comment::edit`).
+            let id = arg_i64(args, "id").ok_or_else(|| Error::InvalidValue {
+                field: "id".to_string(),
+                value: "required".to_string(),
+            })?;
+            let content = req_str(args, "content")?;
+            let project = ctx.project(args)?;
+            let author = arg_holder(args);
+            let comment = comment::edit(&mut ctx.conn, &project, id, content, &author)?;
+            Ok(text(&comment))
+        }
         "comment_delete" => {
             let project = ctx.project(args)?;
             let id = arg_i64(args, "id").ok_or_else(|| Error::InvalidValue {
@@ -1158,633 +1171,78 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
     }
 }
 
-/// Описание инструмента для `tools/list`.
+/// Описание инструмента для `tools/list` — из единого объявления (`crate::surface`).
 ///
-/// Правила бюджета (README §13.2): описание ≤ 200 символов, описание параметра ≤ 80,
-/// параметров ≤ 8, аннотации на каждом инструменте.
+/// Здесь больше нет рукописных схем: имя, описание, аргументы и аннотации живут в таблице, и
+/// `tools/list`, `docs/mcp-tools.md` и бюджет токенов строятся из неё. Схема на проводе и
+/// документация перестали быть двумя копиями одного контракта — они теперь два вывода одного.
+///
+/// Правила бюджета (README §13.2) остаются: описание ≤ 200 символов, описание параметра ≤ 80,
+/// параметров ≤ 8, аннотации на каждом инструменте. Их проверяет `tests` внизу файла — по
+/// сгенерированной схеме, то есть по тому, что реально увидит модель.
 pub fn definition(name: &str) -> Option<Value> {
-    let def = match name {
-        // ------------------------------------------------ инициализация и проекты
-        "tasq_init" => tool(
-            name,
-            "Initialise the tracker in the current directory and register a project",
-            json!({
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Project key for dot-IDs, A-Z and 0-9"},
-                    "name": {"type": "string", "description": "Project name"}
-                }
-            }),
-            (false, false, false),
-        ),
-        "project_create" => tool(
-            name,
-            "Create another project in the same database",
-            json!({
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Unique key, A-Z and 0-9"},
-                    "name": {"type": "string", "description": "Project name"},
-                    "description": {"type": "string", "description": "What the project is about"}
-                },
-                "required": ["key", "name"]
-            }),
-            (false, false, false),
-        ),
-        "project_list" => tool(
-            name,
-            "List projects with their node counts",
-            json!({"type": "object", "properties": {}}),
-            (true, false, true),
-        ),
-        "project_select" => tool(
-            name,
-            "Switch this session to another project; every later call uses it",
-            json!({
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Project key to work in"}
-                },
-                "required": ["key"]
-            }),
-            (false, false, false),
-        ),
-        "project_update" => tool(
-            name,
-            "Rename a project or change its description and status",
-            json!({
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Project to change (default: this session's)"},
-                    "name": {"type": "string", "description": "New name"},
-                    "description": {"type": "string", "description": "New description"},
-                    "status": {"type": "string", "enum": ["active", "on_hold", "completed", "archived"]},
-                    "new_key": {"type": "string", "description": "New key; every dot-ID of the project changes"}
-                }
-            }),
-            (false, false, true),
-        ),
-        "project_delete" => tool(
-            name,
-            "Delete a project with all of its nodes, notes and history",
-            json!({
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Project to delete (default: this session's)"},
-                    "force": {"type": "boolean", "description": "Delete even if it still has live nodes or is the last one"}
-                }
-            }),
-            (true, false, true),
-        ),
-        // ------------------------------------------------ узлы
-        "node_create" => tool(
-            name,
-            "Create a node; without parent it becomes a root epic",
-            json!({
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "description": "Node title"},
-                    "parent": {"type": "string", "description": "Parent: dot-ID, path or #id"},
-                    "kind": {"type": "string", "enum": ["epic", "task", "subtask", "micro"]},
-                    "description": {"type": "string", "description": "The specification"},
-                    "priority": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-                    "due_date": {"type": "string", "description": "YYYY-MM-DD"},
-                    "estimated_hours": {"type": "number", "description": "Estimate in hours"},
-                    "weight": {"type": "number", "description": "Points for burn-up, default 1"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Labels (a set)"}
-                },
-                "required": ["title"]
-            }),
-            (false, false, false),
-        ),
-        "node_get" => tool(
-            name,
-            "One node with children, comments and the parent chain",
-            json!({
-                "type": "object",
-                "properties": {"ref": {"type": "string", "description": "dot-ID, path or #id"}},
-                "required": ["ref"]
-            }),
-            (true, false, true),
-        ),
-        "node_update" => tool(
-            name,
-            "Change node fields; only the given fields are touched",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "dot-ID, path or #id"},
-                    "title": {"type": "string", "description": "New title"},
-                    "description": {"type": "string", "description": "New specification"},
-                    "status": {"type": "string", "description": "Target status"},
-                    "priority": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-                    "assigned_to": {"type": "string", "description": "Who works on it"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Replace the tag set"},
-                    "due_date": {"type": "string", "description": "YYYY-MM-DD"},
-                    "force": {"type": "boolean", "description": "Allow guarded transitions"}
-                },
-                "required": ["ref"]
-            }),
-            (false, false, true),
-        ),
-        "node_list" => tool(
-            name,
-            "List nodes in tree order with light fields",
-            json!({
-                "type": "object",
-                "properties": {
-                    "parent": {"type": "string", "description": "Only this subtree"},
-                    "status": {"type": "string", "description": "Filter by effective status"},
-                    "assignee": {"type": "string", "description": "Filter by assignee"},
-                    "branch": {"type": "string", "description": "Only nodes of this git branch"},
-                    "tag": {"type": "string", "description": "Only this tag (exact)"},
-                    "overdue": {"type": "boolean", "description": "Only overdue nodes"},
-                    "include_archived": {"type": "boolean", "description": "Show archived too"},
-                    "exclude_done": {"type": "boolean", "description": "Hide nodes closed as done"},
-                    "exclude_projects": {"type": "array", "items": {"type": "string"},
-                        "description": "Projects to leave out"},
-                    "fields": {"type": "array", "items": {"type": "string"},
-                        "description": "Return only these fields (dot_id, title, status, ...)"},
-                    "offset": {"type": "integer", "description": "Skip this many rows"},
-                    "limit": {"type": "integer", "description": "Max rows"}
-                }
-            }),
-            (true, false, true),
-        ),
-        "node_move" => tool(
-            name,
-            "Move a node under another parent; descendant dot-IDs change",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Node to move"},
-                    "parent": {"type": "string", "description": "New parent; omit for root"},
-                    "to_project": {"type": "string",
-                        "description": "Move into this project; the dot-ID is rebuilt"},
-                    "renumber": {"type": "boolean", "description": "Take the next free number"}
-                },
-                "required": ["ref"]
-            }),
-            (false, false, true),
-        ),
-        "node_reorder" => tool(
-            name,
-            "Set the order of siblings",
-            json!({
-                "type": "object",
-                "properties": {"refs": {"type": "array", "items": {"type": "string"},
-                                        "description": "Siblings in the wanted order"}},
-                "required": ["refs"]
-            }),
-            (false, false, true),
-        ),
-        "node_archive" => tool(
-            name,
-            "Archive or unarchive a subtree; nothing is deleted",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Subtree root"},
-                    "undo": {"type": "boolean", "description": "Unarchive instead"}
-                },
-                "required": ["ref"]
-            }),
-            (false, false, true),
-        ),
-        "node_delete" => tool(
-            name,
-            "Soft-delete a todo node; history stays in the database",
-            json!({
-                "type": "object",
-                "properties": {"ref": {"type": "string", "description": "Node to remove"}},
-                "required": ["ref"]
-            }),
-            (false, true, true),
-        ),
-        "node_restore" => tool(
-            name,
-            "Bring back a soft-deleted node",
-            json!({
-                "type": "object",
-                "properties": {"ref": {"type": "string", "description": "Removed node"}},
-                "required": ["ref"]
-            }),
-            (false, false, true),
-        ),
-        // ------------------------------------------------ дерево и рекомендации
-        "tasq_context" => tool(
-            name,
-            "Context chain from the root epic down to the node: the why and the what",
-            json!({
-                "type": "object",
-                "properties": {"ref": {"type": "string", "description": "Target node"}},
-                "required": ["ref"]
-            }),
-            (true, false, true),
-        ),
-        "tasq_history" => tool(
-            name,
-            "Status history of a node: when it changed, why, and who",
-            json!({
-                "type": "object",
-                "properties": {"ref": {"type": "string", "description": "Target node"}},
-                "required": ["ref"]
-            }),
-            (true, false, true),
-        ),
-        "tasq_next" => tool(
-            name,
-            "What to work on next, with the reason for the choice",
-            json!({
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "How many candidates"},
-                    "branch": {"type": "string", "description": "Only nodes of this git branch"}
-                }
-            }),
-            (true, false, true),
-        ),
-        // ------------------------------------------------ аренды
-        "tasq_claim" => tool(
-            name,
-            "Take an expiring lease on a node; returns the token for renew and release",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Node to claim"},
-                    "holder": {"type": "string", "description": "Agent name"},
-                    "ttl": {"type": "integer", "description": "Seconds, 60..28800"},
-                    "steal": {"type": "boolean", "description": "Take over a live lease"},
-                    "checkpoint": {"type": "string", "description": "Note for the next holder"},
-                    "reserve": {"type": "array", "items": {"type": "string"},
-                                "description": "Resources to reserve with the lease"},
-                    "force": {"type": "boolean", "description": "Claim despite blockers"}
-                },
-                "required": ["ref"]
-            }),
-            (false, false, false),
-        ),
-        "tasq_renew" => tool(
-            name,
-            "Extend a lease before it expires",
-            json!({
-                "type": "object",
-                "properties": {
-                    "token": {"type": "string", "description": "Lease token"},
-                    "ttl": {"type": "integer", "description": "New TTL in seconds"}
-                },
-                "required": ["token"]
-            }),
-            (false, false, true),
-        ),
-        "tasq_release" => tool(
-            name,
-            "Close a lease: released, failed or completed",
-            json!({
-                "type": "object",
-                "properties": {
-                    "token": {"type": "string", "description": "Lease token"},
-                    "outcome": {"type": "string", "enum": ["released", "failed", "completed"]},
-                    "checkpoint": {"type": "string", "description": "Note for the next holder"},
-                    "force": {"type": "boolean", "description": "Finish despite open children"}
-                },
-                "required": ["token"]
-            }),
-            (false, false, true),
-        ),
-        // ------------------------------------------------ ресурсы
-        "tasq_reserve" => tool(
-            name,
-            "Add or drop resources on a live lease: paths, globs and logical keys",
-            json!({
-                "type": "object",
-                "properties": {
-                    "token": {"type": "string", "description": "Lease token"},
-                    "reserve": {"type": "array", "items": {"type": "string"},
-                                "description": "path:src/api, glob:src/**/*.rs, port:8080"},
-                    "remove": {"type": "array", "items": {"type": "string"},
-                               "description": "Resource values to release"}
-                },
-                "required": ["token"]
-            }),
-            (false, false, true),
-        ),
-        "tasq_holdings" => tool(
-            name,
-            "Live leases and the resources they hold",
-            json!({"type": "object", "properties": {}}),
-            (true, false, true),
-        ),
-        // ------------------------------------------------ зависимости
-        "tasq_link" => tool(
-            name,
-            "Link two nodes; blocks means from waits for to",
-            json!({
-                "type": "object",
-                "properties": {
-                    "from": {"type": "string", "description": "The node that waits"},
-                    "to": {"type": "string", "description": "The node it waits for"},
-                    "kind": {"type": "string",
-                             "enum": ["blocks", "related", "duplicates", "discovered_from", "split_from"]}
-                },
-                "required": ["from", "to"]
-            }),
-            (false, false, false),
-        ),
-        "tasq_unlink" => tool(
-            name,
-            "Remove a link between two nodes",
-            json!({
-                "type": "object",
-                "properties": {
-                    "from": {"type": "string", "description": "Source node"},
-                    "to": {"type": "string", "description": "Target node"},
-                    "kind": {"type": "string", "description": "Relation kind, default blocks"}
-                },
-                "required": ["from", "to"]
-            }),
-            (false, false, true),
-        ),
-        "tasq_graph" => tool(
-            name,
-            "Neighbourhood of a node: waits for, unblocks, transitive blockers, Mermaid",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Node to inspect"},
-                    "depth": {"type": "integer", "description": "How deep to walk blockers"},
-                    "mermaid": {"type": "boolean", "description": "Include a Mermaid diagram"}
-                },
-                "required": ["ref"]
-            }),
-            (true, false, true),
-        ),
-        // ------------------------------------------------ комментарии
-        "comment_add" => tool(
-            name,
-            "Add a comment to a node: a thread that survives sessions",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Target node"},
-                    "content": {"type": "string", "description": "Comment text"},
-                    "holder": {"type": "string", "description": "Author name"}
-                },
-                "required": ["ref", "content"]
-            }),
-            (false, false, false),
-        ),
-        "comment_list" => tool(
-            name,
-            "Comments of a node in chronological order",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "Target node"},
-                    "include_deleted": {"type": "boolean", "description": "Show removed ones"}
-                },
-                "required": ["ref"]
-            }),
-            (true, false, true),
-        ),
-        "comment_delete" => tool(
-            name,
-            "Soft-delete a comment, or restore it with restore=true",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "integer", "description": "Comment id"},
-                    "reason": {"type": "string", "description": "Why it is removed"},
-                    "restore": {"type": "boolean", "description": "Bring it back instead"}
-                },
-                "required": ["id"]
-            }),
-            (false, true, true),
-        ),
-        // ------------------------------------------------ заметки
-        "note_save" => tool(
-            name,
-            "Create or update a note: decision, context, meeting, blocker, release",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "integer", "description": "Update this note"},
-                    "title": {"type": "string", "description": "Note title"},
-                    "content": {"type": "string", "description": "Note body"},
-                    "note_type": {"type": "string",
-                                  "enum": ["general", "decision", "context", "meeting",
-                                           "technical", "blocker", "progress", "release"]},
-                    "ref": {"type": "string", "description": "Attach to a node"}
-                }
-            }),
-            (false, false, false),
-        ),
-        "note_list" => tool(
-            name,
-            "Notes of the project, newest first",
-            json!({
-                "type": "object",
-                "properties": {
-                    "note_type": {"type": "string", "description": "Filter by type"},
-                    "ref": {"type": "string", "description": "Filter by node"},
-                    "limit": {"type": "integer", "description": "Max rows"}
-                }
-            }),
-            (true, false, true),
-        ),
-        "note_search" => tool(
-            name,
-            "Search notes by keyword",
-            json!({
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "Keyword"}},
-                "required": ["query"]
-            }),
-            (true, false, true),
-        ),
-        "note_delete" => tool(
-            name,
-            "Delete a note",
-            json!({
-                "type": "object",
-                "properties": {"id": {"type": "integer", "description": "Note id"}},
-                "required": ["id"]
-            }),
-            (false, true, true),
-        ),
-        // ------------------------------------------------ шаблоны
-        "template_save" => tool(
-            name,
-            "Create or replace a template: a node tree with {variable} placeholders",
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Template name"},
-                    "description": {"type": "string", "description": "What it is for"},
-                    "tree": {"type": "object", "description": "Array of nodes or {nodes: [...]}"}
-                },
-                "required": ["name", "tree"]
-            }),
-            (false, false, false),
-        ),
-        "template_list" => tool(
-            name,
-            "List templates with their variables. Without a project, every template in the database is listed with its project key; global templates have no project.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "project": {
-                        "type": "string",
-                        "description": "Project key; its templates and the global ones. Omit for every template in the database"
-                    }
-                }
-            }),
-            (true, false, true),
-        ),
-        "template_apply" => tool(
-            name,
-            "Create nodes from a template under a parent",
-            json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Template name"},
-                    "parent": {"type": "string", "description": "Parent node for the roots"},
-                    "values": {"type": "object", "description": "Variable values by name"}
-                },
-                "required": ["name"]
-            }),
-            (false, false, false),
-        ),
-        "template_delete" => tool(
-            name,
-            "Delete a template",
-            json!({
-                "type": "object",
-                "properties": {"name": {"type": "string", "description": "Template name"}},
-                "required": ["name"]
-            }),
-            (false, true, true),
-        ),
-        // ------------------------------------------------ активность
-        "activity_log" => tool(
-            name,
-            "Recent changes: what happened and when",
-            json!({
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "How many records"}}
-            }),
-            (true, false, true),
-        ),
-        "session_diff" => tool(
-            name,
-            "What changed since a timestamp: counts by action plus recent records",
-            json!({
-                "type": "object",
-                "properties": {"since": {"type": "string", "description": "ISO-8601 timestamp"}},
-                "required": ["since"]
-            }),
-            (true, false, true),
-        ),
-        "node_batch_update" => tool(
-            name,
-            "Move several nodes to one status; failures are reported per node",
-            json!({
-                "type": "object",
-                "properties": {
-                    "refs": {"type": "array", "items": {"type": "string"},
-                             "description": "Nodes to update"},
-                    "status": {"type": "string", "description": "Target status"},
-                    "force": {"type": "boolean", "description": "Allow guarded transitions"}
-                },
-                "required": ["refs", "status"]
-            }),
-            (false, false, false),
-        ),
-        // ------------------------------------------------ поиск и обзоры
-        "tasq_search" => tool(
-            name,
-            "Full-text search across nodes and notes; without a project it searches every project",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Words or an FTS query"},
-                    "project": {
-                        "type": "string",
-                        "description": "Limit to one project; omit to search the whole database"
-                    }
-                },
-                "required": ["query"]
-            }),
-            (true, false, true),
-        ),
-        "tasq_dashboard" => tool(
-            name,
-            "One-call overview: board, live leases, next candidates, at-risk nodes",
-            json!({
-                "type": "object",
-                "properties": {
-                    "project": {"type": "string", "description": "Project key"},
-                    "all": {
-                        "type": "boolean",
-                        "description": "One section per project instead of a single project"
-                    }
-                }
-            }),
-            (true, false, true),
-        ),
-        "tasq_burnup" => tool(
-            name,
-            "Burn-up series and forecast by count, points or hours",
-            json!({
-                "type": "object",
-                "properties": {
-                    "metric": {"type": "string", "enum": ["count", "points", "hours"]},
-                    "since": {"type": "string", "description": "YYYY-MM-DD"},
-                    "until": {"type": "string", "description": "YYYY-MM-DD"},
-                    "ascii": {"type": "boolean", "description": "Include an ASCII chart"}
-                }
-            }),
-            (true, false, true),
-        ),
-        "tasq_risk" => tool(
-            name,
-            "Nodes that fall behind their own due date",
-            json!({
-                "type": "object",
-                "properties": {"threshold": {"type": "number", "description": "Allowed lag, 0..1"}}
-            }),
-            (true, false, true),
-        ),
-        // ------------------------------------------------ перенос данных
-        "tasq_export" => tool(
-            name,
-            "Export the project as JSON with a checksum",
-            json!({
-                "type": "object",
-                "properties": {"include_deleted": {"type": "boolean", "description": "Keep removed nodes"}}
-            }),
-            (true, false, true),
-        ),
-        "tasq_import" => tool(
-            name,
-            "Import an export document, from tasq or from saga-mcp",
-            json!({
-                "type": "object",
-                "properties": {
-                    "document": {"type": "object", "description": "Export payload"},
-                    "mode": {"type": "string", "enum": ["merge", "replace"]},
-                    "from_saga": {"type": "boolean", "description": "Read a saga tracker_export"}
-                },
-                "required": ["document"]
-            }),
-            (false, false, false),
-        ),
-        _ => return None,
-    };
-    Some(def)
+    let op = crate::surface::operation(name)?;
+    Some(json!({
+        "name": op.tool,
+        "description": op.summary,
+        "annotations": {
+            "title": op.tool,
+            "readOnlyHint": op.read_only,
+            "destructiveHint": op.destructive,
+            "idempotentHint": op.idempotent,
+            "openWorldHint": false,
+        },
+        "inputSchema": schema(op),
+    }))
+}
+
+/// JSON Schema вызова, собранная из объявления.
+///
+/// `properties` есть всегда (пустой объект, если аргументов нет), `required` — только когда есть
+/// обязательные: пустой список требований ничего не добавляет, а в схеме читается как «требований
+/// нет» и всё же занимает место в бюджете.
+fn schema(op: &crate::surface::Operation) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<Value> = Vec::new();
+    for arg in op.args {
+        let mut spec = serde_json::Map::new();
+        spec.insert("type".to_string(), json!(arg.kind.json_type()));
+        if let crate::surface::Kind::Choice(variants) = arg.kind {
+            spec.insert("enum".to_string(), json!(variants));
+        }
+        if matches!(arg.kind, crate::surface::Kind::StrList) {
+            spec.insert("items".to_string(), json!({"type": "string"}));
+        }
+        // Пустое описание не пишем вовсе: у перечислений оно не нужно (значения говорят сами),
+        // а ключ с пустой строкой занимает место в бюджете схемы и выглядит как недоделка.
+        if !arg.description.is_empty() {
+            spec.insert("description".to_string(), json!(arg.description));
+        }
+        properties.insert(arg.name.to_string(), Value::Object(spec));
+        if arg.required {
+            required.push(json!(arg.name));
+        }
+    }
+    // Порядок производный, а не порядок объявления: `required` — множество, и зависеть от того,
+    // как расставлены `Arg` в таблице, ему незачем. Отсортированный список ещё и сравнивается
+    // со снимком схемы без ложных расхождений.
+    required.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    let mut root = serde_json::Map::new();
+    root.insert("type".to_string(), json!("object"));
+    root.insert("properties".to_string(), Value::Object(properties));
+    if !required.is_empty() {
+        root.insert("required".to_string(), Value::Array(required));
+    }
+    Value::Object(root)
 }
 
 /// Инструменты, которые живут вне проекта: им `project` не нужен и не должен предлагаться.
+///
+/// Список живёт в тестах намеренно: в рабочем коде его роль играет сама таблица — `project`
+/// объявлен аргументом ровно у тех операций, которым он нужен, и никакой подстановки при
+/// сборке схемы нет. Здесь он нужен как независимое ожидание контракта: если кто-то уберёт
+/// `project` из таблицы, тест это заметит, а не подтвердит сам себя.
+#[cfg(test)]
 const PROJECT_FREE: &[&str] = &[
     "tasq_init",
     "project_create",
@@ -1809,36 +1267,6 @@ const PROJECT_FREE: &[&str] = &[
 #[cfg(test)]
 const WIDER_THAN_USUAL: &[(&str, usize)] =
     &[("node_list", 12), ("node_create", 9), ("node_update", 9)];
-
-fn tool(name: &str, description: &str, mut schema: Value, hints: (bool, bool, bool)) -> Value {
-    let (read_only, destructive, idempotent) = hints;
-    // `project` объявлен у КАЖДОГО инструмента, работающего внутри проекта: аргумент
-    // поддерживался и раньше, но не был виден в `tools/list`, то есть агент о нём не узнал
-    // бы. Одно описание вместо 39 копий — и бюджет схем растёт на одну строку по смыслу.
-    if !PROJECT_FREE.contains(&name)
-        && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
-    {
-        properties.insert(
-            "project".to_string(),
-            json!({
-                "type": "string",
-                "description": "Project key; default: the session project",
-            }),
-        );
-    }
-    json!({
-        "name": name,
-        "description": description,
-        "annotations": {
-            "title": name,
-            "readOnlyHint": read_only,
-            "destructiveHint": destructive,
-            "idempotentHint": idempotent,
-            "openWorldHint": false,
-        },
-        "inputSchema": schema,
-    })
-}
 
 #[cfg(test)]
 mod tests {

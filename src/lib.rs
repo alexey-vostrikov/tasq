@@ -28,6 +28,7 @@ pub mod refs;
 pub mod resource;
 pub mod session;
 pub mod status;
+pub mod surface;
 pub mod template;
 pub mod transfer;
 pub mod tree;

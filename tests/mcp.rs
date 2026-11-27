@@ -95,7 +95,12 @@ fn handshake_and_tools_list_over_stdio() {
 
     let list = &responses[1];
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 46, "полный профиль отдаёт весь каталог");
+    // Длина — у объявления: цифра здесь была бы ещё одной копией факта, которая отстаёт.
+    assert_eq!(
+        tools.len(),
+        tasq::surface::OPERATIONS.len(),
+        "полный профиль отдаёт весь каталог"
+    );
     let names: Vec<&str> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())

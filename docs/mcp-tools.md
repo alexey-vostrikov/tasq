@@ -2,13 +2,13 @@
 
 Файл сгенерирован командой `tasq docs` из каталога самого сервера: имя, описание и схема берутся из того же кода, что отвечает на `tools/list`.
 
-Всего инструментов: 46.
+Всего инструментов: 47.
 
 ## Профили
 
 | профиль | инструментов | бюджет, токенов | факт |
 | --- | --- | --- | --- |
-| `full` | 46 | 6000 | 5664 |
+| `full` | 47 | 6000 | 5788 |
 | `agent` | 30 | 4000 | 3884 |
 | `read-only` | 17 | 2000 | 1926 |
 | `migration` | 6 | 800 | 603 |
@@ -42,9 +42,10 @@
 | `tasq_link` | full, agent | 141 | `from`, `to` | Link two nodes; blocks means from waits for to |
 | `tasq_unlink` | full, agent | 126 | `from`, `to` | Remove a link between two nodes |
 | `tasq_graph` | full, agent, read-only | 137 | `ref` | Neighbourhood of a node: waits for, unblocks, transitive blockers, Mermaid |
-| `comment_add` | full, agent | 125 | `ref`, `content` | Add a comment to a node: a thread that survives sessions |
+| `comment_add` | full, agent | 125 | `content`, `ref` | Add a comment to a node: a thread that survives sessions |
 | `comment_list` | full, agent, read-only | 108 | `ref` | Comments of a node in chronological order |
 | `comment_delete` | full | 126 | `id` | Soft-delete a comment, or restore it with restore=true |
+| `comment_update` | full | 125 | `content`, `id` | Edit a comment's text: the date it was written stays |
 | `note_save` | full, agent | 164 | — | Create or update a note: decision, context, meeting, blocker, release |
 | `note_list` | full, agent, read-only | 116 | — | Notes of the project, newest first |
 | `note_search` | full, agent, read-only | 90 | `query` | Search notes by keyword |

@@ -133,14 +133,15 @@ mod tests {
             migration.tokens < full.tokens / 3,
             "migration — самый узкий"
         );
-        assert_eq!(full.tools, 46);
+        // Длина каталога берётся у объявления: цифра здесь была бы третьей копией факта.
+        assert_eq!(full.tools, crate::surface::OPERATIONS.len());
         assert_eq!(migration.tools, 6);
     }
 
     #[test]
     fn per_tool_costs_are_sorted_and_sum_roughly_to_the_total() {
         let report = measure(Profile::Full);
-        assert_eq!(report.per_tool.len(), 46);
+        assert_eq!(report.per_tool.len(), crate::surface::OPERATIONS.len());
         for pair in report.per_tool.windows(2) {
             assert!(
                 pair[0].tokens >= pair[1].tokens,
