@@ -22,6 +22,16 @@ pub enum Error {
     #[error("database schema version {found} is newer than supported {supported}")]
     SchemaTooNew { found: i64, supported: i64 },
 
+    /// База старой схемы, а миграцию прямо сейчас выполняет другая команда.
+    ///
+    /// Отдельная ошибка, а не общий `STORAGE_ERROR`: «база занята» не говорит, что делать, и
+    /// человек ищет причину в блокировках, тогда как причина — обновление схемы, которое через
+    /// секунду закончится само. Здесь и действие другое: повторить, а не искать писателя.
+    #[error(
+        "schema v{found} needs migrating to v{supported}, and another process is migrating it now"
+    )]
+    MigrationBusy { found: i64, supported: i64 },
+
     /// Проект с таким ключом уже есть.
     #[error("project key {0} is already used")]
     DuplicateKey(String),
@@ -229,6 +239,7 @@ impl Error {
             Error::NoProject => "NO_PROJECT",
             Error::ProjectRequired { .. } => "PROJECT_REQUIRED",
             Error::SchemaTooNew { .. } => "SCHEMA_TOO_NEW",
+            Error::MigrationBusy { .. } => "MIGRATION_BUSY",
             Error::DuplicateKey(_) => "DUPLICATE_KEY",
             Error::ProjectNotFound { .. } => "PROJECT_NOT_FOUND",
             Error::ProjectNotEmpty { .. } => "PROJECT_NOT_EMPTY",
@@ -288,6 +299,9 @@ impl Error {
                  project_select or the `project` argument in MCP; `tasq list projects` lists the keys"
             }
             Error::SchemaTooNew { .. } => "upgrade the tasq binary; downgrades are not supported",
+            Error::MigrationBusy { .. } => {
+                "retry in a moment: the migration runs once and takes milliseconds"
+            }
             Error::DuplicateKey(_) => "pick another key or reuse the existing project",
             Error::ProjectNotFound { .. } => "run `tasq list projects` to see the available keys",
             Error::ProjectNotEmpty { .. } => {

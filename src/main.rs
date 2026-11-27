@@ -818,6 +818,36 @@ fn open(
     Ok((conn, project))
 }
 
+/// То же, что `open`, но соединение только для чтения.
+///
+/// Нужно командам, которые ничего не меняют: `ls`, `show`, `board`, `next`, `find` и подобным.
+/// Разница видна при запуске волной — сто одновременных чтений против базы, которой нужна
+/// миграция, теряли треть команд на «database is locked», потому что каждая бралась обновлять
+/// схему. Соединение только для чтения такой возможности не имеет.
+fn open_reading(
+    db_path: Option<&std::path::Path>,
+    project_key: Option<&str>,
+) -> Result<(Connection, Project)> {
+    let cwd = std::env::current_dir()?;
+    let path = db::discover(&cwd, db_path)?;
+    let conn = db::open_reading_checked(&path)?;
+    let project = project::select(&conn, project_key)?;
+    Ok((conn, project))
+}
+
+/// Соединение только для чтения и проект по ссылке на узел — для `show`, `history`, `ctx`, `time`.
+fn open_ref_reading(
+    db_path: Option<&std::path::Path>,
+    project_key: Option<&str>,
+    reference: &str,
+) -> Result<(Connection, Project)> {
+    let cwd = std::env::current_dir()?;
+    let path = db::discover(&cwd, db_path)?;
+    let conn = db::open_reading_checked(&path)?;
+    let project = project::for_reference(&conn, project_key, reference)?;
+    Ok((conn, project))
+}
+
 /// Формат выходного документа: флаг → расширение `--out` → JSON.
 ///
 /// Явный флаг важнее расширения (файл без расширения — обычное дело), расширение важнее
@@ -1326,7 +1356,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             ListWhat::Projects => {
                 let cwd = std::env::current_dir()?;
                 let path = db::discover(&cwd, cli.db.as_deref())?;
-                let conn = db::open_checked(&path)?;
+                let conn = db::open_reading_checked(&path)?;
                 let projects = project::list(&conn)?;
                 if cli.json {
                     print_json(&projects);
@@ -1582,7 +1612,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Show { reference, tree } => {
-            let (conn, project) = open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
+            let (conn, project) =
+                open_ref_reading(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             if *tree {
                 let nodes = node::subtree(&conn, &project, reference)?;
                 let root_depth = nodes.first().map(|n| n.depth).unwrap_or(0);
@@ -1678,7 +1709,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // показываются все (узел опознаётся по ключу в dot-ID), `--project all` — явно.
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
-            let conn = db::open_checked(&path)?;
+            let conn = db::open_reading_checked(&path)?;
             // Незнакомое значение фильтра — отказ: молча выданный полный список читается
             // как «таких узлов нет» и уводит в сторону.
             if let Some(value) = status {
@@ -2035,7 +2066,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Log { limit } => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (conn, project) = open_reading(cli.db.as_deref(), cli.project.as_deref())?;
             let records = activity::recent(&conn, project.id, *limit)?;
             if cli.json {
                 print_json(&records);
@@ -2063,7 +2094,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::History { reference } => {
-            let (conn, project) = open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
+            let (conn, project) =
+                open_ref_reading(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let (_, node) = node::resolve_shown(&conn, &project, reference)?;
             let timeline = history::timeline(&conn, node.id)?;
             if cli.json {
@@ -2234,7 +2266,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Holders => {
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (conn, project) = open_reading(cli.db.as_deref(), cli.project.as_deref())?;
             let live = lease::holdings(&conn, &project)?;
             if cli.json {
                 print_json(&live);
@@ -2403,7 +2435,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
 
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
-            let conn = db::open_checked(&path)?;
+            let conn = db::open_reading_checked(&path)?;
             // Привязка берётся из сессии; нет сессии — нет привязки, и проекты перечислены
             // как есть (пометки «свой» тогда не существует).
             let session_id = session::from_env();
@@ -2609,7 +2641,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // уверенным тоном.
             let cwd = std::env::current_dir()?;
             let path = db::discover(&cwd, cli.db.as_deref())?;
-            let conn = db::open_checked(&path)?;
+            let conn = db::open_reading_checked(&path)?;
             let hits = match project::scope(&conn, cli.project.as_deref())? {
                 project::Scope::One(project) => overview::search(&conn, &project, query)?,
                 project::Scope::All => overview::search_all(&conn, query)?,
@@ -2633,7 +2665,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Ctx { reference } => {
-            let (conn, project) = open_ref(cli.db.as_deref(), cli.project.as_deref(), reference)?;
+            let (conn, project) =
+                open_ref_reading(cli.db.as_deref(), cli.project.as_deref(), reference)?;
             let chain = overview::context(&conn, &project, reference)?;
             if cli.json {
                 print_json(&chain);
@@ -2665,7 +2698,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if *all {
                 let cwd = std::env::current_dir()?;
                 let path = db::discover(&cwd, cli.db.as_deref())?;
-                let conn = db::open_checked(&path)?;
+                let conn = db::open_reading_checked(&path)?;
                 let boards = overview::board_all(&conn)?;
                 if cli.json {
                     print_json(&boards);
@@ -2733,7 +2766,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
 
         Command::Time { parent } => {
-            let (conn, project) = open_ref(
+            let (conn, project) = open_ref_reading(
                 cli.db.as_deref(),
                 cli.project.as_deref(),
                 parent.as_deref().unwrap_or(""),
@@ -2910,7 +2943,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     value: format!("{threshold} (expected 0..1)"),
                 });
             }
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (conn, project) = open_reading(cli.db.as_deref(), cli.project.as_deref())?;
             let risky = burnup::at_risk(&conn, &project, *threshold)?;
             if cli.json {
                 print_json(&risky);
@@ -2952,7 +2985,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if *all {
                 let cwd = std::env::current_dir()?;
                 let path = db::discover(&cwd, cli.db.as_deref())?;
-                let conn = db::open_checked(&path)?;
+                let conn = db::open_reading_checked(&path)?;
                 let document = transfer::dump(&conn)?;
                 let text = render_document(&document, format)?;
                 match out {
@@ -2982,7 +3015,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 }
                 return Ok(ExitCode::SUCCESS);
             }
-            let (conn, project) = open(cli.db.as_deref(), cli.project.as_deref())?;
+            let (conn, project) = open_reading(cli.db.as_deref(), cli.project.as_deref())?;
             let document = transfer::export(&conn, &project, *include_deleted)?;
             let text = render_document(&document, format)?;
             match out {

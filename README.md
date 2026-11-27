@@ -91,7 +91,8 @@ SQLite-файле, MCP-сервер поверх stdio и CLI для челов�
   `actual_hours` из попыток — это представления, а не колонки, которые кто-то забыл обновить.
 - **Мягкое удаление вместо `DELETE`** для узлов и комментариев: строка остаётся ради аудита, скрывается
   из выдач (`deleted_at IS NULL`), восстанавливается парным инструментом.
-- **Один писатель.** Запись — только в `BEGIN IMMEDIATE`, `busy_timeout = 5000`, ретраи на `SQLITE_BUSY`.
+- **Один писатель.** Запись — только в `BEGIN IMMEDIATE`, `busy_timeout = 200` мс, три повтора на `SQLITE_BUSY`
+  с разбросом; ждать блокировку дольше оказалось медленнее, чем отказаться и повторить (§17.3).
 - **Время — UTC ISO-8601 с миллисекундами** (`2026-11-08T05:20:31.412Z`). Даты (`due_date`) — `YYYY-MM-DD`
   в часовом поясе проекта (`projects.timezone`, по умолчанию `UTC`).
 
@@ -1264,7 +1265,10 @@ COLLATE UNICODE_NOCASE`, поиск в верхнем и нижнем регис
 
 ### 17.3. Надёжность и корректность
 
-- `PRAGMA journal_mode=WAL; synchronous=NORMAL; foreign_keys=ON; busy_timeout=5000`.
+- `PRAGMA journal_mode=WAL; synchronous=NORMAL; foreign_keys=ON; busy_timeout=200` (переменная
+  `TASQ_BUSY_MS` для стендов). Команда, которая только читает, открывает базу без права записи;
+  при «занято» на открытии, миграции или `BEGIN IMMEDIATE` — до трёх повторов с разбросом 5–25 мс.
+  Отказ после повторов на миграции — отдельный код `MIGRATION_BUSY`, а не `STORAGE_ERROR`.
 - Любая мутация — одна транзакция с записью в лог; частичных состояний не бывает.
 - Ошибки — типизированные коды (§19), а не строки; `--json` отдаёт `{"error":{"code":…,"message":…,"hint":…}}`.
 - Fail-fast: неизвестный `kind`, статус, профиль, вид ресурса, конфликтная конфигурация — ошибка сразу,
@@ -1305,7 +1309,7 @@ COLLATE UNICODE_NOCASE`, поиск в верхнем и нижнем регис
 `NOT_YOUR_ATTEMPT`, `LEASE_REQUIRED`, `RESOURCE_RESERVATION_CONFLICT`, `TOO_MANY_RESERVATIONS`,
 `PATH_OUTSIDE_PROJECT`, `CYCLE_DETECTED`, `ANCESTOR_BLOCK_EDGE`, `SELF_EDGE`, `CROSS_PROJECT_EDGE`,
 `DUPLICATE_KEY`, `TOOL_NOT_IN_PROFILE`, `SCHEMA_TOO_NEW`, `EXPORT_CHECKSUM_MISMATCH`, `CONFIG_UNPARSABLE`,
-`BRANCH_UNAVAILABLE`.
+`BRANCH_UNAVAILABLE`, `MIGRATION_BUSY`.
 
 Каждая ошибка несёт `code`, `message`, `hint` и, где уместно, машиночитаемые детали
 (`holder`, `expires_at`, `dot_id`, `blockers[]`).

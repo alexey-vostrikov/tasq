@@ -98,6 +98,86 @@ pub fn discover(start: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// Сколько ждать чужую блокировку, в миллисекундах.
+///
+/// Умолчание — 200 мс, а не 5 с, и рядом стоит повтор (см. `with_busy`). Причина в замере:
+/// сто одновременных команд с пятисекундным ожиданием проходят все, но выстраиваются в очередь
+/// и тратят 1,5–3 с; те же сто с отказом через 200 мс и тремя повторами проходят за 0,5 с на
+/// запись и 1,7 с на чтение. Блокирующее ожидание держит процесс в очереди даже когда работа
+/// уже сделана соседом, а отказ плюс повтор освобождает место и пробует снова.
+///
+/// Переменная `TASQ_BUSY_MS` нужна стендам и тестам: гонку «занято» иначе не воспроизвести,
+/// не растягивая набор на секунды.
+pub fn busy_timeout_ms() -> u32 {
+    busy_timeout_from(std::env::var("TASQ_BUSY_MS").ok().as_deref())
+}
+
+/// Разбор значения `TASQ_BUSY_MS` без чтения окружения.
+///
+/// Отдельно от `busy_timeout_ms`, потому что окружение процесса — общий ресурс: тест, правящий
+/// переменную, перетирает соседние тесты того же бинаря. Правило («ноль и мусор — умолчание»)
+/// проверяется на значении, а не подменой окружения.
+pub fn busy_timeout_from(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BUSY_MS)
+}
+
+/// Умолчание ожидания блокировки.
+pub const DEFAULT_BUSY_MS: u32 = 200;
+
+/// Сколько раз пробовать заново, если база занята чужим писателем.
+///
+/// Три, а не десять: замер на ста процессах показал, что третий повтор уже не добавляет
+/// успехов (100/100 и при трёх, и при десяти), а только удлиняет худший случай.
+const BUSY_ATTEMPTS: usize = 3;
+
+/// Занята ли база чужой блокировкой.
+///
+/// Различать `SQLITE_BUSY` и `SQLITE_LOCKED` здесь не нужно — оба означают «повтори»; а вот
+/// отличать их от «нет таблицы» обязательно, иначе повтор превратит ошибку схемы в три
+/// бессмысленных попытки и тот же отказ.
+fn is_busy(err: &Error) -> bool {
+    match err {
+        Error::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ),
+        _ => false,
+    }
+}
+
+/// Выполняет попытку, повторяя её только при «занято».
+fn with_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut last: Option<Error> = None;
+    for round in 0..BUSY_ATTEMPTS {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_busy(&err) => {
+                last = Some(err);
+                if round + 1 < BUSY_ATTEMPTS {
+                    backoff(round);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.expect("повтор без последней ошибки"))
+}
+
+/// Пауза перед повтором: растёт с номером попытки и разбрасывается случайно.
+///
+/// Разброс обязателен: без него повторы всех процессов идут в одну фазу и сталкиваются снова
+/// тем же составом. Пауза остаётся короткой — вся волна обязана уложиться в доли секунды.
+fn backoff(round: usize) {
+    let spread = 5u64 + 10 * round as u64;
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64 % spread.max(1))
+        .unwrap_or(0);
+    std::thread::sleep(std::time::Duration::from_millis(spread + jitter));
+}
+
 /// Открывает соединение с нужными прагмами. Файл базы должен существовать.
 ///
 /// Регистрирует две функции, которых нет в SQLite по умолчанию:
@@ -109,14 +189,37 @@ pub fn discover(start: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
 ///   Встроенная `NOCASE` тоже ограничена ASCII.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch(
+    let timeout = busy_timeout_ms();
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;
+         PRAGMA busy_timeout = {timeout};
          -- Потолок размера журнала: после checkpoint WAL не остаётся на максимуме.
-         PRAGMA journal_size_limit = 8388608;",
-    )?;
+         PRAGMA journal_size_limit = 8388608;"
+    ))?;
+    register_unicode(&conn)?;
+    Ok(conn)
+}
+
+/// Соединение только для чтения: команда, которая ничего не меняет, не имеет права брать
+/// запись при открытии.
+///
+/// Зачем отдельный вход, если `open` и так ничего не пишет явно. Пишет: `PRAGMA journal_mode`
+/// и `PRAGMA journal_size_limit` меняют заголовок файла, а миграция, включённая в открытие,
+/// берёт блокировку записи целиком. Замер: сто одновременных `ls` против базы, ждущей
+/// миграции, теряли треть команд на «database is locked», хотя читать им никто не мешал.
+/// Соединение только для чтения такой возможности не имеет вовсе — не «редко пишет», а «не может».
+///
+/// Регистрация Unicode-функций остаётся: `find` и `ls` ищут по тексту, и без `uni_lower`
+/// запрос падает, а не отвечает неточно.
+pub fn open_reading(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let timeout = busy_timeout_ms();
+    conn.execute_batch(&format!(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = {timeout};"
+    ))?;
     register_unicode(&conn)?;
     Ok(conn)
 }
@@ -196,12 +299,42 @@ fn register_unicode(conn: &Connection) -> Result<()> {
 /// Немедленный захват блокировки записи убирает гонку «прочитал, что свободно,
 /// и пишу» — второй писатель ждёт на `busy_timeout`, а не проходит на устаревшем чтении.
 pub fn write_tx(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
-    Ok(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
+    // Повтор здесь, а не вокруг всей команды: `BEGIN IMMEDIATE` берёт блокировку записи сразу,
+    // поэтому после успеха внутри транзакции ждать уже нечего. Замер на ста одновременных
+    // `add`: без повтора проходят 72, с тремя — все сто, и вся волна укладывается в 0,5 с.
+    //
+    // Соединение между попытками не переоткрывается: `BEGIN IMMEDIATE`, не получивший
+    // блокировку, оставляет соединение в состоянии без транзакции, и повтор с того же
+    // соединения — это ровно то же, что делает SQLite при своём внутреннем повторе.
+    // Общая ссылка, а не `&mut`: возвращаемая транзакция занимает соединение, и с изменяемым
+    // заимствованием повтор в цикле не собрался бы — заимствование переживает итерацию.
+    // `new_unchecked` берёт `&Connection` и выполняет `BEGIN IMMEDIATE` сам, поэтому это
+    // единственный способ повторить попытку, не переоткрывая соединение.
+    let conn: &Connection = conn;
+    let mut last: Option<Error> = None;
+    for round in 0..BUSY_ATTEMPTS {
+        match rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate) {
+            Ok(tx) => return Ok(tx),
+            Err(err) => {
+                let err: Error = err.into();
+                if !is_busy(&err) {
+                    return Err(err);
+                }
+                last = Some(err);
+                if round + 1 < BUSY_ATTEMPTS {
+                    backoff(round);
+                }
+            }
+        }
+    }
+    Err(last.expect("повтор без последней ошибки"))
 }
 
 /// Открывает базу и проверяет, что версия схемы не новее поддерживаемой.
 pub fn open_checked(path: &Path) -> Result<Connection> {
-    let mut conn = open(path)?;
+    // Повтор охватывает и само открытие: `journal_mode = WAL` на базе, которую в этот момент
+    // открывает сосед, тоже может ответить «занято».
+    let mut conn = with_busy(|| open(path))?;
     let version = schema_version(&conn)?;
     if version > SUPPORTED_SCHEMA_VERSION {
         return Err(Error::SchemaTooNew {
@@ -219,13 +352,70 @@ pub fn open_checked(path: &Path) -> Result<Connection> {
     // Сообщение печатается в stderr и только когда миграция действительно произошла: тихое
     // изменение чужой базы при первом запуске — не то, о чём стоит узнавать по косвенным
     // признакам. `--json` оно не портит: поток ошибок в документ не попадает.
-    if version < SUPPORTED_SCHEMA_VERSION && apply_migrations(&mut conn)? {
-        eprintln!(
-            "schema: migrated v{version} -> v{SUPPORTED_SCHEMA_VERSION} ({})",
-            path.display()
-        );
+    if version < SUPPORTED_SCHEMA_VERSION {
+        // Гонка на обновлении — обычное дело, а не исключение: сто команд, запущенных одной
+        // волной на базе старой схемы, видят одну и ту же версию и все берутся мигрировать.
+        // Блокировку получает одна, остальные ждут её и падают, хотя работы для них нет вовсе.
+        //
+        // Повтор решает это без договоров между процессами: следующая попытка перечитывает
+        // версию (это делает `apply_migrations`), видит, что сосед уже поднял схему, и
+        // возвращает «нечего применять». Договориться о лидере здесь не на чем — файла
+        // блокировки нет, а `BEGIN EXCLUSIVE` на миграцию означал бы то же ожидание.
+        let migrated = match with_busy(|| apply_migrations(&mut conn)) {
+            Ok(migrated) => migrated,
+            // Отказ после всех повторов: отличаем «схема устарела, но занята» от прочих бед.
+            // Тихий отказ здесь был бы хуже ошибки — команда не должна работать на старой
+            // схеме, иначе поиск по комментариям молча уйдёт в запасной путь.
+            Err(err) if is_busy(&err) => {
+                // Последняя попытка могла разойтись с соседом на миллисекунду: он уже поднял
+                // схему, а мы получили «занято» на своей. Тогда работы нет и повторять нечего.
+                let now = schema_version(&conn).unwrap_or(version);
+                if now >= SUPPORTED_SCHEMA_VERSION {
+                    return Ok(conn);
+                }
+                return Err(Error::MigrationBusy {
+                    found: now,
+                    supported: SUPPORTED_SCHEMA_VERSION,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        if migrated {
+            eprintln!(
+                "schema: migrated v{version} -> v{SUPPORTED_SCHEMA_VERSION} ({})",
+                path.display()
+            );
+        }
     }
     Ok(conn)
+}
+
+/// Открывает базу для команды, которая только читает.
+///
+/// Схема проверяется здесь же: команде на старой схеме нельзя — она прочитает то, чего в базе
+/// ещё нет, и ответит неполно. Но и мигрировать ей нечем: соединение только для чтения. Поэтому
+/// старая схема — повод открыть обычное соединение и дать миграции произойти, а актуальная —
+/// повод к записи не прикасаться вовсе.
+///
+/// Любая другая беда при открытии только для чтения (например, `-shm` недоступен на диске,
+/// смонтированном только для чтения) — тоже повод отступить к обычному открытию: поведение
+/// команды важнее способа открыть файл.
+pub fn open_reading_checked(path: &Path) -> Result<Connection> {
+    let conn = match open_reading(path) {
+        Ok(conn) => conn,
+        Err(_) => return open_checked(path),
+    };
+    match schema_version(&conn) {
+        Ok(version) if version == SUPPORTED_SCHEMA_VERSION => Ok(conn),
+        Ok(version) if version > SUPPORTED_SCHEMA_VERSION => Err(Error::SchemaTooNew {
+            found: version,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        }),
+        _ => {
+            drop(conn);
+            open_checked(path)
+        }
+    }
 }
 
 /// Версия схемы в соединении: публичная обёртка для дампа и внешних проверок.
