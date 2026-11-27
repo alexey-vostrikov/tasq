@@ -286,3 +286,47 @@ fn leases_are_reported_without_writing() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Счётчик один на базу, даже если к ней ходят через символическую ссылку.
+///
+/// На живой базе это стоило двух файлов: `~/.tasq/tasq.db` — ссылка на
+/// `~/.local/share/tasq/hermes.db`, и метрики ложились рядом с каждым путём отдельно. Счётчик,
+/// который зависит от того, как его позвали, отвечает не на тот вопрос.
+#[test]
+fn metrics_sit_beside_the_real_file_not_the_symlink() {
+    let dir = temp_dir("symlink");
+    init(&dir);
+    run(&dir, &["add", "узел"]);
+
+    let link = dir.join("tasq-link.db");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.join(".tasq/tasq.db"), &link).expect("ссылка");
+
+    // Отчёт по ссылке обязан увидеть тот же счётчик, что и по настоящему файлу.
+    let direct = stats(&dir, &[]);
+    let via_link = {
+        let (code, stdout, stderr) = run(
+            &dir,
+            &["--db", link.to_str().expect("путь"), "--json", "stat"],
+        );
+        assert_eq!(code, 0, "{stdout}{stderr}");
+        serde_json::from_str::<Value>(&stdout).expect("json")
+    };
+    // Отчёт по ссылке видит тот же счётчик: разница ровно в единицу — сам этот вызов `stat`,
+    // который записал себя до того, как посчитал.
+    assert_eq!(
+        via_link["calls"].as_i64().unwrap_or(0),
+        direct["calls"].as_i64().unwrap_or(0) + 1,
+        "{via_link}"
+    );
+    assert_eq!(
+        direct["metrics_path"], via_link["metrics_path"],
+        "{via_link}"
+    );
+    assert!(
+        !dir.join("tasq-link-metrics.db").exists(),
+        "рядом со ссылкой появился второй счётчик"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

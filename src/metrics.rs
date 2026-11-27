@@ -28,15 +28,18 @@ use crate::error::Result;
 
 /// Имя файла метрик рядом с базой: `hermes.db` → `hermes-metrics.db`.
 ///
-/// Рядом с найденным путём, а не рядом с файлом, на который он указывает: `~/.tasq/tasq.db` бывает
-/// символической ссылкой на базу в `~/.local/share`, и метрики тогда ложатся к ссылке. Это
-/// осознанно — один найденный путь даёт один файл метрик, и `TASQ_DB` не раздваивает счётчик.
+/// Рядом с **настоящим** файлом, а не рядом с путём, которым к нему пришли. Замер на живой базе:
+/// `~/.tasq/tasq.db` — символическая ссылка на `~/.local/share/tasq/hermes.db`, и пока путь не
+/// разрешался, один и тот же трекер имел два счётчика — 52 вызова по одному адресу и 1 по другому.
+/// Счётчик принадлежит базе, а не маршруту к ней, поэтому ссылки разрешаются; если разрешить
+/// нельзя (файла ещё нет), остаётся исходный путь.
 pub fn path(db_path: &Path) -> PathBuf {
-    let stem = db_path
+    let real = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let stem = real
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_else(|| "tasq".to_string());
-    db_path.with_file_name(format!("{stem}-metrics.db"))
+    real.with_file_name(format!("{stem}-metrics.db"))
 }
 
 /// Схема: одна таблица и один индекс по времени.
