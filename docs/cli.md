@@ -44,6 +44,23 @@ Opening a database never rewrites its schema: a hundred commands started at once
 tasq migrate [ОПЦИИ]
 ```
 
+## `serve`
+
+Serve MCP over HTTP instead of stdio (loopback only, off by default)
+
+Serve MCP over HTTP instead of stdio (loopback only, off by default)
+
+The flag is required on purpose: an open port is a surface this tool does not open without being asked. TLS is not terminated here — the address must be loopback, and `https://` is refused with the reason rather than half-implemented.
+
+```
+tasq serve [ОПЦИИ]
+```
+
+| флаг | значение | по умолчанию | описание |
+| --- | --- | --- | --- |
+| `--http` | `ADDR` | — | Address to listen on, for example 127.0.0.1:8787 (0 picks a free port) |
+| `--profile` | `PROFILE` | — | Tool profile: full \| agent \| read-only \| migration |
+
 ## `doctor`
 
 Check database integrity, schema version and lease hygiene

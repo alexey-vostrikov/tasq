@@ -3,6 +3,7 @@
 //! Сервер поднимается командой `tasq mcp [--profile …]`. Он не открывает сокетов и не ходит
 //! в сеть: единственный вход — stdin, единственный выход — stdout, диагностика — stderr.
 
+pub mod http;
 pub mod profile;
 pub mod rpc;
 pub mod tools;
@@ -355,6 +356,57 @@ impl rpc::Handler for Server {
 }
 
 /// Запускает сервер на stdin/stdout.
+/// Всё, что нужно обоим транспортам: сервер, сброс журнала и две строки в stderr.
+///
+/// Вынесено, потому что HTTP отличается от stdio ровно циклом чтения: профиль, проект, сессия,
+/// поток сброса и диагностика обязаны совпадать, иначе поведение инструментов начнёт зависеть от
+/// транспорта — а этого не должно быть видно ни одному клиенту.
+fn startup(
+    cwd: &std::path::Path,
+    db: Option<&std::path::Path>,
+    profile: Profile,
+    project_key: Option<&str>,
+    flush: Option<Duration>,
+) -> Result<(Server, Option<Flusher>)> {
+    let server = Server::open(cwd, db, profile, project_key)?;
+    let flusher = match (flush, server.context.as_ref()) {
+        (Some(interval), Some(context)) if !interval.is_zero() => {
+            Some(Flusher::start(context.db_path.clone(), interval))
+        }
+        _ => None,
+    };
+    if let Some(key) = server.project_key() {
+        eprintln!("tasq mcp: project {key}");
+    }
+    match server.db_path() {
+        Some(path) => eprintln!(
+            "tasq mcp: profile {}, {} tool(s), database {}",
+            profile.as_str(),
+            server.catalogue().len(),
+            path.display()
+        ),
+        None => eprintln!(
+            "tasq mcp: profile {}, {} tool(s), no database yet (tasq_init will create one)",
+            profile.as_str(),
+            server.catalogue().len()
+        ),
+    }
+    Ok((server, flusher))
+}
+
+/// HTTP-транспорт: только loopback и только по явному флагу (`src/mcp/http.rs`).
+pub fn serve_http(
+    cwd: &std::path::Path,
+    db: Option<&std::path::Path>,
+    profile: Profile,
+    project_key: Option<&str>,
+    flush: Option<Duration>,
+    addr: &str,
+) -> Result<()> {
+    let (mut server, _flusher) = startup(cwd, db, profile, project_key, flush)?;
+    http::serve(&mut server, addr)
+}
+
 pub fn serve(
     cwd: &std::path::Path,
     db: Option<&std::path::Path>,

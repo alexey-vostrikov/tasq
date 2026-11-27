@@ -74,6 +74,20 @@ enum Command {
     /// a decision with its own command and its own confirmation in the output.
     Migrate,
 
+    /// Serve MCP over HTTP instead of stdio (loopback only, off by default)
+    ///
+    /// The flag is required on purpose: an open port is a surface this tool does not open without
+    /// being asked. TLS is not terminated here — the address must be loopback, and `https://` is
+    /// refused with the reason rather than half-implemented.
+    Serve {
+        /// Address to listen on, for example 127.0.0.1:8787 (0 picks a free port)
+        #[arg(long, value_name = "ADDR")]
+        http: Option<String>,
+        /// Tool profile: full | agent | read-only | migration
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+
     /// Check database integrity, schema version and lease hygiene
     Doctor {
         /// Only check, never modify (currently the default behaviour)
@@ -3291,6 +3305,42 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Connect { .. } => unreachable!("обработан до открытия базы"),
         Command::Docs { .. } => unreachable!("обработан до открытия базы"),
         Command::Completions { .. } => unreachable!("обработан до открытия базы"),
+
+        Command::Serve { http, profile } => {
+            // Без флага — отказ, а не «поднимем на всякий случай»: у инструмента с одним файлом
+            // нет причин открывать порт, если об этом не попросили явно.
+            let addr = http.as_deref().ok_or_else(|| Error::InvalidValue {
+                field: "http".to_string(),
+                value: "tasq serve needs --http ADDR (for example 127.0.0.1:8787); stdio is the default transport, use `tasq mcp`"
+                    .to_string(),
+            })?;
+            let profile = match profile {
+                Some(value) => {
+                    mcp::profile::Profile::parse(value).ok_or_else(|| Error::InvalidValue {
+                        field: "profile".to_string(),
+                        value: format!("{value} (allowed: full, agent, read-only, migration)"),
+                    })?
+                }
+                // HTTP открывает тот же каталог, что stdio, но профиль по умолчанию здесь
+                // скромнее: наружу отдаётся то, что нужно для работы, а не всё подряд.
+                None => mcp::profile::Profile::Agent,
+            };
+            let cwd = std::env::current_dir()?;
+            let flush = if cli.flush == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(cli.flush))
+            };
+            mcp::serve_http(
+                &cwd,
+                cli.db.as_deref(),
+                profile,
+                cli.project.as_deref(),
+                flush,
+                addr,
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
 
         Command::Mcp { profile } => {
             let profile =
