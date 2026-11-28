@@ -99,7 +99,9 @@ fn empty_project_answers_with_hints() {
         (vec!["find", "нет"], "nothing found"),
         (vec!["template", "ls"], "no templates"),
         (vec!["time"], "no tracked work"),
-        (vec!["risk"], "no node is behind"),
+        // Сроков в этом фикстурном проекте нет, поэтому честный ответ — «проверять нечего».
+        // Формулировка «no node is behind» здесь и была ложной зелёнью (TASQDEV-21.8).
+        (vec!["risk"], "nothing was checked"),
     ] {
         let (code, stdout, stderr) = run(&dir, &args);
         assert_eq!(code, 0, "{args:?}: {stderr}");

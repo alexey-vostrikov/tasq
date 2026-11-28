@@ -397,5 +397,9 @@ fn burnup_snapshot_over_mcp() {
     );
 
     let risk = check(&responses[3], "tasq_risk");
-    assert!(risk.is_array(), "{risk}");
+    // Форма изменилась намеренно: массив отстающих не отличал «всё в срок» от «сроков нет ни у
+    // кого», и агент принимал пустоту за благополучие (TASQDEV-21.8). Теперь это объект с `checked`.
+    assert!(risk.is_object(), "{risk}");
+    assert!(risk["at_risk"].is_array(), "{risk}");
+    assert_eq!(risk["checked"], Value::from(true), "{risk}");
 }

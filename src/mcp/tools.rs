@@ -1153,7 +1153,15 @@ fn dispatch(ctx: &mut Context, name: &str, args: &Value) -> Result<Value> {
                 &project,
                 arg_f64(args, "threshold").unwrap_or(0.2),
             )?;
-            Ok(text(&risky))
+            // `checked` обязателен: без него пустой `at_risk` читается агентом как «всё в срок»,
+            // хотя причиной может быть отсутствие сроков вовсе. Та же ложная зелень, что была в CLI.
+            let deadlines = crate::burnup::deadlines(&ctx.conn, &project)?;
+            Ok(text(&serde_json::json!({
+                "checked": deadlines.checked(),
+                "dated": deadlines.dated,
+                "total": deadlines.total,
+                "at_risk": risky,
+            })))
         }
 
         // ------------------------------------------------ перенос данных

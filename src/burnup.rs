@@ -546,6 +546,40 @@ pub struct AtRisk {
     pub gap: f64,
 }
 
+/// Итог проверки сроков: сколько узлов вообще имеет срок и сколько их всего.
+///
+/// Зачем отдельно от `at_risk`: пустой список отстающих означает ДВА разных состояния — «всё в
+/// срок» и «сроков нет ни у кого», и различить их по длине списка нельзя. На живой базе второе
+/// выдавалось за первое: `risk` на трёх проектах отвечал «no node is behind its own deadline», хотя
+/// `due_date` был пуст во всех 343 узлах. Ложная зелень хуже отсутствия отчёта, потому что её
+/// принимают за сигнал.
+#[derive(Debug, Clone, Serialize)]
+pub struct Deadlines {
+    /// Живых узлов с заполненным сроком — по ним проверка вообще что-то значит.
+    pub dated: i64,
+    /// Живых узлов всего (без удалённых и архивных).
+    pub total: i64,
+}
+
+impl Deadlines {
+    /// Была ли проверка осмысленной: без сроков отчёт «всё в срок» ничего не утверждает.
+    pub fn checked(&self) -> bool {
+        self.dated > 0
+    }
+}
+
+/// Сколько живых узлов проекта имеет срок — то есть сколько узлов `at_risk` способен оценить.
+pub fn deadlines(conn: &Connection, project: &Project) -> Result<Deadlines> {
+    let (total, dated) = conn.query_row(
+        "SELECT COUNT(*), COUNT(NULLIF(due_date, ''))
+         FROM nodes
+         WHERE project_id = ?1 AND deleted_at IS NULL AND archived_at IS NULL",
+        params![project.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(Deadlines { dated, total })
+}
+
 /// Узлы с риском срыва: времени прошло заметно больше, чем сделано.
 pub fn at_risk(conn: &Connection, project: &Project, threshold: f64) -> Result<Vec<AtRisk>> {
     let today = today(conn)?;
@@ -578,8 +612,16 @@ pub fn at_risk(conn: &Connection, project: &Project, threshold: f64) -> Result<V
             continue;
         };
         let created_day = day_key(&created_at).unwrap_or(today);
+        // Узел мог родиться уже просроченным — завели задним числом, или срок пришёл из шаблона
+        // прошлого периода. Окно «создан → срок» тогда отрицательное, и доля прошедшего времени от
+        // него равна нулю: такой узел не попадал в отчёт вовсе («не отстаёт», хотя срок прошёл).
+        // Это тот же класс, что ложная зелень: отчёт молчит там, где должен говорить.
         let window = (due_day - created_day).whole_days().max(1) as f64;
-        let elapsed = ((today - created_day).whole_days() as f64 / window).clamp(0.0, 2.0);
+        let elapsed = if due_day < created_day {
+            2.0
+        } else {
+            ((today - created_day).whole_days() as f64 / window).clamp(0.0, 2.0)
+        };
         let done = if total_weight > 0.0 {
             (done_weight / total_weight).clamp(0.0, 1.0)
         } else if status == "done" {

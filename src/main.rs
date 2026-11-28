@@ -3319,12 +3319,39 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
             let (conn, project) = open_reading(cli.db.as_deref(), cli.project.as_deref())?;
             let risky = burnup::at_risk(&conn, &project, *threshold)?;
+            let deadlines = burnup::deadlines(&conn, &project)?;
             if cli.json {
-                print_json(&risky);
+                // Объект, а не массив: пустой массив читается и как «всё в срок», и как «проверять
+                // было нечего», и различить их снаружи невозможно. `checked` называет это прямо.
+                print_json(&serde_json::json!({
+                    "checked": deadlines.checked(),
+                    "dated": deadlines.dated,
+                    "total": deadlines.total,
+                    "at_risk": risky,
+                }));
                 return Ok(ExitCode::SUCCESS);
             }
             if risky.is_empty() {
-                println!("no node is behind its own deadline");
+                if deadlines.checked() {
+                    println!(
+                        "checked {} node(s) with a due date, {} live in the project: none is behind \
+                         schedule",
+                        deadlines.dated, deadlines.total
+                    );
+                } else {
+                    // Не «всё хорошо», а «проверять нечего» — и что именно сделать, чтобы стало что
+                    // проверять. Формулировка «no node is behind» на пустых сроках была ложной
+                    // зелёнью: она читается как подтверждение, ничего не подтверждая.
+                    println!(
+                        "nothing was checked: no live node in this project has a due date \
+                         (0 of {})",
+                        deadlines.total
+                    );
+                    println!(
+                        "hint: set one with `tasq set <ref> --due YYYY-MM-DD`, or start the project \
+                         from a template that carries deadlines"
+                    );
+                }
                 return Ok(ExitCode::SUCCESS);
             }
             for node in &risky {
